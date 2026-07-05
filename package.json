@@ -1,0 +1,21 @@
+{
+  "name": "lifecycle-x",
+  "private": true,
+  "version": "0.1.0",
+  "description": "存续期业务数据探针智能体",
+  "scripts": {
+    "build": "pnpm -r build",
+    "dev": "pnpm --filter @lifecycle-x/desktop dev",
+    "desktop:build": "pnpm --filter @lifecycle-x/desktop build",
+    "desktop:dev": "pnpm --filter @lifecycle-x/desktop dev",
+    "desktop:typecheck": "pnpm --filter @lifecycle-x/desktop typecheck",
+    "test": "pnpm -r test",
+    "typecheck": "pnpm -r typecheck"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  },
+  "packageManager": "pnpm@11.7.0"
+}

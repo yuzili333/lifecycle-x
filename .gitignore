@@ -1,0 +1,12 @@
+node_modules/
+.pnpm-store/
+dist/
+out/
+apps/*/out/
+artifacts/
+coverage/
+tmp/
+.DS_Store
+*.log
+
+output/

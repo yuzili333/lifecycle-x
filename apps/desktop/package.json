@@ -1,0 +1,25 @@
+{
+  "name": "@lifecycle-x/desktop",
+  "private": true,
+  "version": "0.1.0",
+  "description": "存续期数据探针智能体桌面客户端",
+  "main": "out/main/index.js",
+  "type": "module",
+  "scripts": {
+    "build": "electron-vite build",
+    "dev": "electron-vite dev",
+    "preview": "electron-vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron-vite": "^3.0.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "electron": "^33.2.1"
+  }
+}
