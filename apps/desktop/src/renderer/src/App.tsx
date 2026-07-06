@@ -1,4 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
+import { Button } from "@astryxdesign/core/Button";
+import { Banner } from "@astryxdesign/core/Banner";
+import { Spinner } from "@astryxdesign/core/Spinner";
+import { LoginPage } from "./LoginPage";
+import { useAuthStore } from "./useAuthStore";
 import "./styles.css";
 
 type AppInfo = {
@@ -40,8 +45,14 @@ const modules = [
 
 function App() {
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
+  const auth = useAuthStore();
 
   useEffect(() => {
+    if (!window.lifecycleX) {
+      setAppInfo(null);
+      return;
+    }
+
     window.lifecycleX
       .getAppInfo()
       .then((info) => setAppInfo(info as AppInfo))
@@ -55,6 +66,26 @@ function App() {
 
     return `Electron ${appInfo.electron} · Node ${appInfo.node}`;
   }, [appInfo]);
+
+  if (auth.status === "checking") {
+    return (
+      <main className="loading-screen">
+        <Spinner size="lg" />
+        <span>正在校验登录态...</span>
+      </main>
+    );
+  }
+
+  if (auth.status !== "authenticated") {
+    return (
+      <LoginPage
+        onPasswordLogin={auth.loginWithPassword}
+        onSsoComplete={auth.completeSso}
+        lastError={auth.lastError}
+        onError={auth.setLastError}
+      />
+    );
+  }
 
   return (
     <main className="app-shell">
@@ -84,10 +115,30 @@ function App() {
         <header className="topbar">
           <div>
             <h1>存续期数据探针智能体</h1>
-            <p>面向贷后管理和后续尽职调查的桌面分析工作台。</p>
+            <p>
+              {auth.user?.displayName} · {auth.user?.role === "admin" ? "管理员" : "普通用户"} ·
+              面向贷后管理和后续尽职调查的桌面分析工作台。
+            </p>
           </div>
-          <div className="runtime">{runtimeLabel}</div>
+          <div className="topbar-actions">
+            <div className="runtime">{runtimeLabel}</div>
+            <Button label="退出登录" variant="secondary" size="sm" onClick={auth.logout} />
+          </div>
         </header>
+
+        {auth.permissions.includes("audit:read") ? (
+          <Banner
+            status="success"
+            title="管理员权限已启用"
+            description="当前账号可访问审计追踪、用户管理和数据源管理能力。"
+          />
+        ) : (
+          <Banner
+            status="info"
+            title="普通用户权限"
+            description="当前账号可执行分析任务、查看数据源和读取报告。"
+          />
+        )}
 
         <section className="task-panel" aria-labelledby="task-title">
           <div>

@@ -5,21 +5,29 @@
   "description": "存续期数据探针智能体桌面客户端",
   "main": "out/main/index.js",
   "type": "module",
+  "astryx": {
+    "theme": "@astryxdesign/theme-neutral"
+  },
   "scripts": {
     "build": "electron-vite build",
     "dev": "electron-vite dev",
     "preview": "electron-vite preview",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "xds": "node node_modules/@astryxdesign/cli/bin/astryx.mjs"
   },
   "dependencies": {
+    "@astryxdesign/core": "^0.1.3",
+    "@astryxdesign/theme-neutral": "^0.1.3",
+    "@stylexjs/stylex": "^0.18.3",
     "@vitejs/plugin-react": "^4.3.4",
     "electron-vite": "^3.0.0",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7"
   },
   "devDependencies": {
-    "@types/react": "^18.3.18",
-    "@types/react-dom": "^18.3.5",
+    "@astryxdesign/cli": "^0.1.3",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
     "electron": "^33.2.1"
   }
 }

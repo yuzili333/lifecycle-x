@@ -1,0 +1,22 @@
+{
+  "name": "@lifecycle-x/server",
+  "private": true,
+  "version": "0.1.0",
+  "description": "存续期数据探针智能体认证服务",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "express": "^5.1.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "tsx": "^4.20.6"
+  }
+}

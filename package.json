@@ -9,6 +9,10 @@
     "desktop:build": "pnpm --filter @lifecycle-x/desktop build",
     "desktop:dev": "pnpm --filter @lifecycle-x/desktop dev",
     "desktop:typecheck": "pnpm --filter @lifecycle-x/desktop typecheck",
+    "server:build": "pnpm --filter @lifecycle-x/server build",
+    "server:dev": "pnpm --filter @lifecycle-x/server dev",
+    "server:test": "pnpm --filter @lifecycle-x/server test",
+    "server:typecheck": "pnpm --filter @lifecycle-x/server typecheck",
     "test": "pnpm -r test",
     "typecheck": "pnpm -r typecheck"
   },

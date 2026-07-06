@@ -1,3 +1,7 @@
+@import "@astryxdesign/core/reset.css";
+@import "@astryxdesign/core/astryx.css";
+@import "@astryxdesign/theme-neutral/theme.css";
+
 :root {
   color: #172033;
   background: #f7fafc;
@@ -19,13 +23,34 @@
 
 body {
   margin: 0;
-  min-width: 1024px;
+  min-width: 960px;
   min-height: 100vh;
   background: #f7fafc;
 }
 
 button {
   font: inherit;
+}
+
+.loading-screen {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  align-content: center;
+  gap: var(--spacing-4);
+  color: var(--color-text-secondary);
+  background:
+    linear-gradient(135deg, rgb(1 113 227 / 8%), transparent 34%),
+    var(--color-background-body);
+}
+
+.login-page {
+  min-height: 100vh;
+  padding: var(--spacing-6);
+  background:
+    linear-gradient(140deg, rgb(1 113 227 / 14%), transparent 42%),
+    linear-gradient(320deg, rgb(13 183 175 / 14%), transparent 38%),
+    var(--color-background-body);
 }
 
 .app-shell {
@@ -105,6 +130,13 @@ button {
   justify-content: space-between;
   gap: 24px;
   align-items: flex-start;
+}
+
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  white-space: nowrap;
 }
 
 .topbar h1,

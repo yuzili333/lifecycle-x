@@ -2,6 +2,7 @@ import { app, BrowserWindow, ipcMain, shell } from "electron";
 import { join } from "node:path";
 
 const isMac = process.platform === "darwin";
+let refreshToken: string | null = null;
 
 function createMainWindow(): BrowserWindow {
   const mainWindow = new BrowserWindow({
@@ -13,7 +14,7 @@ function createMainWindow(): BrowserWindow {
     backgroundColor: "#f7fafc",
     show: false,
     webPreferences: {
-      preload: join(__dirname, "../preload/index.js"),
+      preload: join(__dirname, "../preload/index.mjs"),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
@@ -46,6 +47,17 @@ ipcMain.handle("app:info", () => ({
   chrome: process.versions.chrome,
   node: process.versions.node,
 }));
+
+ipcMain.handle("auth:get-refresh-token", () => refreshToken);
+ipcMain.handle("auth:set-refresh-token", (_event, token: string) => {
+  refreshToken = token;
+  return true;
+});
+ipcMain.handle("auth:clear-refresh-token", () => {
+  refreshToken = null;
+  return true;
+});
+ipcMain.handle("shell:open-external", (_event, url: string) => shell.openExternal(url));
 
 app.whenReady().then(() => {
   app.setAppUserModelId("com.lifecycle-x.desktop");
