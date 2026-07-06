@@ -10,7 +10,7 @@ function createMainWindow(): BrowserWindow {
     height: 840,
     minWidth: 1080,
     minHeight: 720,
-    title: "存续期数据探针智能体",
+    title: "Cycle Probe",
     backgroundColor: "#f7fafc",
     show: false,
     webPreferences: {

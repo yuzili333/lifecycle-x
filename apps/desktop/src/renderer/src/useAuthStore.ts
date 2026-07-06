@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { authApi, isAuthSuccess, type AuthFailure, type AuthUser } from "./auth";
+import { authApi, isAuthSuccess, type AuthFailure, type AuthSuccess, type AuthUser } from "./auth";
 
 export type AuthStatus = "checking" | "anonymous" | "authenticated";
 
@@ -98,18 +98,59 @@ export function useAuthStore() {
     });
   }, []);
 
+  const refreshSession = useCallback(async (): Promise<AuthSuccess | false> => {
+    const refreshToken = (await window.lifecycleX?.auth.getRefreshToken()) ?? null;
+    if (!refreshToken) {
+      setState({
+        status: "anonymous",
+        accessToken: null,
+        user: null,
+        permissions: [],
+        expiresAt: null,
+        lastError: null,
+      });
+      return false;
+    }
+
+    const result = await authApi.refresh(refreshToken);
+    if (isAuthSuccess(result)) {
+      await applySuccess(result);
+      return result;
+    }
+
+    await window.lifecycleX?.auth.clearRefreshToken();
+    setState({
+      status: "anonymous",
+      accessToken: null,
+      user: null,
+      permissions: [],
+      expiresAt: null,
+      lastError: result,
+    });
+    return false;
+  }, [applySuccess]);
+
+  const updateUser = useCallback((userPatch: Partial<AuthUser>) => {
+    setState((current) => ({
+      ...current,
+      user: current.user ? { ...current.user, ...userPatch } : current.user,
+    }));
+  }, []);
+
   return useMemo(
     () => ({
       ...state,
       loginWithPassword,
       completeSso,
       logout,
+      refreshSession,
+      updateUser,
       setLastError: (lastError: AuthFailure | null) =>
         setState((current) => ({
           ...current,
           lastError,
         })),
     }),
-    [completeSso, loginWithPassword, logout, state],
+    [completeSso, loginWithPassword, logout, refreshSession, state, updateUser],
   );
 }

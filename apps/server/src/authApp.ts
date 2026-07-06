@@ -1,6 +1,6 @@
 import express, { type Request, type Response } from "express";
 import { randomUUID } from "node:crypto";
-import { AuthStore, MAX_FAILED_ATTEMPTS } from "./authStore.js";
+import { AuthStore, MAX_FAILED_ATTEMPTS, type WorkbenchSettings } from "./authStore.js";
 import type { AuthErrorCode, AuthFailure, AuthSuccess, AuthUser, ClientInfo } from "./types.js";
 
 const DEFAULT_PORT = 4317;
@@ -48,6 +48,7 @@ function sanitizeUser(user: AuthUser): AuthUser {
     displayName: user.displayName,
     role: user.role,
     status: user.status,
+    avatarUrl: user.avatarUrl,
   };
 }
 
@@ -85,6 +86,24 @@ function requestMeta(request: Request) {
   };
 }
 
+function resolveAuthenticatedRequest(store: AuthStore, request: Request) {
+  const accessToken = bearerToken(request);
+  return accessToken ? store.resolveAccessToken(accessToken) : null;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isValidSettingsPatch(value: unknown): value is Partial<WorkbenchSettings> {
+  if (!isPlainObject(value)) {
+    return false;
+  }
+
+  const allowedRootKeys = new Set(["general", "appearance", "configuration", "personalization"]);
+  return Object.keys(value).every((key) => allowedRootKeys.has(key) && isPlainObject(value[key]));
+}
+
 export function createAuthApp(store = new AuthStore()) {
   const app = express();
 
@@ -92,7 +111,7 @@ export function createAuthApp(store = new AuthStore()) {
   app.use((request, response, next) => {
     response.setHeader("Access-Control-Allow-Origin", "*");
     response.setHeader("Access-Control-Allow-Headers", "content-type, authorization");
-    response.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+    response.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,OPTIONS");
     if (request.method === "OPTIONS") {
       response.status(204).end();
       return;
@@ -347,6 +366,117 @@ export function createAuthApp(store = new AuthStore()) {
       return;
     }
     response.json({ success: true, logs: store.auditLogs });
+  });
+
+  app.get("/users/me/profile", (request, response) => {
+    const traceId = randomUUID();
+    const resolved = resolveAuthenticatedRequest(store, request);
+    if (!resolved) {
+      sendFailure(response, 401, "SESSION_EXPIRED", "登录态已过期，请重新登录。", traceId);
+      return;
+    }
+
+    const profile = store.profileFor(resolved.user.id);
+    if (!profile) {
+      sendFailure(response, 500, "INTERNAL_ERROR", "用户资料暂不可用。", traceId);
+      return;
+    }
+    response.json({ success: true, profile });
+  });
+
+  app.patch("/users/me/avatar", (request, response) => {
+    const traceId = randomUUID();
+    const resolved = resolveAuthenticatedRequest(store, request);
+    const meta = requestMeta(request);
+    if (!resolved) {
+      sendFailure(response, 401, "SESSION_EXPIRED", "登录态已过期，请重新登录。", traceId);
+      return;
+    }
+
+    if (!isPlainObject(request.body)) {
+      sendFailure(response, 400, "VALIDATION_ERROR", "头像更新参数不完整。", traceId);
+      return;
+    }
+
+    const allowedKeys = new Set(["avatarUrl"]);
+    const rejectedFields = Object.keys(request.body).filter((key) => !allowedKeys.has(key));
+    const { avatarUrl } = request.body as { avatarUrl?: unknown };
+    if (rejectedFields.length > 0) {
+      store.appendAudit({
+        traceId,
+        userId: resolved.user.id,
+        method: "avatar-update",
+        result: "failure",
+        reason: "READONLY_PROFILE_FIELDS",
+        ...meta,
+      });
+      sendFailure(response, 400, "VALIDATION_ERROR", "个人资料仅允许更新头像。", traceId, {
+        fields: Object.fromEntries(rejectedFields.map((field) => [field, "该字段来自企业内部主数据，禁止在客户端修改。"])),
+      });
+      return;
+    }
+
+    if (typeof avatarUrl !== "string" || avatarUrl.trim().length === 0) {
+      sendFailure(response, 400, "VALIDATION_ERROR", "头像地址不能为空。", traceId, {
+        fields: { avatarUrl: "头像地址不能为空。" },
+      });
+      return;
+    }
+
+    const profile = store.updateAvatar(resolved.user.id, avatarUrl.trim());
+    if (!profile) {
+      sendFailure(response, 500, "INTERNAL_ERROR", "头像更新失败。", traceId);
+      return;
+    }
+    store.appendAudit({ traceId, userId: resolved.user.id, method: "avatar-update", result: "success", ...meta });
+    response.json({ success: true, profile });
+  });
+
+  app.get("/users/me/settings", (request, response) => {
+    const traceId = randomUUID();
+    const resolved = resolveAuthenticatedRequest(store, request);
+    if (!resolved) {
+      sendFailure(response, 401, "SESSION_EXPIRED", "登录态已过期，请重新登录。", traceId);
+      return;
+    }
+
+    const settings = store.settingsFor(resolved.user.id);
+    if (!settings) {
+      sendFailure(response, 500, "INTERNAL_ERROR", "用户设置暂不可用。", traceId);
+      return;
+    }
+    response.json({ success: true, settings });
+  });
+
+  app.patch("/users/me/settings", (request, response) => {
+    const traceId = randomUUID();
+    const resolved = resolveAuthenticatedRequest(store, request);
+    const meta = requestMeta(request);
+    if (!resolved) {
+      sendFailure(response, 401, "SESSION_EXPIRED", "登录态已过期，请重新登录。", traceId);
+      return;
+    }
+
+    if (!isValidSettingsPatch(request.body)) {
+      store.appendAudit({
+        traceId,
+        userId: resolved.user.id,
+        method: "settings-update",
+        result: "failure",
+        reason: "VALIDATION_ERROR",
+        ...meta,
+      });
+      sendFailure(response, 400, "VALIDATION_ERROR", "用户设置参数不合法。", traceId);
+      return;
+    }
+
+    const settings = store.updateSettings(resolved.user.id, request.body);
+    if (!settings) {
+      sendFailure(response, 500, "INTERNAL_ERROR", "用户设置保存失败。", traceId);
+      return;
+    }
+    store.appendAudit({ traceId, userId: resolved.user.id, method: "settings-update", result: "success", ...meta });
+    response.json({ success: true, settings });
   });
 
   return { app, store };

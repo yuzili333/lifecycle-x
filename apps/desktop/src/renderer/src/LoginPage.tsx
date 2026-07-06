@@ -1,6 +1,5 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Avatar } from "@astryxdesign/core/Avatar";
-import { Banner } from "@astryxdesign/core/Banner";
 import { Button } from "@astryxdesign/core/Button";
 import { Card } from "@astryxdesign/core/Card";
 import { Center } from "@astryxdesign/core/Center";
@@ -10,6 +9,7 @@ import { Link } from "@astryxdesign/core/Link";
 import { Section } from "@astryxdesign/core/Section";
 import { Text } from "@astryxdesign/core/Text";
 import { TextInput } from "@astryxdesign/core/TextInput";
+import { useToast } from "@astryxdesign/core/Toast";
 import { authApi, errorMessage, type AuthFailure } from "./auth";
 
 type LoginPageProps = {
@@ -31,7 +31,8 @@ export function LoginPage({ onPasswordLogin, onSsoComplete, lastError, onError }
   const [password, setPassword] = useState("");
   const [ssoState, setSsoState] = useState<{ token: string; providerName: string; email: string } | null>(null);
   const [isLoading, setIsLoading] = useState(false);
-  const [notice, setNotice] = useState<string | null>(null);
+  const toast = useToast();
+  const lastToastTraceId = useRef<string | null>(null);
 
   const canPasswordLogin = identifier.trim().length > 0 && password.length > 0;
   const canSsoLogin = isEmail(identifier.trim());
@@ -50,9 +51,22 @@ export function LoginPage({ onPasswordLogin, onSsoComplete, lastError, onError }
     return undefined;
   }, [lastError]);
 
+  useEffect(() => {
+    if (!lastError || lastToastTraceId.current === lastError.error.traceId) {
+      return;
+    }
+
+    lastToastTraceId.current = lastError.error.traceId;
+    toast({
+      type: "error",
+      body: `${errorMessage(lastError)} Trace: ${lastError.error.traceId}`,
+      uniqueID: "login-error",
+      collisionBehavior: "overwrite",
+    });
+  }, [lastError, toast]);
+
   const handlePasswordLogin = async () => {
     setIsLoading(true);
-    setNotice(null);
     const ok = await onPasswordLogin(identifier.trim(), password);
     setIsLoading(false);
     if (!ok) {
@@ -62,7 +76,6 @@ export function LoginPage({ onPasswordLogin, onSsoComplete, lastError, onError }
 
   const handleSsoStart = async () => {
     setIsLoading(true);
-    setNotice(null);
     onError(null);
     const result = await authApi.startSso(identifier.trim());
     setIsLoading(false);
@@ -79,6 +92,12 @@ export function LoginPage({ onPasswordLogin, onSsoComplete, lastError, onError }
     });
     setStep("sso-confirm");
     await window.lifecycleX?.openExternal(result.authorizationUrl);
+    toast({
+      type: "info",
+      body: `已打开 ${result.provider.name} 企业认证页面，请完成授权后返回客户端。`,
+      uniqueID: "sso-started",
+      collisionBehavior: "overwrite",
+    });
   };
 
   const handleSsoComplete = async () => {
@@ -115,23 +134,18 @@ export function LoginPage({ onPasswordLogin, onSsoComplete, lastError, onError }
       return;
     }
     onError(null);
-    setNotice("如果该邮箱已开通账号，系统已发送密码重置指引。");
+    toast({
+      type: "info",
+      body: "如果该邮箱已开通账号，系统已发送密码重置指引。",
+      uniqueID: "password-reset-requested",
+      collisionBehavior: "overwrite",
+    });
   };
 
   return (
     <Center axis="both" className="login-page">
       <Card padding={8} width="100%" maxWidth={420}>
         <VStack gap={4} hAlign="stretch">
-          {lastError && (
-            <Banner
-              status="error"
-              title="登录失败"
-              description={`${errorMessage(lastError)} Trace: ${lastError.error.traceId}`}
-            />
-          )}
-
-          {notice && <Banner status="success" title="请求已提交" description={notice} />}
-
           {step === "credentials" && (
             <>
               <VStack gap={1} hAlign="center">

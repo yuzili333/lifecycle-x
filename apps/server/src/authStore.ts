@@ -30,7 +30,14 @@ export type AuditLog = {
   traceId: string;
   userId?: string;
   identifier?: string;
-  method: LoginMethod | "refresh" | "logout" | "password-reset" | "password-change";
+  method:
+    | LoginMethod
+    | "refresh"
+    | "logout"
+    | "password-reset"
+    | "password-change"
+    | "avatar-update"
+    | "settings-update";
   result: "success" | "failure";
   reason?: string;
   ip?: string;
@@ -44,6 +51,46 @@ export type SsoState = {
   email: string;
   providerId: string;
   expiresAt: number;
+};
+
+export type WorkbenchSettings = {
+  general: {
+    language: "zh-CN" | "en-US";
+    timezone: string;
+    notificationsEnabled: boolean;
+  };
+  appearance: {
+    themeMode: "light" | "dark";
+    accentColor: string;
+    uiFontSize: number;
+    codeFontSize: number;
+    translucentSidebar: boolean;
+    contrast: "standard" | "high";
+    dockIcon: "default" | "light" | "deep";
+  };
+  configuration: {
+    modelProvider: string;
+    apiKeyStatus: "not_configured" | "configured";
+    skillEnabled: boolean;
+    mcpEnabled: boolean;
+  };
+  personalization: {
+    defaultModule: "data-assistant" | "data-management";
+    compactNavigation: boolean;
+  };
+};
+
+export type UserProfile = {
+  id: string;
+  username: string;
+  email: string;
+  displayName: string;
+  role: AuthUser["role"];
+  status: AuthUser["status"];
+  avatarUrl?: string;
+  department: string;
+  title: string;
+  phone: string;
 };
 
 function hashPassword(password: string, salt = randomBytes(16).toString("hex")) {
@@ -72,6 +119,8 @@ function token(prefix: string) {
 
 export class AuthStore {
   private users = new Map<string, InternalUser>();
+  private profiles = new Map<string, UserProfile>();
+  private settings = new Map<string, WorkbenchSettings>();
   private sessions = new Map<string, SessionRecord>();
   private accessIndex = new Map<string, string>();
   private resetTokens = new Map<string, { userId: string; expiresAt: number; usedAt?: number }>();
@@ -91,6 +140,48 @@ export class AuthStore {
 
   findUserById(userId: string) {
     return this.users.get(userId);
+  }
+
+  profileFor(userId: string) {
+    const user = this.users.get(userId);
+    const profile = this.profiles.get(userId);
+    if (!user || !profile) {
+      return null;
+    }
+    return { ...profile, avatarUrl: user.avatarUrl };
+  }
+
+  updateAvatar(userId: string, avatarUrl: string) {
+    const user = this.users.get(userId);
+    const profile = this.profiles.get(userId);
+    if (!user || !profile) {
+      return null;
+    }
+
+    user.avatarUrl = avatarUrl;
+    profile.avatarUrl = avatarUrl;
+    return this.profileFor(userId);
+  }
+
+  settingsFor(userId: string) {
+    const settings = this.settings.get(userId);
+    return settings ? structuredClone(settings) : null;
+  }
+
+  updateSettings(userId: string, patch: Partial<WorkbenchSettings>) {
+    const current = this.settings.get(userId);
+    if (!current) {
+      return null;
+    }
+
+    const next: WorkbenchSettings = {
+      general: { ...current.general, ...patch.general },
+      appearance: { ...current.appearance, ...patch.appearance },
+      configuration: { ...current.configuration, ...patch.configuration },
+      personalization: { ...current.personalization, ...patch.personalization },
+    };
+    this.settings.set(userId, next);
+    return structuredClone(next);
   }
 
   isPasswordValid(user: InternalUser, password: string) {
@@ -282,6 +373,7 @@ export class AuthStore {
         displayName: "系统管理员",
         role: "admin",
         status: "active",
+        avatarUrl: "https://api.dicebear.com/9.x/initials/svg?seed=Admin",
         passwordHash: hashPassword("Lifecycle@123"),
         failedAttempts: 0,
         ssoProviderId: "bank-oidc",
@@ -293,6 +385,7 @@ export class AuthStore {
         displayName: "贷后分析员",
         role: "user",
         status: "active",
+        avatarUrl: "https://api.dicebear.com/9.x/initials/svg?seed=Analyst",
         passwordHash: hashPassword("Lifecycle@123"),
         failedAttempts: 0,
         ssoProviderId: "bank-oidc",
@@ -304,6 +397,7 @@ export class AuthStore {
         displayName: "已停用用户",
         role: "user",
         status: "disabled",
+        avatarUrl: "https://api.dicebear.com/9.x/initials/svg?seed=Disabled",
         passwordHash: hashPassword("Lifecycle@123"),
         failedAttempts: 0,
         ssoProviderId: "bank-oidc",
@@ -312,6 +406,44 @@ export class AuthStore {
 
     for (const user of users) {
       this.users.set(user.id, user);
+      this.profiles.set(user.id, {
+        id: user.id,
+        username: user.username,
+        email: user.email,
+        displayName: user.displayName,
+        role: user.role,
+        status: user.status,
+        avatarUrl: user.avatarUrl,
+        department: user.role === "admin" ? "系统管理部" : "贷后管理部",
+        title: user.role === "admin" ? "系统管理员" : "贷后分析员",
+        phone: user.role === "admin" ? "010-8000-0001" : "010-8000-0002",
+      });
+      this.settings.set(user.id, {
+        general: {
+          language: "zh-CN",
+          timezone: "Asia/Shanghai",
+          notificationsEnabled: true,
+        },
+        appearance: {
+          themeMode: "light",
+          accentColor: "#108387",
+          uiFontSize: 14,
+          codeFontSize: 13,
+          translucentSidebar: false,
+          contrast: "standard",
+          dockIcon: "default",
+        },
+        configuration: {
+          modelProvider: "OpenAI Compatible",
+          apiKeyStatus: "not_configured",
+          skillEnabled: false,
+          mcpEnabled: false,
+        },
+        personalization: {
+          defaultModule: "data-assistant",
+          compactNavigation: false,
+        },
+      });
     }
   }
 }

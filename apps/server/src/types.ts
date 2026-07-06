@@ -24,6 +24,7 @@ export type AuthUser = {
   displayName: string;
   role: UserRole;
   status: UserStatus;
+  avatarUrl?: string;
 };
 
 export type AuthSuccess = {

@@ -77,4 +77,24 @@ describe("AuthStore", () => {
     });
     expect(store.auditLogs[0]?.traceId).toBe("trace-test");
   });
+
+  it("updates only avatar-backed profile data and stores workbench settings", () => {
+    const store = new AuthStore();
+    const user = store.findUserByIdentifier("analyst");
+    expect(user).toBeDefined();
+    if (!user) {
+      return;
+    }
+
+    const profile = store.updateAvatar(user.id, "https://example.com/avatar.png");
+    expect(profile?.avatarUrl).toBe("https://example.com/avatar.png");
+    expect(profile?.email).toBe("analyst@bank.example.com");
+    expect(store.findUserByIdentifier("analyst")?.avatarUrl).toBe("https://example.com/avatar.png");
+
+    const settings = store.updateSettings(user.id, {
+      personalization: { defaultModule: "data-management", compactNavigation: true },
+    });
+    expect(settings?.personalization.defaultModule).toBe("data-management");
+    expect(settings?.general.language).toBe("zh-CN");
+  });
 });

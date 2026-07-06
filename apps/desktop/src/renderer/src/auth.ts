@@ -18,6 +18,7 @@ export type AuthUser = {
   displayName: string;
   role: "user" | "admin";
   status: "active" | "disabled";
+  avatarUrl?: string;
 };
 
 export type AuthSuccess = {
@@ -49,9 +50,9 @@ export type AuthSession = {
 
 type ApiResult<T> = T | AuthFailure;
 
-const AUTH_API_URL = import.meta.env.VITE_AUTH_API_URL ?? "http://127.0.0.1:4317";
+export const AUTH_API_URL = import.meta.env.VITE_AUTH_API_URL ?? "http://127.0.0.1:4317";
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<ApiResult<T>> {
+export async function request<T>(path: string, init: RequestInit = {}): Promise<ApiResult<T>> {
   try {
     const response = await fetch(`${AUTH_API_URL}${path}`, {
       ...init,
