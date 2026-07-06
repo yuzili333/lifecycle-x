@@ -25,7 +25,7 @@ body {
   margin: 0;
   min-width: 960px;
   min-height: 100vh;
-  background: #f7fafc;
+  background: #0f1724;
 }
 
 button {
@@ -58,10 +58,10 @@ button {
   width: 32px;
   height: 32px;
   place-items: center;
-  border: 1px solid #2a7f84;
+  border: 1px solid color-mix(in srgb, var(--workbench-accent, #65d6d2) 58%, #ffffff);
   border-radius: 8px;
-  color: #0b565a;
-  background: #dff7f5;
+  color: #031317;
+  background: var(--workbench-accent, #65d6d2);
   font-size: 12px;
   font-weight: 800;
 }
@@ -70,7 +70,10 @@ button {
   display: grid;
   grid-template-rows: auto 1fr;
   min-height: 100vh;
-  background: #f7fafc;
+  color: var(--workbench-foreground, #172033);
+  background: var(--workbench-background, #f7fafc);
+  font-family: var(--workbench-font);
+  font-size: var(--workbench-ui-font-size, 14px);
 }
 
 .workbench-topbar {
@@ -79,9 +82,9 @@ button {
   gap: 24px;
   align-items: center;
   min-height: 88px;
-  border-bottom: 1px solid #d8e2ec;
+  border-bottom: 1px solid color-mix(in srgb, var(--workbench-foreground, #e6edf6) 14%, transparent);
   padding: 22px 28px;
-  background: #ffffff;
+  background: color-mix(in srgb, var(--workbench-background, #0f1724) 94%, #ffffff);
 }
 
 .workbench-actions {
@@ -91,9 +94,55 @@ button {
   white-space: nowrap;
 }
 
+.workbench-actions .topbar-avatar-trigger {
+  width: 32px !important;
+  min-width: 32px !important;
+  height: 32px !important;
+  min-height: 32px !important;
+  border: 0 !important;
+  border-radius: 999px !important;
+  padding: 0 !important;
+  color: inherit;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+.workbench-actions .topbar-avatar-trigger:hover,
+.workbench-actions .topbar-avatar-trigger:active,
+.workbench-actions .topbar-avatar-trigger[data-state="open"] {
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+.workbench-actions .topbar-avatar-trigger:focus-visible {
+  outline: 2px solid var(--workbench-accent, #65d6d2);
+  outline-offset: 2px;
+}
+
+.nav-asset-icon {
+  display: inline-block;
+  width: 20px;
+  height: 20px;
+  flex: 0 0 20px;
+  background: currentColor;
+  mask: var(--nav-icon-url) center / contain no-repeat;
+  -webkit-mask: var(--nav-icon-url) center / contain no-repeat;
+}
+
 .workbench-content {
   min-width: 0;
   padding: 28px;
+}
+
+.workbench-side-theme {
+  height: 100%;
+  color: var(--workbench-foreground, #e6edf6);
+  background: var(--workbench-background, #0f1724);
+}
+
+.workbench-side-nav {
+  color: var(--workbench-foreground, #e6edf6);
+  background: var(--workbench-background, #0f1724);
 }
 
 .side-user {
@@ -103,9 +152,18 @@ button {
   align-items: center;
   min-width: 0;
   padding: 12px;
-  border: 1px solid #dbe5ee;
+  border: 1px solid color-mix(in srgb, var(--workbench-foreground, #e6edf6) 16%, transparent);
   border-radius: 8px;
-  background: #ffffff;
+  background: color-mix(in srgb, var(--workbench-background, #0f1724) 88%, #ffffff);
+}
+
+.side-user-avatar-only {
+  display: grid;
+  width: 100%;
+  place-items: center;
+  padding: 4px 0;
+  border: 0;
+  background: transparent;
 }
 
 .side-user-copy {
@@ -122,12 +180,12 @@ button {
 }
 
 .side-user-copy strong {
-  color: #102235;
+  color: var(--workbench-foreground, #e6edf6);
   font-size: 13px;
 }
 
 .side-user-copy span {
-  color: #607086;
+  color: color-mix(in srgb, var(--workbench-foreground, #e6edf6) 68%, transparent);
   font-size: 12px;
 }
 
@@ -137,10 +195,10 @@ button {
   place-items: center;
   align-content: center;
   gap: 14px;
-  border: 1px solid #d8e2ec;
+  border: 1px solid color-mix(in srgb, var(--workbench-accent, #65d6d2) 26%, transparent);
   border-radius: 8px;
-  background: #ffffff;
-  box-shadow: 0 12px 30px rgb(15 23 42 / 6%);
+  background: color-mix(in srgb, var(--workbench-background, #0f1724) 88%, #ffffff);
+  box-shadow: 0 18px 50px rgb(0 0 0 / 22%);
   text-align: center;
 }
 
@@ -149,11 +207,13 @@ button {
   width: 64px;
   height: 64px;
   place-items: center;
-  border: 1px solid #b7d8d6;
+  border: 1px solid color-mix(in srgb, var(--workbench-accent, #65d6d2) 44%, transparent);
   border-radius: 8px;
-  color: #0b565a;
-  background: #eefbf9;
+  color: var(--workbench-accent, #65d6d2);
+  background: color-mix(in srgb, var(--workbench-background, #0f1724) 76%, var(--workbench-accent, #65d6d2));
   font-weight: 800;
+  font-family: var(--workbench-code-font);
+  font-size: var(--workbench-code-font-size, 13px);
 }
 
 .profile-readonly-grid {
@@ -167,15 +227,26 @@ button {
   grid-template-columns: 250px minmax(0, 1fr);
   min-height: 620px;
   max-height: 82vh;
+  color: var(--workbench-foreground, #e6edf6);
+  background: var(--workbench-background, #0f1724);
+  font-family: var(--workbench-font);
+  font-size: var(--workbench-ui-font-size, 14px);
 }
 
 .settings-sidebar-nav {
   display: grid;
   grid-template-rows: auto 1fr;
   gap: 18px;
-  border-right: 1px solid #d8e2ec;
+  border-right: 1px solid color-mix(in srgb, var(--workbench-foreground, #e6edf6) 14%, transparent);
   padding: 24px 18px;
-  background: #f8fbfd;
+  background: color-mix(in srgb, var(--workbench-background, #0f1724) 92%, #ffffff);
+}
+
+.settings-sidebar-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
 }
 
 .settings-tab-list {
@@ -192,25 +263,25 @@ button {
   border: 1px solid transparent;
   border-radius: 8px;
   padding: 10px 12px;
-  color: #32445b;
+  color: color-mix(in srgb, var(--workbench-foreground, #e6edf6) 84%, transparent);
   background: transparent;
   text-align: left;
   cursor: default;
 }
 
 .settings-tab strong {
-  color: #102235;
+  color: var(--workbench-foreground, #e6edf6);
   font-size: 14px;
 }
 
 .settings-tab span {
-  color: #607086;
+  color: color-mix(in srgb, var(--workbench-foreground, #e6edf6) 66%, transparent);
   font-size: 12px;
 }
 
 .settings-tab.active {
-  border-color: #9fd8d6;
-  background: #e9f8f7;
+  border-color: color-mix(in srgb, var(--workbench-accent, #65d6d2) 42%, transparent);
+  background: color-mix(in srgb, var(--workbench-background, #0f1724) 72%, var(--workbench-accent, #65d6d2));
 }
 
 .settings-sidebar-content {
@@ -220,13 +291,14 @@ button {
   min-width: 0;
   overflow: auto;
   padding: 24px;
+  background: color-mix(in srgb, var(--workbench-background, #0f1724) 88%, #ffffff);
 }
 
 .settings-footer {
   display: flex;
   justify-content: flex-end;
   gap: 10px;
-  border-top: 1px solid #d8e2ec;
+  border-top: 1px solid color-mix(in srgb, var(--workbench-foreground, #e6edf6) 14%, transparent);
   padding-top: 16px;
 }
 

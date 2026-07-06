@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useState, type CSSProperties, type ReactNode } from "react";
 import { AppShell } from "@astryxdesign/core/AppShell";
 import { Avatar } from "@astryxdesign/core/Avatar";
 import { Button } from "@astryxdesign/core/Button";
@@ -7,7 +7,13 @@ import { DropdownMenu } from "@astryxdesign/core/DropdownMenu";
 import { HStack, VStack } from "@astryxdesign/core/Layout";
 import { Section } from "@astryxdesign/core/Section";
 import { Selector } from "@astryxdesign/core/Selector";
-import { SideNav, SideNavHeading, SideNavItem, SideNavSection } from "@astryxdesign/core/SideNav";
+import {
+  SideNav,
+  SideNavHeading,
+  SideNavItem,
+  SideNavSection,
+  useSideNavCollapse,
+} from "@astryxdesign/core/SideNav";
 import { Slider } from "@astryxdesign/core/Slider";
 import { Spinner } from "@astryxdesign/core/Spinner";
 import { Switch } from "@astryxdesign/core/Switch";
@@ -16,6 +22,8 @@ import { TextInput } from "@astryxdesign/core/TextInput";
 import { useToast } from "@astryxdesign/core/Toast";
 import type { AuthFailure } from "./auth";
 import type { useAuthStore } from "./useAuthStore";
+import aiIcon from "./assets/ai.svg";
+import databaseIcon from "./assets/database.svg";
 import { workbenchApi, type ApiResult, type UserProfile, type WorkbenchSettings } from "./workbenchApi";
 
 type WorkbenchAuth = ReturnType<typeof useAuthStore>;
@@ -25,8 +33,8 @@ type WorkbenchShellProps = {
   runtimeLabel: string;
 };
 
-type WorkbenchModule = "data-assistant" | "data-management" | "reports" | "audit";
-type SettingsTab = "general" | "appearance" | "configuration" | "personalization";
+type WorkbenchModule = "data-assistant" | "data-management";
+type SettingsTab = "profile" | "general" | "appearance" | "agent" | "logout";
 
 const defaultSettings: WorkbenchSettings = {
   general: {
@@ -35,8 +43,12 @@ const defaultSettings: WorkbenchSettings = {
     notificationsEnabled: true,
   },
   appearance: {
-    themeMode: "light",
-    accentColor: "#108387",
+    themeMode: "dark",
+    accentColor: "#65d6d2",
+    backgroundColor: "#0f1724",
+    foregroundColor: "#e6edf6",
+    fontFamily: "Inter, PingFang SC, Microsoft YaHei, system-ui, sans-serif",
+    codeFontFamily: "JetBrains Mono, SFMono-Regular, Menlo, Consolas, monospace",
     uiFontSize: 14,
     codeFontSize: 13,
     translucentSidebar: false,
@@ -56,10 +68,11 @@ const defaultSettings: WorkbenchSettings = {
 };
 
 const settingsTabs: Array<{ id: SettingsTab; label: string; description: string }> = [
+  { id: "profile", label: "个人资料", description: "头像和企业主数据" },
   { id: "general", label: "常规", description: "语言、时区和通知" },
-  { id: "appearance", label: "外观", description: "主题、字号和侧栏表现" },
-  { id: "configuration", label: "配置", description: "模型、Skill 和 MCP" },
-  { id: "personalization", label: "个性化", description: "默认入口和导航偏好" },
+  { id: "appearance", label: "外观", description: "主题、颜色、字体和侧栏" },
+  { id: "agent", label: "智能体配置", description: "大模型、API Key、Skill 和 MCP" },
+  { id: "logout", label: "退出登录", description: "结束当前登录态" },
 ];
 
 function isFailure<T extends { success: true }>(result: ApiResult<T>): result is AuthFailure {
@@ -120,14 +133,35 @@ function PlaceholderView({
   );
 }
 
+function NavAssetIcon({ src }: { src: string }) {
+  return <span className="nav-asset-icon" style={{ "--nav-icon-url": `url(${src})` } as CSSProperties} aria-hidden="true" />;
+}
+
+function SideNavUserCard({ profile, user }: { profile: UserProfile | null; user: WorkbenchAuth["user"] }) {
+  const { isCollapsed } = useSideNavCollapse();
+
+  return (
+    <div className={isCollapsed ? "side-user-avatar-only" : "side-user"}>
+      <Avatar src={profile?.avatarUrl} name={profile?.displayName ?? user?.displayName} size={isCollapsed ? 32 : 36} />
+      {!isCollapsed && (
+        <div className="side-user-copy">
+          <strong>{profile?.displayName ?? user?.displayName}</strong>
+          <span>{profile?.email ?? user?.email}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function WorkbenchShell({ auth, runtimeLabel }: WorkbenchShellProps) {
   const toast = useToast();
   const [activeModule, setActiveModule] = useState<WorkbenchModule>("data-assistant");
-  const [isProfileOpen, setIsProfileOpen] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
-  const [activeSettingsTab, setActiveSettingsTab] = useState<SettingsTab>("general");
+  const [isLogoutConfirmOpen, setIsLogoutConfirmOpen] = useState(false);
+  const [activeSettingsTab, setActiveSettingsTab] = useState<SettingsTab>("profile");
   const [profile, setProfile] = useState<UserProfile | null>(() => fallbackProfile(auth.user));
   const [avatarDraft, setAvatarDraft] = useState(auth.user?.avatarUrl ?? "");
+  const [apiKeyDraft, setApiKeyDraft] = useState("");
   const [settings, setSettings] = useState<WorkbenchSettings>(defaultSettings);
   const [isLoadingWorkbench, setIsLoadingWorkbench] = useState(true);
   const [isSavingAvatar, setIsSavingAvatar] = useState(false);
@@ -206,16 +240,37 @@ export function WorkbenchShell({ auth, runtimeLabel }: WorkbenchShellProps) {
 
   const navItems = useMemo(
     () => [
-      { id: "data-assistant" as const, label: "数据助手", permission: "analysis:read" },
-      { id: "data-management" as const, label: "数据管理", permission: "datasource:read" },
-      { id: "reports" as const, label: "报告库", permission: "report:read" },
-      { id: "audit" as const, label: "审计追踪", permission: "audit:read" },
+      { id: "data-assistant" as const, label: "数据助手", permission: "analysis:read", icon: aiIcon },
+      { id: "data-management" as const, label: "数据管理", permission: "datasource:read", icon: databaseIcon },
     ],
     [],
   );
 
   const visibleNavItems = navItems.filter((item) => auth.permissions.includes(item.permission));
   const currentTitle = visibleNavItems.find((item) => item.id === activeModule)?.label ?? "数据助手";
+  const workbenchStyle = {
+    "--workbench-background": settings.appearance.backgroundColor,
+    "--workbench-foreground": settings.appearance.foregroundColor,
+    "--workbench-accent": settings.appearance.accentColor,
+    "--workbench-font": settings.appearance.fontFamily,
+    "--workbench-code-font": settings.appearance.codeFontFamily,
+    "--workbench-ui-font-size": `${settings.appearance.uiFontSize}px`,
+    "--workbench-code-font-size": `${settings.appearance.codeFontSize}px`,
+  } as CSSProperties;
+
+  const openSettings = (tab: SettingsTab) => {
+    setActiveSettingsTab(tab);
+    setIsSettingsOpen(true);
+  };
+
+  const requestLogout = () => {
+    setIsLogoutConfirmOpen(true);
+  };
+
+  const confirmLogout = async () => {
+    setIsLogoutConfirmOpen(false);
+    await auth.logout();
+  };
 
   const handleAvatarSave = async () => {
     const nextAvatar = avatarDraft.trim();
@@ -248,8 +303,19 @@ export function WorkbenchShell({ auth, runtimeLabel }: WorkbenchShellProps) {
   };
 
   const handleSettingsSave = async () => {
+    const nextSettings =
+      apiKeyDraft.trim().length > 0
+        ? {
+            ...settings,
+            configuration: {
+              ...settings.configuration,
+              apiKeyStatus: "configured" as const,
+            },
+          }
+        : settings;
+
     setIsSavingSettings(true);
-    const result = await requestWithRefresh((token) => workbenchApi.updateSettings(token, settings));
+    const result = await requestWithRefresh((token) => workbenchApi.updateSettings(token, nextSettings));
     setIsSavingSettings(false);
     if (isFailure(result)) {
       showError(result);
@@ -257,6 +323,7 @@ export function WorkbenchShell({ auth, runtimeLabel }: WorkbenchShellProps) {
     }
 
     setSettings(result.settings);
+    setApiKeyDraft("");
     toast({
       type: "info",
       body: "用户设置已保存。",
@@ -272,54 +339,36 @@ export function WorkbenchShell({ auth, runtimeLabel }: WorkbenchShellProps) {
       );
     }
 
-    if (activeModule === "reports") {
-      return <PlaceholderView title="报告库" description="报告归档和导出能力沿用权限控制，后续按报告模块需求开发。" />;
-    }
-
-    if (activeModule === "audit") {
-      return <PlaceholderView title="审计追踪" description="审计日志入口仅对管理员展示，具体列表能力后续接入。" />;
-    }
-
     return <PlaceholderView title="数据助手" description="默认首页已预留，功能需求确认后再接入智能体交互。" />;
   };
 
   const sideNav = (
-    <SideNav
-      header={
-        <SideNavHeading
-          heading="Lifecycle X"
-          superheading="存续期数据探针"
-          subheading={auth.user ? `${auth.user.displayName} · ${roleLabel(auth.user.role)}` : "已认证用户"}
-          icon={<div className="workbench-brand-mark">LX</div>}
-        />
-      }
-      footer={
-        <div className="side-user">
-          <Avatar src={profile?.avatarUrl} name={profile?.displayName ?? auth.user?.displayName} size={36} />
-          <div className="side-user-copy">
-            <strong>{profile?.displayName ?? auth.user?.displayName}</strong>
-            <span>{profile?.email ?? auth.user?.email}</span>
-          </div>
-        </div>
-      }
-      collapsible={{ defaultIsCollapsed: false, buttonLabel: "折叠工作台导航" }}
-    >
-      <SideNavSection title="主导航">
-        {visibleNavItems.map((item) => (
-          <SideNavItem
-            key={item.id}
-            label={item.label}
-            isSelected={activeModule === item.id}
-            onClick={() => setActiveModule(item.id)}
-          />
-        ))}
-      </SideNavSection>
-    </SideNav>
+    <div className="workbench-side-theme" style={workbenchStyle}>
+      <SideNav
+        className="workbench-side-nav"
+        header={<SideNavHeading heading="Cycle Probe" icon={<div className="workbench-brand-mark">CP</div>} />}
+        footer={<SideNavUserCard profile={profile} user={auth.user} />}
+        collapsible={{ defaultIsCollapsed: false, buttonLabel: "折叠工作台导航" }}
+      >
+        <SideNavSection title="主导航">
+          {visibleNavItems.map((item) => (
+            <SideNavItem
+              key={item.id}
+              label={item.label}
+              icon={<NavAssetIcon src={item.icon} />}
+              selectedIcon={<NavAssetIcon src={item.icon} />}
+              isSelected={activeModule === item.id}
+              onClick={() => setActiveModule(item.id)}
+            />
+          ))}
+        </SideNavSection>
+      </SideNav>
+    </div>
   );
 
   return (
     <AppShell variant="section" sideNav={sideNav} contentPadding={0} mobileNav={{ breakpoint: "md" }}>
-      <section className="workbench-main">
+      <section className="workbench-main" data-theme-mode={settings.appearance.themeMode} style={workbenchStyle}>
         <header className="workbench-topbar">
           <div>
             <Text type="display-3" as="h1">
@@ -335,25 +384,20 @@ export function WorkbenchShell({ auth, runtimeLabel }: WorkbenchShellProps) {
             <DropdownMenu
               button={{
                 label: profile?.displayName ?? auth.user?.displayName ?? "用户菜单",
-                variant: "secondary",
+                variant: "ghost",
                 size: "md",
-                children: (
-                  <HStack vAlign="center" gap={2}>
-                    <Avatar src={profile?.avatarUrl} name={profile?.displayName ?? auth.user?.displayName} size={24} />
-                    <span>{profile?.displayName ?? auth.user?.displayName}</span>
-                  </HStack>
-                ),
+                className: "topbar-avatar-trigger",
+                isIconOnly: true,
+                icon: <Avatar src={profile?.avatarUrl} name={profile?.displayName ?? auth.user?.displayName} size={32} />,
               }}
+              hasChevron={false}
               menuWidth={220}
               placement="below"
               items={[
-                { label: "数据助手", onClick: () => setActiveModule("data-assistant") },
-                { label: "数据管理", onClick: () => setActiveModule("data-management") },
+                { label: "个人资料", onClick: () => openSettings("profile") },
+                { label: "用户设置", onClick: () => openSettings("general") },
                 { type: "divider" },
-                { label: "个人资料", onClick: () => setIsProfileOpen(true) },
-                { label: "用户设置", onClick: () => setIsSettingsOpen(true) },
-                { type: "divider" },
-                { label: "退出登录", onClick: auth.logout },
+                { label: "退出登录", onClick: requestLogout },
               ]}
             />
           </div>
@@ -362,51 +406,15 @@ export function WorkbenchShell({ auth, runtimeLabel }: WorkbenchShellProps) {
         <div className="workbench-content">{renderContent()}</div>
       </section>
 
-      <Dialog isOpen={isProfileOpen} onOpenChange={setIsProfileOpen} width={560} purpose="form" padding={5}>
-        <VStack gap={4} hAlign="stretch">
-          <HStack hAlign="between" vAlign="start">
-            <div>
-              <Text type="display-3" as="h2">
-                个人资料
-              </Text>
-              <Text type="body" color="secondary">
-                仅支持更新个人头像，其他字段由企业内部主数据同步。
-              </Text>
-            </div>
-            <Avatar src={profile?.avatarUrl} name={profile?.displayName ?? auth.user?.displayName} size={64} />
-          </HStack>
-
-          <TextInput
-            label="头像地址"
-            value={avatarDraft}
-            placeholder="https://example.com/avatar.png"
-            width="100%"
-            hasClear
-            onChange={setAvatarDraft}
-          />
-
-          <div className="profile-readonly-grid">
-            <ReadOnlyField label="姓名" value={profile?.displayName ?? ""} />
-            <ReadOnlyField label="邮箱" value={profile?.email ?? ""} />
-            <ReadOnlyField label="角色" value={roleLabel(profile?.role)} />
-            <ReadOnlyField label="部门" value={profile?.department ?? ""} />
-            <ReadOnlyField label="职务" value={profile?.title ?? ""} />
-            <ReadOnlyField label="联系方式" value={profile?.phone ?? ""} />
-          </div>
-
-          <HStack hAlign="end" gap={2}>
-            <Button label="关闭" variant="secondary" onClick={() => setIsProfileOpen(false)} />
-            <Button label="保存头像" variant="primary" isLoading={isSavingAvatar} onClick={handleAvatarSave} />
-          </HStack>
-        </VStack>
-      </Dialog>
-
-      <Dialog isOpen={isSettingsOpen} onOpenChange={setIsSettingsOpen} width={860} maxHeight="82vh" purpose="form" padding={0}>
-        <section className="settings-sidebar-shell">
+      <Dialog isOpen={isSettingsOpen} onOpenChange={setIsSettingsOpen} width={860} maxHeight="82vh" purpose="info" padding={0}>
+        <section className="settings-sidebar-shell" style={workbenchStyle}>
           <aside className="settings-sidebar-nav" aria-label="用户设置分类">
-            <Text type="display-3" as="h2">
-              用户设置
-            </Text>
+            <div className="settings-sidebar-heading">
+              <Text type="display-3" as="h2">
+                用户设置
+              </Text>
+              <Button label="关闭" variant="ghost" size="sm" onClick={() => setIsSettingsOpen(false)} />
+            </div>
             <div className="settings-tab-list">
               {settingsTabs.map((tab) => (
                 <button
@@ -423,6 +431,44 @@ export function WorkbenchShell({ auth, runtimeLabel }: WorkbenchShellProps) {
           </aside>
 
           <div className="settings-sidebar-content">
+            {activeSettingsTab === "profile" && (
+              <VStack gap={4} hAlign="stretch">
+                <HStack hAlign="between" vAlign="start">
+                  <div>
+                    <Text type="display-3" as="h3">
+                      个人资料
+                    </Text>
+                    <Text type="body" color="secondary">
+                      仅支持更新个人头像，其他字段由企业内部主数据同步。
+                    </Text>
+                  </div>
+                  <Avatar src={profile?.avatarUrl} name={profile?.displayName ?? auth.user?.displayName} size={64} />
+                </HStack>
+
+                <TextInput
+                  label="头像地址"
+                  value={avatarDraft}
+                  placeholder="https://example.com/avatar.png"
+                  width="100%"
+                  hasClear
+                  onChange={setAvatarDraft}
+                />
+
+                <div className="profile-readonly-grid">
+                  <ReadOnlyField label="姓名" value={profile?.displayName ?? ""} />
+                  <ReadOnlyField label="邮箱" value={profile?.email ?? ""} />
+                  <ReadOnlyField label="角色" value={roleLabel(profile?.role)} />
+                  <ReadOnlyField label="部门" value={profile?.department ?? ""} />
+                  <ReadOnlyField label="职务" value={profile?.title ?? ""} />
+                  <ReadOnlyField label="联系方式" value={profile?.phone ?? ""} />
+                </div>
+
+                <HStack hAlign="end" gap={2}>
+                  <Button label="保存头像" variant="primary" isLoading={isSavingAvatar} onClick={handleAvatarSave} />
+                </HStack>
+              </VStack>
+            )}
+
             {activeSettingsTab === "general" && (
               <VStack gap={4} hAlign="stretch">
                 <Text type="display-3" as="h3">
@@ -491,6 +537,40 @@ export function WorkbenchShell({ auth, runtimeLabel }: WorkbenchShellProps) {
                     setSettings((current) => ({ ...current, appearance: { ...current.appearance, accentColor } }))
                   }
                 />
+                <HStack gap={3} vAlign="start">
+                  <TextInput
+                    label="背景"
+                    value={settings.appearance.backgroundColor}
+                    placeholder="#f7fafc"
+                    onChange={(backgroundColor) =>
+                      setSettings((current) => ({ ...current, appearance: { ...current.appearance, backgroundColor } }))
+                    }
+                  />
+                  <TextInput
+                    label="前景"
+                    value={settings.appearance.foregroundColor}
+                    placeholder="#172033"
+                    onChange={(foregroundColor) =>
+                      setSettings((current) => ({ ...current, appearance: { ...current.appearance, foregroundColor } }))
+                    }
+                  />
+                </HStack>
+                <TextInput
+                  label="字体"
+                  value={settings.appearance.fontFamily}
+                  placeholder="Inter, PingFang SC, system-ui, sans-serif"
+                  onChange={(fontFamily) =>
+                    setSettings((current) => ({ ...current, appearance: { ...current.appearance, fontFamily } }))
+                  }
+                />
+                <TextInput
+                  label="代码字体"
+                  value={settings.appearance.codeFontFamily}
+                  placeholder="JetBrains Mono, SFMono-Regular, Menlo, monospace"
+                  onChange={(codeFontFamily) =>
+                    setSettings((current) => ({ ...current, appearance: { ...current.appearance, codeFontFamily } }))
+                  }
+                />
                 <Slider
                   label="UI 字号"
                   min={12}
@@ -557,10 +637,10 @@ export function WorkbenchShell({ auth, runtimeLabel }: WorkbenchShellProps) {
               </VStack>
             )}
 
-            {activeSettingsTab === "configuration" && (
+            {activeSettingsTab === "agent" && (
               <VStack gap={4} hAlign="stretch">
                 <Text type="display-3" as="h3">
-                  配置
+                  智能体配置
                 </Text>
                 <Section variant="muted" padding={4}>
                   <VStack gap={3} hAlign="stretch">
@@ -579,6 +659,13 @@ export function WorkbenchShell({ auth, runtimeLabel }: WorkbenchShellProps) {
                       API Key 状态：
                       {settings.configuration.apiKeyStatus === "configured" ? "已配置（脱敏）" : "未配置"}
                     </Text>
+                    <TextInput
+                      label="模型 API Key"
+                      type="password"
+                      value={apiKeyDraft}
+                      placeholder="输入新密钥后保存，仅更新脱敏配置状态"
+                      onChange={setApiKeyDraft}
+                    />
                     <Switch
                       label="启用 Skill"
                       value={settings.configuration.skillEnabled}
@@ -604,48 +691,53 @@ export function WorkbenchShell({ auth, runtimeLabel }: WorkbenchShellProps) {
               </VStack>
             )}
 
-            {activeSettingsTab === "personalization" && (
+            {activeSettingsTab === "logout" && (
               <VStack gap={4} hAlign="stretch">
                 <Text type="display-3" as="h3">
-                  个性化
+                  退出登录
                 </Text>
-                <Selector
-                  label="默认入口"
-                  value={settings.personalization.defaultModule}
-                  options={[
-                    { label: "数据助手", value: "data-assistant" },
-                    { label: "数据管理", value: "data-management" },
-                  ]}
-                  onChange={(defaultModule) =>
-                    setSettings((current) => ({
-                      ...current,
-                      personalization: {
-                        ...current.personalization,
-                        defaultModule: defaultModule as WorkbenchSettings["personalization"]["defaultModule"],
-                      },
-                    }))
-                  }
-                />
-                <Switch
-                  label="紧凑导航"
-                  description="减少侧边导航纵向间距，适合小屏工作环境。"
-                  value={settings.personalization.compactNavigation}
-                  onChange={(compactNavigation) =>
-                    setSettings((current) => ({
-                      ...current,
-                      personalization: { ...current.personalization, compactNavigation },
-                    }))
-                  }
-                />
+                <Section variant="muted" padding={4}>
+                  <VStack gap={3} hAlign="stretch">
+                    <Text type="body" color="secondary">
+                      退出后会清理本地刷新令牌和当前运行时访问令牌，并返回登录页。
+                    </Text>
+                    <Button label="退出登录" variant="destructive" onClick={requestLogout} />
+                  </VStack>
+                </Section>
               </VStack>
             )}
 
             <div className="settings-footer">
               <Button label="关闭" variant="secondary" onClick={() => setIsSettingsOpen(false)} />
-              <Button label="保存设置" variant="primary" isLoading={isSavingSettings} onClick={handleSettingsSave} />
+              {activeSettingsTab !== "profile" && activeSettingsTab !== "logout" && (
+                <Button label="保存设置" variant="primary" isLoading={isSavingSettings} onClick={handleSettingsSave} />
+              )}
             </div>
           </div>
         </section>
+      </Dialog>
+
+      <Dialog
+        isOpen={isLogoutConfirmOpen}
+        onOpenChange={setIsLogoutConfirmOpen}
+        width={420}
+        purpose="info"
+        padding={5}
+      >
+        <VStack gap={4} hAlign="stretch">
+          <div>
+            <Text type="display-3" as="h2">
+              确认退出登录
+            </Text>
+            <Text type="body" color="secondary">
+              退出后会清理当前登录态，并返回登录页。
+            </Text>
+          </div>
+          <HStack hAlign="end" gap={2}>
+            <Button label="取消" variant="secondary" onClick={() => setIsLogoutConfirmOpen(false)} />
+            <Button label="确认退出" variant="destructive" onClick={confirmLogout} />
+          </HStack>
+        </VStack>
       </Dialog>
     </AppShell>
   );

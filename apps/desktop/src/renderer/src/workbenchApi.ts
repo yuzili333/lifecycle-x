@@ -15,6 +15,10 @@ export type WorkbenchSettings = {
   appearance: {
     themeMode: "light" | "dark";
     accentColor: string;
+    backgroundColor: string;
+    foregroundColor: string;
+    fontFamily: string;
+    codeFontFamily: string;
     uiFontSize: number;
     codeFontSize: number;
     translucentSidebar: boolean;

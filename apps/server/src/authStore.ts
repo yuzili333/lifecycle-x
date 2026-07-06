@@ -62,6 +62,10 @@ export type WorkbenchSettings = {
   appearance: {
     themeMode: "light" | "dark";
     accentColor: string;
+    backgroundColor: string;
+    foregroundColor: string;
+    fontFamily: string;
+    codeFontFamily: string;
     uiFontSize: number;
     codeFontSize: number;
     translucentSidebar: boolean;
@@ -425,8 +429,12 @@ export class AuthStore {
           notificationsEnabled: true,
         },
         appearance: {
-          themeMode: "light",
-          accentColor: "#108387",
+          themeMode: "dark",
+          accentColor: "#65d6d2",
+          backgroundColor: "#0f1724",
+          foregroundColor: "#e6edf6",
+          fontFamily: "Inter, PingFang SC, Microsoft YaHei, system-ui, sans-serif",
+          codeFontFamily: "JetBrains Mono, SFMono-Regular, Menlo, Consolas, monospace",
           uiFontSize: 14,
           codeFontSize: 13,
           translucentSidebar: false,

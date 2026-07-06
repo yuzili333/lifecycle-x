@@ -92,9 +92,32 @@ describe("AuthStore", () => {
     expect(store.findUserByIdentifier("analyst")?.avatarUrl).toBe("https://example.com/avatar.png");
 
     const settings = store.updateSettings(user.id, {
+      appearance: {
+        themeMode: "dark",
+        accentColor: "#5ad4d0",
+        backgroundColor: "#101820",
+        foregroundColor: "#f7fafc",
+        fontFamily: "Inter, system-ui",
+        codeFontFamily: "Menlo, monospace",
+        uiFontSize: 15,
+        codeFontSize: 14,
+        translucentSidebar: true,
+        contrast: "high",
+        dockIcon: "deep",
+      },
+      configuration: {
+        modelProvider: "Enterprise Gateway",
+        apiKeyStatus: "configured",
+        skillEnabled: true,
+        mcpEnabled: false,
+      },
       personalization: { defaultModule: "data-management", compactNavigation: true },
     });
     expect(settings?.personalization.defaultModule).toBe("data-management");
     expect(settings?.general.language).toBe("zh-CN");
+    expect(settings?.appearance.backgroundColor).toBe("#101820");
+    expect(settings?.appearance.codeFontFamily).toBe("Menlo, monospace");
+    expect(settings?.configuration.apiKeyStatus).toBe("configured");
+    expect(settings?.configuration.mcpEnabled).toBe(false);
   });
 });
