@@ -12,6 +12,10 @@ export type AuthState = {
   lastError: AuthFailure | null;
 };
 
+type RefreshSessionOptions = {
+  clearOnFailure?: boolean;
+};
+
 export function useAuthStore() {
   const [state, setState] = useState<AuthState>({
     status: "checking",
@@ -98,17 +102,20 @@ export function useAuthStore() {
     });
   }, []);
 
-  const refreshSession = useCallback(async (): Promise<AuthSuccess | false> => {
+  const refreshSession = useCallback(async (options: RefreshSessionOptions = {}): Promise<AuthSuccess | false> => {
+    const clearOnFailure = options.clearOnFailure ?? true;
     const refreshToken = (await window.lifecycleX?.auth.getRefreshToken()) ?? null;
     if (!refreshToken) {
-      setState({
-        status: "anonymous",
-        accessToken: null,
-        user: null,
-        permissions: [],
-        expiresAt: null,
-        lastError: null,
-      });
+      if (clearOnFailure) {
+        setState({
+          status: "anonymous",
+          accessToken: null,
+          user: null,
+          permissions: [],
+          expiresAt: null,
+          lastError: null,
+        });
+      }
       return false;
     }
 
@@ -118,15 +125,17 @@ export function useAuthStore() {
       return result;
     }
 
-    await window.lifecycleX?.auth.clearRefreshToken();
-    setState({
-      status: "anonymous",
-      accessToken: null,
-      user: null,
-      permissions: [],
-      expiresAt: null,
-      lastError: result,
-    });
+    if (clearOnFailure) {
+      await window.lifecycleX?.auth.clearRefreshToken();
+      setState({
+        status: "anonymous",
+        accessToken: null,
+        user: null,
+        permissions: [],
+        expiresAt: null,
+        lastError: result,
+      });
+    }
     return false;
   }, [applySuccess]);
 

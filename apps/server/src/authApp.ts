@@ -1,6 +1,7 @@
 import express, { type Request, type Response } from "express";
 import { randomUUID } from "node:crypto";
 import { AuthStore, MAX_FAILED_ATTEMPTS, type WorkbenchSettings } from "./authStore.js";
+import { DataManagementStore, type ConnectionInput } from "./dataManagementStore.js";
 import type { AuthErrorCode, AuthFailure, AuthSuccess, AuthUser, ClientInfo } from "./types.js";
 
 const DEFAULT_PORT = 4317;
@@ -104,14 +105,51 @@ function isValidSettingsPatch(value: unknown): value is Partial<WorkbenchSetting
   return Object.keys(value).every((key) => allowedRootKeys.has(key) && isPlainObject(value[key]));
 }
 
-export function createAuthApp(store = new AuthStore()) {
+function resolveAuthorizedRequest(store: AuthStore, request: Request, permission: string) {
+  const resolved = resolveAuthenticatedRequest(store, request);
+  if (!resolved) {
+    return { resolved: null, status: 401 as const, code: "SESSION_EXPIRED" as const, message: "登录态已过期，请重新登录。" };
+  }
+
+  if (!store.permissionsFor(resolved.user).includes(permission)) {
+    return { resolved: null, status: 403 as const, code: "PERMISSION_DENIED" as const, message: "当前用户无权访问该数据管理能力。" };
+  }
+
+  return { resolved, status: 200 as const, code: undefined, message: undefined };
+}
+
+function connectionInput(value: unknown): ConnectionInput | null {
+  if (!isPlainObject(value)) {
+    return null;
+  }
+  const port = typeof value.port === "number" ? value.port : Number(value.port ?? 3306);
+  return {
+    name: typeof value.name === "string" ? value.name : undefined,
+    type: value.type === "csv" ? "csv" : "mysql",
+    environment:
+      value.environment === "production" ||
+      value.environment === "staging" ||
+      value.environment === "development" ||
+      value.environment === "imported"
+        ? value.environment
+        : "staging",
+    host: typeof value.host === "string" ? value.host : undefined,
+    port: Number.isFinite(port) ? port : 3306,
+    database: typeof value.database === "string" ? value.database : undefined,
+    username: typeof value.username === "string" ? value.username : undefined,
+    password: typeof value.password === "string" ? value.password : undefined,
+    readonly: typeof value.readonly === "boolean" ? value.readonly : undefined,
+  };
+}
+
+export function createAuthApp(store = new AuthStore(), dataStore = new DataManagementStore()) {
   const app = express();
 
-  app.use(express.json({ limit: "256kb" }));
+  app.use(express.json({ limit: "2mb" }));
   app.use((request, response, next) => {
     response.setHeader("Access-Control-Allow-Origin", "*");
     response.setHeader("Access-Control-Allow-Headers", "content-type, authorization");
-    response.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,OPTIONS");
+    response.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS");
     if (request.method === "OPTIONS") {
       response.status(204).end();
       return;
@@ -477,6 +515,295 @@ export function createAuthApp(store = new AuthStore()) {
     }
     store.appendAudit({ traceId, userId: resolved.user.id, method: "settings-update", result: "success", ...meta });
     response.json({ success: true, settings });
+  });
+
+  app.get("/data-sources", (request, response) => {
+    const traceId = randomUUID();
+    const auth = resolveAuthorizedRequest(store, request, "datasource:read");
+    if (!auth.resolved) {
+      sendFailure(response, auth.status, auth.code, auth.message, traceId);
+      return;
+    }
+
+    response.json({ success: true, dataSources: dataStore.listDataSources() });
+  });
+
+  app.post("/data-sources", (request, response) => {
+    const traceId = randomUUID();
+    const auth = resolveAuthorizedRequest(store, request, "datasource:manage");
+    if (!auth.resolved) {
+      sendFailure(response, auth.status, auth.code, auth.message, traceId);
+      return;
+    }
+
+    const input = connectionInput(request.body);
+    if (!input?.name || !input.host || !input.database || !input.username) {
+      sendFailure(response, 400, "VALIDATION_ERROR", "数据源连接信息不完整。", traceId, {
+        fields: {
+          ...(!input?.name ? { name: "连接名称不能为空。" } : {}),
+          ...(!input?.host ? { host: "主机不能为空。" } : {}),
+          ...(!input?.database ? { database: "数据库不能为空。" } : {}),
+          ...(!input?.username ? { username: "用户名不能为空。" } : {}),
+        },
+      });
+      return;
+    }
+
+    if (input.port && ![0, 3306, 3307, 3316].includes(input.port)) {
+      sendFailure(response, 400, "VALIDATION_ERROR", "端口不在允许范围内。", traceId, {
+        fields: { port: "P0 仅允许 3306、3307、3316 或 CSV 本地导入端口。" },
+      });
+      return;
+    }
+
+    const dataSource = dataStore.createDataSource(input, auth.resolved.user.id);
+    response.json({ success: true, dataSource });
+  });
+
+  app.post("/data-sources/test-connection", (request, response) => {
+    const traceId = randomUUID();
+    const auth = resolveAuthorizedRequest(store, request, "datasource:manage");
+    if (!auth.resolved) {
+      sendFailure(response, auth.status, auth.code, auth.message, traceId);
+      return;
+    }
+
+    const input = connectionInput(request.body);
+    if (!input?.host || !input.database || !input.username || !input.password) {
+      sendFailure(response, 400, "VALIDATION_ERROR", "测试连接参数不完整。", traceId, {
+        fields: {
+          ...(!input?.host ? { host: "主机不能为空。" } : {}),
+          ...(!input?.database ? { database: "数据库不能为空。" } : {}),
+          ...(!input?.username ? { username: "用户名不能为空。" } : {}),
+          ...(!input?.password ? { password: "密码不能为空。" } : {}),
+        },
+      });
+      return;
+    }
+
+    if (input.port && ![3306, 3307, 3316].includes(input.port)) {
+      sendFailure(response, 400, "VALIDATION_ERROR", "端口不在允许范围内。", traceId, {
+        fields: { port: "P0 仅允许 3306、3307、3316。" },
+      });
+      return;
+    }
+
+    response.json(dataStore.testDraftConnection(input));
+  });
+
+  app.patch("/data-sources/:dataSourceId", (request, response) => {
+    const traceId = randomUUID();
+    const auth = resolveAuthorizedRequest(store, request, "datasource:manage");
+    if (!auth.resolved) {
+      sendFailure(response, auth.status, auth.code, auth.message, traceId);
+      return;
+    }
+
+    const input = connectionInput(request.body);
+    if (!input) {
+      sendFailure(response, 400, "VALIDATION_ERROR", "数据源更新参数不合法。", traceId);
+      return;
+    }
+
+    const dataSource = dataStore.updateDataSource(request.params.dataSourceId, input);
+    if (!dataSource) {
+      sendFailure(response, 404, "DATA_SOURCE_UNAVAILABLE", "数据源不存在。", traceId);
+      return;
+    }
+    response.json({ success: true, dataSource });
+  });
+
+  app.post("/data-sources/:dataSourceId/test-connection", (request, response) => {
+    const traceId = randomUUID();
+    const auth = resolveAuthorizedRequest(store, request, "datasource:read");
+    if (!auth.resolved) {
+      sendFailure(response, auth.status, auth.code, auth.message, traceId);
+      return;
+    }
+
+    const result = dataStore.testConnection(request.params.dataSourceId);
+    if (!result) {
+      sendFailure(response, 404, "DATA_SOURCE_UNAVAILABLE", "数据源不存在或不可用。", traceId);
+      return;
+    }
+    response.json(result);
+  });
+
+  app.post("/data-sources/:dataSourceId/metadata/sync", (request, response) => {
+    const traceId = randomUUID();
+    const auth = resolveAuthorizedRequest(store, request, "datasource:manage");
+    if (!auth.resolved) {
+      sendFailure(response, auth.status, auth.code, auth.message, traceId);
+      return;
+    }
+
+    const dataSource = dataStore.syncMetadata(request.params.dataSourceId);
+    if (!dataSource) {
+      sendFailure(response, 404, "DATA_SOURCE_UNAVAILABLE", "数据源不存在或不可用。", traceId);
+      return;
+    }
+    response.json({ success: true, dataSource });
+  });
+
+  app.get("/data-sources/:dataSourceId/schemas", (request, response) => {
+    const traceId = randomUUID();
+    const auth = resolveAuthorizedRequest(store, request, "datasource:read");
+    if (!auth.resolved) {
+      sendFailure(response, auth.status, auth.code, auth.message, traceId);
+      return;
+    }
+    response.json({ success: true, schemas: dataStore.listSchemas(request.params.dataSourceId) });
+  });
+
+  app.get("/data-sources/:dataSourceId/tables", (request, response) => {
+    const traceId = randomUUID();
+    const auth = resolveAuthorizedRequest(store, request, "datasource:read");
+    if (!auth.resolved) {
+      sendFailure(response, auth.status, auth.code, auth.message, traceId);
+      return;
+    }
+    const schema = typeof request.query.schema === "string" ? request.query.schema : undefined;
+    response.json({ success: true, tables: dataStore.listTables(request.params.dataSourceId, schema) });
+  });
+
+  app.get("/data-sources/:dataSourceId/tables/:tableId", (request, response) => {
+    const traceId = randomUUID();
+    const auth = resolveAuthorizedRequest(store, request, "datasource:read");
+    if (!auth.resolved) {
+      sendFailure(response, auth.status, auth.code, auth.message, traceId);
+      return;
+    }
+    const table = dataStore.tableDetail(request.params.dataSourceId, request.params.tableId);
+    if (!table) {
+      sendFailure(response, 404, "DATA_SOURCE_UNAVAILABLE", "表元数据不存在。", traceId);
+      return;
+    }
+    response.json({ success: true, table });
+  });
+
+  app.post("/data-sources/:dataSourceId/query/sample", (request, response) => {
+    const traceId = randomUUID();
+    const auth = resolveAuthorizedRequest(store, request, "datasource:read");
+    if (!auth.resolved) {
+      sendFailure(response, auth.status, auth.code, auth.message, traceId);
+      return;
+    }
+    const { tableId, columns, limit } = request.body as { tableId?: string; columns?: string[]; limit?: number };
+    if (!tableId) {
+      sendFailure(response, 400, "VALIDATION_ERROR", "表标识不能为空。", traceId, { fields: { tableId: "表标识不能为空。" } });
+      return;
+    }
+    const result = dataStore.sampleData(request.params.dataSourceId, tableId, auth.resolved.user.id, traceId, columns, limit);
+    if (!result) {
+      sendFailure(response, 423, "QUERY_BLOCKED", "样例数据读取被安全策略拦截。", traceId);
+      return;
+    }
+    response.json(result);
+  });
+
+  app.post("/data-sources/:dataSourceId/query/large-table-plan", (request, response) => {
+    const traceId = randomUUID();
+    const auth = resolveAuthorizedRequest(store, request, "datasource:read");
+    if (!auth.resolved) {
+      sendFailure(response, auth.status, auth.code, auth.message, traceId);
+      return;
+    }
+    const { tableId } = request.body as { tableId?: string };
+    if (!tableId) {
+      sendFailure(response, 400, "VALIDATION_ERROR", "表标识不能为空。", traceId);
+      return;
+    }
+    const plan = dataStore.largeTablePlan(request.params.dataSourceId, tableId, auth.resolved.user.id, traceId);
+    if (!plan) {
+      sendFailure(response, 404, "DATA_SOURCE_UNAVAILABLE", "表元数据不存在。", traceId);
+      return;
+    }
+    response.json(plan);
+  });
+
+  app.post("/data-sources/:dataSourceId/query/confirm-large-table", (request, response) => {
+    const traceId = randomUUID();
+    const auth = resolveAuthorizedRequest(store, request, "datasource:read");
+    if (!auth.resolved) {
+      sendFailure(response, auth.status, auth.code, auth.message, traceId);
+      return;
+    }
+    const { tableId } = request.body as { tableId?: string };
+    if (!tableId) {
+      sendFailure(response, 400, "VALIDATION_ERROR", "表标识不能为空。", traceId);
+      return;
+    }
+    const result = dataStore.confirmLargeTable(request.params.dataSourceId, tableId, auth.resolved.user.id, traceId);
+    if (!result) {
+      sendFailure(response, 423, "QUERY_BLOCKED", "大表读取被安全策略拦截。", traceId);
+      return;
+    }
+    response.json(result);
+  });
+
+  app.post("/queries/:queryId/cancel", (request, response) => {
+    const traceId = randomUUID();
+    const auth = resolveAuthorizedRequest(store, request, "datasource:read");
+    if (!auth.resolved) {
+      sendFailure(response, auth.status, auth.code, auth.message, traceId);
+      return;
+    }
+    response.json(dataStore.cancelQuery(request.params.queryId, auth.resolved.user.id, traceId));
+  });
+
+  app.post("/csv/files", (request, response) => {
+    const traceId = randomUUID();
+    const auth = resolveAuthorizedRequest(store, request, "datasource:manage");
+    if (!auth.resolved) {
+      sendFailure(response, auth.status, auth.code, auth.message, traceId);
+      return;
+    }
+    const { name, content } = request.body as { name?: string; content?: string };
+    if (!name || !content) {
+      sendFailure(response, 400, "VALIDATION_ERROR", "CSV 文件名和内容不能为空。", traceId);
+      return;
+    }
+    response.json(dataStore.uploadCsv(name, content));
+  });
+
+  app.post("/csv/files/:fileId/preview", (request, response) => {
+    const traceId = randomUUID();
+    const auth = resolveAuthorizedRequest(store, request, "datasource:read");
+    if (!auth.resolved) {
+      sendFailure(response, auth.status, auth.code, auth.message, traceId);
+      return;
+    }
+    const preview = dataStore.previewCsv(request.params.fileId);
+    if (!preview) {
+      sendFailure(response, 404, "DATA_SOURCE_UNAVAILABLE", "CSV 文件不存在。", traceId);
+      return;
+    }
+    response.json(preview);
+  });
+
+  app.post("/csv/files/:fileId/import", (request, response) => {
+    const traceId = randomUUID();
+    const auth = resolveAuthorizedRequest(store, request, "datasource:manage");
+    if (!auth.resolved) {
+      sendFailure(response, auth.status, auth.code, auth.message, traceId);
+      return;
+    }
+    const result = dataStore.importCsv(request.params.fileId, auth.resolved.user.id);
+    if (!result) {
+      sendFailure(response, 404, "DATA_SOURCE_UNAVAILABLE", "CSV 文件不存在。", traceId);
+      return;
+    }
+    response.json(result);
+  });
+
+  app.get("/agent/context/schema", (request, response) => {
+    const traceId = randomUUID();
+    const auth = resolveAuthorizedRequest(store, request, "datasource:read");
+    if (!auth.resolved) {
+      sendFailure(response, auth.status, auth.code, auth.message, traceId);
+      return;
+    }
+    response.json(dataStore.schemaContext());
   });
 
   return { app, store };

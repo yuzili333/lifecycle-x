@@ -10,3 +10,7 @@ tmp/
 *.log
 
 output/
+
+# environment variables
+.env
+.env.*

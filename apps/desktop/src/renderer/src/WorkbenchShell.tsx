@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type CSSProperties, type ReactNode } from "react";
+import { Activity, useCallback, useEffect, useMemo, useState, type CSSProperties, type FormEvent, type ReactNode } from "react";
 import { AppShell } from "@astryxdesign/core/AppShell";
 import { Avatar } from "@astryxdesign/core/Avatar";
 import { Button } from "@astryxdesign/core/Button";
@@ -15,16 +15,17 @@ import {
   useSideNavCollapse,
 } from "@astryxdesign/core/SideNav";
 import { Slider } from "@astryxdesign/core/Slider";
-import { Spinner } from "@astryxdesign/core/Spinner";
 import { Switch } from "@astryxdesign/core/Switch";
 import { Text } from "@astryxdesign/core/Text";
 import { TextInput } from "@astryxdesign/core/TextInput";
-import { useToast } from "@astryxdesign/core/Toast";
 import type { AuthFailure } from "./auth";
+import { DataManagementWorkspace } from "./DataManagementWorkspace";
+import { useAppToast } from "./useAppToast";
 import type { useAuthStore } from "./useAuthStore";
 import aiIcon from "./assets/ai.svg";
 import databaseIcon from "./assets/database.svg";
 import { workbenchApi, type ApiResult, type UserProfile, type WorkbenchSettings } from "./workbenchApi";
+import type { DataSourceMenuAction } from "../../preload";
 
 type WorkbenchAuth = ReturnType<typeof useAuthStore>;
 
@@ -35,6 +36,10 @@ type WorkbenchShellProps = {
 
 type WorkbenchModule = "data-assistant" | "data-management";
 type SettingsTab = "profile" | "general" | "appearance" | "agent" | "logout";
+
+const DEFAULT_WORKBENCH_MODULE: WorkbenchModule = "data-assistant";
+const WORKBENCH_NAV_CACHE_KEY_PREFIX = "cycle-probe:workbench:last-module";
+const MODEL_CONFIG_PROMPT_CACHE_KEY_PREFIX = "cycle-probe:workbench:model-config-prompted";
 
 const defaultSettings: WorkbenchSettings = {
   general: {
@@ -56,7 +61,8 @@ const defaultSettings: WorkbenchSettings = {
     dockIcon: "default",
   },
   configuration: {
-    modelProvider: "OpenAI Compatible",
+    modelProvider: "Siliconflow",
+    modelName: "",
     apiKeyStatus: "not_configured",
     skillEnabled: false,
     mcpEnabled: false,
@@ -66,6 +72,118 @@ const defaultSettings: WorkbenchSettings = {
     compactNavigation: false,
   },
 };
+
+function isWorkbenchModule(value: string | null): value is WorkbenchModule {
+  return value === "data-assistant" || value === "data-management";
+}
+
+function canAccessWorkbenchModule(module: WorkbenchModule, permissions: string[]) {
+  if (module === "data-assistant") {
+    return permissions.includes("analysis:read");
+  }
+  return permissions.includes("datasource:read");
+}
+
+function fallbackWorkbenchModule(permissions: string[]): WorkbenchModule {
+  if (canAccessWorkbenchModule(DEFAULT_WORKBENCH_MODULE, permissions)) {
+    return DEFAULT_WORKBENCH_MODULE;
+  }
+  if (canAccessWorkbenchModule("data-management", permissions)) {
+    return "data-management";
+  }
+  return DEFAULT_WORKBENCH_MODULE;
+}
+
+function workbenchNavCacheKey(user: WorkbenchAuth["user"]) {
+  return `${WORKBENCH_NAV_CACHE_KEY_PREFIX}:${user?.id ?? "anonymous"}`;
+}
+
+function readCachedWorkbenchModule(user: WorkbenchAuth["user"], permissions: string[]): WorkbenchModule {
+  const fallback = fallbackWorkbenchModule(permissions);
+  if (typeof window === "undefined") {
+    return fallback;
+  }
+
+  try {
+    const cached = window.localStorage.getItem(workbenchNavCacheKey(user));
+    if (isWorkbenchModule(cached) && canAccessWorkbenchModule(cached, permissions)) {
+      return cached;
+    }
+  } catch {
+    return fallback;
+  }
+
+  return fallback;
+}
+
+function writeCachedWorkbenchModule(user: WorkbenchAuth["user"], module: WorkbenchModule) {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(workbenchNavCacheKey(user), module);
+  } catch {
+    // Ignore storage failures; navigation state still works in memory.
+  }
+}
+
+function modelConfigPromptCacheKey(user: WorkbenchAuth["user"]) {
+  return `${MODEL_CONFIG_PROMPT_CACHE_KEY_PREFIX}:${user?.id ?? "anonymous"}`;
+}
+
+function hasPromptedModelConfiguration(user: WorkbenchAuth["user"]) {
+  if (typeof window === "undefined") {
+    return false;
+  }
+
+  try {
+    return window.localStorage.getItem(modelConfigPromptCacheKey(user)) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function markModelConfigurationPrompted(user: WorkbenchAuth["user"]) {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(modelConfigPromptCacheKey(user), "1");
+  } catch {
+    // Ignore storage failures; the settings prompt can still be shown in this session.
+  }
+}
+
+function isModelConfigurationReady(settings: WorkbenchSettings) {
+  return (
+    settings.configuration.modelProvider.trim().length > 0 &&
+    settings.configuration.modelName.trim().length > 0 &&
+    settings.configuration.apiKeyStatus === "configured"
+  );
+}
+
+function normalizeWorkbenchSettings(settings: WorkbenchSettings): WorkbenchSettings {
+  return {
+    general: { ...defaultSettings.general, ...settings.general },
+    appearance: { ...defaultSettings.appearance, ...settings.appearance },
+    configuration: { ...defaultSettings.configuration, ...settings.configuration },
+    personalization: { ...defaultSettings.personalization, ...settings.personalization },
+  };
+}
+
+async function hasLocalModelApiKey(user: WorkbenchAuth["user"]) {
+  if (!user?.id || !window.lifecycleX?.modelApiKey) {
+    return false;
+  }
+
+  try {
+    return await window.lifecycleX.modelApiKey.has(user.id);
+  } catch {
+    return false;
+  }
+}
 
 const settingsTabs: Array<{ id: SettingsTab; label: string; description: string }> = [
   { id: "profile", label: "个人资料", description: "头像和企业主数据" },
@@ -137,39 +255,77 @@ function NavAssetIcon({ src }: { src: string }) {
   return <span className="nav-asset-icon" style={{ "--nav-icon-url": `url(${src})` } as CSSProperties} aria-hidden="true" />;
 }
 
-function SideNavUserCard({ profile, user }: { profile: UserProfile | null; user: WorkbenchAuth["user"] }) {
+function SideNavUserCard({
+  profile,
+  user,
+  onOpenSettings,
+  onLogout,
+}: {
+  profile: UserProfile | null;
+  user: WorkbenchAuth["user"];
+  onOpenSettings: () => void;
+  onLogout: () => void;
+}) {
   const { isCollapsed } = useSideNavCollapse();
+  const displayName = profile?.displayName ?? user?.displayName ?? "用户";
+  const email = profile?.email ?? user?.email ?? "";
 
   return (
-    <div className={isCollapsed ? "side-user-avatar-only" : "side-user"}>
-      <Avatar src={profile?.avatarUrl} name={profile?.displayName ?? user?.displayName} size={isCollapsed ? 32 : 36} />
-      {!isCollapsed && (
-        <div className="side-user-copy">
-          <strong>{profile?.displayName ?? user?.displayName}</strong>
-          <span>{profile?.email ?? user?.email}</span>
-        </div>
-      )}
-    </div>
+    <DropdownMenu
+      button={{
+        label: "用户菜单",
+        variant: "ghost",
+        size: "md",
+        className: isCollapsed ? "side-user-menu-trigger collapsed" : "side-user-menu-trigger",
+        children: (
+          <span className={isCollapsed ? "side-user-avatar-only" : "side-user"}>
+            <Avatar src={profile?.avatarUrl} name={displayName} size={isCollapsed ? 32 : 36} />
+            {!isCollapsed && (
+              <span className="side-user-copy">
+                <strong>{displayName}</strong>
+                <span>{email}</span>
+              </span>
+            )}
+          </span>
+        ),
+      }}
+      hasChevron={false}
+      menuWidth={180}
+      placement="above"
+      items={[
+        { label: "设置", onClick: onOpenSettings },
+        { type: "divider" },
+        { label: "退出登录", onClick: onLogout },
+      ]}
+    />
   );
 }
 
-export function WorkbenchShell({ auth, runtimeLabel }: WorkbenchShellProps) {
-  const toast = useToast();
-  const [activeModule, setActiveModule] = useState<WorkbenchModule>("data-assistant");
+export function WorkbenchShell({ auth }: WorkbenchShellProps) {
+  const toast = useAppToast();
+  const [activeModule, setActiveModule] = useState<WorkbenchModule>(() => readCachedWorkbenchModule(auth.user, auth.permissions));
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isLogoutConfirmOpen, setIsLogoutConfirmOpen] = useState(false);
+  const [isSessionExpiredConfirmOpen, setIsSessionExpiredConfirmOpen] = useState(false);
+  const [isModelConfigRequiredOpen, setIsModelConfigRequiredOpen] = useState(false);
+  const [pendingDataSourceAction, setPendingDataSourceAction] = useState<DataSourceMenuAction | null>(null);
   const [activeSettingsTab, setActiveSettingsTab] = useState<SettingsTab>("profile");
   const [profile, setProfile] = useState<UserProfile | null>(() => fallbackProfile(auth.user));
   const [avatarDraft, setAvatarDraft] = useState(auth.user?.avatarUrl ?? "");
+  const [assistantDraft, setAssistantDraft] = useState("");
   const [apiKeyDraft, setApiKeyDraft] = useState("");
   const [settings, setSettings] = useState<WorkbenchSettings>(defaultSettings);
-  const [isLoadingWorkbench, setIsLoadingWorkbench] = useState(true);
   const [isSavingAvatar, setIsSavingAvatar] = useState(false);
   const [isSavingSettings, setIsSavingSettings] = useState(false);
+
+  const openSessionExpiredConfirm = useCallback(() => {
+    setIsSessionExpiredConfirmOpen(true);
+  }, []);
 
   const requestWithRefresh = useCallback(
     async <T extends { success: true }>(call: (accessToken: string) => Promise<ApiResult<T>>): Promise<ApiResult<T>> => {
       if (!auth.accessToken) {
+        openSessionExpiredConfirm();
         return {
           success: false,
           error: {
@@ -185,14 +341,27 @@ export function WorkbenchShell({ auth, runtimeLabel }: WorkbenchShellProps) {
         return result;
       }
 
-      const refreshed = await auth.refreshSession();
-      return refreshed ? call(refreshed.accessToken) : result;
+      const refreshed = await auth.refreshSession({ clearOnFailure: false });
+      if (!refreshed) {
+        openSessionExpiredConfirm();
+        return result;
+      }
+
+      const retryResult = await call(refreshed.accessToken);
+      if (isFailure(retryResult) && retryResult.error.code === "SESSION_EXPIRED") {
+        openSessionExpiredConfirm();
+      }
+      return retryResult;
     },
-    [auth],
+    [auth, openSessionExpiredConfirm],
   );
 
   const showError = useCallback(
     (result: AuthFailure) => {
+      if (result.error.code === "SESSION_EXPIRED") {
+        openSessionExpiredConfirm();
+        return;
+      }
       toast({
         type: "error",
         body: `${result.error.message} Trace: ${result.error.traceId}`,
@@ -200,16 +369,28 @@ export function WorkbenchShell({ auth, runtimeLabel }: WorkbenchShellProps) {
         collisionBehavior: "overwrite",
       });
     },
-    [toast],
+    [openSessionExpiredConfirm, toast],
   );
+
+  useEffect(() => {
+    setActiveModule(readCachedWorkbenchModule(auth.user, auth.permissions));
+  }, [auth.permissions, auth.user]);
+
+  useEffect(() => {
+    if (!canAccessWorkbenchModule(activeModule, auth.permissions)) {
+      setActiveModule(readCachedWorkbenchModule(auth.user, auth.permissions));
+      return;
+    }
+    writeCachedWorkbenchModule(auth.user, activeModule);
+  }, [activeModule, auth.permissions, auth.user]);
 
   useEffect(() => {
     let isMounted = true;
 
     async function loadWorkbench() {
-      setIsLoadingWorkbench(true);
       const profileResult = await requestWithRefresh(workbenchApi.profile);
       const settingsResult = await requestWithRefresh(workbenchApi.settings);
+      const localModelApiKeyConfigured = await hasLocalModelApiKey(auth.user);
 
       if (!isMounted) {
         return;
@@ -226,17 +407,43 @@ export function WorkbenchShell({ auth, runtimeLabel }: WorkbenchShellProps) {
       if (isFailure(settingsResult)) {
         showError(settingsResult);
       } else {
-        setSettings(settingsResult.settings);
+        const normalizedSettings = normalizeWorkbenchSettings(settingsResult.settings);
+        const nextSettings: WorkbenchSettings = {
+          ...normalizedSettings,
+          configuration: {
+            ...normalizedSettings.configuration,
+            apiKeyStatus: localModelApiKeyConfigured ? "configured" : "not_configured",
+          },
+        };
+        setSettings(nextSettings);
+        if (!isModelConfigurationReady(nextSettings) && !hasPromptedModelConfiguration(auth.user)) {
+          markModelConfigurationPrompted(auth.user);
+          setActiveSettingsTab("agent");
+          setIsSettingsOpen(true);
+          toast({
+            type: "info",
+            body: "请先完成大模型配置后再使用数据助手对话功能。",
+            uniqueID: "model-config-required",
+            collisionBehavior: "overwrite",
+          });
+        }
       }
-
-      setIsLoadingWorkbench(false);
     }
 
     void loadWorkbench();
     return () => {
       isMounted = false;
     };
-  }, [auth.user, requestWithRefresh, showError]);
+  }, [auth.user, requestWithRefresh, showError, toast]);
+
+  useEffect(() => {
+    const dispose = window.lifecycleX?.dataSource.onAction((action) => {
+      setActiveModule("data-management");
+      setPendingDataSourceAction(action);
+    });
+
+    return () => dispose?.();
+  }, []);
 
   const navItems = useMemo(
     () => [
@@ -247,7 +454,6 @@ export function WorkbenchShell({ auth, runtimeLabel }: WorkbenchShellProps) {
   );
 
   const visibleNavItems = navItems.filter((item) => auth.permissions.includes(item.permission));
-  const currentTitle = visibleNavItems.find((item) => item.id === activeModule)?.label ?? "数据助手";
   const workbenchStyle = {
     "--workbench-background": settings.appearance.backgroundColor,
     "--workbench-foreground": settings.appearance.foregroundColor,
@@ -263,6 +469,11 @@ export function WorkbenchShell({ auth, runtimeLabel }: WorkbenchShellProps) {
     setIsSettingsOpen(true);
   };
 
+  const openAgentSettingsFromPrompt = () => {
+    setIsModelConfigRequiredOpen(false);
+    openSettings("agent");
+  };
+
   const requestLogout = () => {
     setIsLogoutConfirmOpen(true);
   };
@@ -270,6 +481,26 @@ export function WorkbenchShell({ auth, runtimeLabel }: WorkbenchShellProps) {
   const confirmLogout = async () => {
     setIsLogoutConfirmOpen(false);
     await auth.logout();
+  };
+
+  const confirmSessionExpiredLogout = async () => {
+    setIsSessionExpiredConfirmOpen(false);
+    await auth.logout();
+  };
+
+  const handleAssistantSubmit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!isModelConfigurationReady(settings)) {
+      setIsModelConfigRequiredOpen(true);
+      return;
+    }
+
+    toast({
+      type: "info",
+      body: `已使用 ${settings.configuration.modelName} 接收对话请求，数据助手对话能力待接入。`,
+      uniqueID: "assistant-chat-pending",
+      collisionBehavior: "overwrite",
+    });
   };
 
   const handleAvatarSave = async () => {
@@ -303,8 +534,28 @@ export function WorkbenchShell({ auth, runtimeLabel }: WorkbenchShellProps) {
   };
 
   const handleSettingsSave = async () => {
+    const nextApiKey = apiKeyDraft.trim();
+    setIsSavingSettings(true);
+
+    if (nextApiKey.length > 0) {
+      const localApiKeySaved = auth.user?.id && window.lifecycleX?.modelApiKey
+        ? await window.lifecycleX.modelApiKey.set(auth.user.id, nextApiKey)
+        : false;
+
+      if (!localApiKeySaved) {
+        setIsSavingSettings(false);
+        toast({
+          type: "error",
+          body: "模型 API Key 本地保存失败，请稍后重试。",
+          uniqueID: "model-api-key-save-failed",
+          collisionBehavior: "overwrite",
+        });
+        return;
+      }
+    }
+
     const nextSettings =
-      apiKeyDraft.trim().length > 0
+      nextApiKey.length > 0
         ? {
             ...settings,
             configuration: {
@@ -314,7 +565,6 @@ export function WorkbenchShell({ auth, runtimeLabel }: WorkbenchShellProps) {
           }
         : settings;
 
-    setIsSavingSettings(true);
     const result = await requestWithRefresh((token) => workbenchApi.updateSettings(token, nextSettings));
     setIsSavingSettings(false);
     if (isFailure(result)) {
@@ -322,7 +572,7 @@ export function WorkbenchShell({ auth, runtimeLabel }: WorkbenchShellProps) {
       return;
     }
 
-    setSettings(result.settings);
+    setSettings(normalizeWorkbenchSettings(result.settings));
     setApiKeyDraft("");
     toast({
       type: "info",
@@ -333,13 +583,43 @@ export function WorkbenchShell({ auth, runtimeLabel }: WorkbenchShellProps) {
   };
 
   const renderContent = () => {
-    if (activeModule === "data-management") {
-      return (
-        <PlaceholderView title="数据管理" description="数据源连接、字段口径和数据资产管理能力将在后续 Goal 中拆分建设。" />
-      );
-    }
-
-    return <PlaceholderView title="数据助手" description="默认首页已预留，功能需求确认后再接入智能体交互。" />;
+    return (
+      <div className="workbench-module-stack">
+        <Activity mode={activeModule === "data-assistant" ? "visible" : "hidden"} name="workbench-data-assistant">
+          <div className="workbench-module">
+            <PlaceholderView title="数据助手" description="对话能力依赖大模型配置，完成配置后即可接入智能体交互。">
+              <form className="assistant-chat-entry" onSubmit={handleAssistantSubmit}>
+                <TextInput
+                  label="对话内容"
+                  value={assistantDraft}
+                  placeholder="输入需要分析或查询的问题"
+                  width="100%"
+                  hasClear
+                  onChange={setAssistantDraft}
+                />
+                <Button label="发送" variant="primary" type="submit" />
+              </form>
+              <Text type="supporting" color="secondary">
+                {isModelConfigurationReady(settings) ? `当前模型：${settings.configuration.modelName}` : "尚未完成大模型配置"}
+              </Text>
+            </PlaceholderView>
+          </div>
+        </Activity>
+        <Activity mode={activeModule === "data-management" ? "visible" : "hidden"} name="workbench-data-management">
+          <div className="workbench-module">
+            {auth.permissions.includes("datasource:read") && (
+              <DataManagementWorkspace
+                isActive={activeModule === "data-management"}
+                canManage={auth.permissions.includes("datasource:manage")}
+                requestWithRefresh={requestWithRefresh}
+                menuAction={pendingDataSourceAction}
+                onMenuActionHandled={() => setPendingDataSourceAction(null)}
+              />
+            )}
+          </div>
+        </Activity>
+      </div>
+    );
   };
 
   const sideNav = (
@@ -347,10 +627,10 @@ export function WorkbenchShell({ auth, runtimeLabel }: WorkbenchShellProps) {
       <SideNav
         className="workbench-side-nav"
         header={<SideNavHeading heading="Cycle Probe" icon={<div className="workbench-brand-mark">CP</div>} />}
-        footer={<SideNavUserCard profile={profile} user={auth.user} />}
+        footer={<SideNavUserCard profile={profile} user={auth.user} onOpenSettings={() => openSettings("general")} onLogout={requestLogout} />}
         collapsible={{ defaultIsCollapsed: false, buttonLabel: "折叠工作台导航" }}
       >
-        <SideNavSection title="主导航">
+        <SideNavSection title="主导航" isHeaderHidden>
           {visibleNavItems.map((item) => (
             <SideNavItem
               key={item.id}
@@ -358,6 +638,7 @@ export function WorkbenchShell({ auth, runtimeLabel }: WorkbenchShellProps) {
               icon={<NavAssetIcon src={item.icon} />}
               selectedIcon={<NavAssetIcon src={item.icon} />}
               isSelected={activeModule === item.id}
+              size="sm"
               onClick={() => setActiveModule(item.id)}
             />
           ))}
@@ -369,40 +650,6 @@ export function WorkbenchShell({ auth, runtimeLabel }: WorkbenchShellProps) {
   return (
     <AppShell variant="section" sideNav={sideNav} contentPadding={0} mobileNav={{ breakpoint: "md" }}>
       <section className="workbench-main" data-theme-mode={settings.appearance.themeMode} style={workbenchStyle}>
-        <header className="workbench-topbar">
-          <div>
-            <Text type="display-3" as="h1">
-              {currentTitle}
-            </Text>
-            <Text type="body" color="secondary">
-              {auth.user?.displayName} · {roleLabel(auth.user?.role)} · {runtimeLabel}
-            </Text>
-          </div>
-
-          <div className="workbench-actions">
-            {isLoadingWorkbench && <Spinner size="sm" />}
-            <DropdownMenu
-              button={{
-                label: profile?.displayName ?? auth.user?.displayName ?? "用户菜单",
-                variant: "ghost",
-                size: "md",
-                className: "topbar-avatar-trigger",
-                isIconOnly: true,
-                icon: <Avatar src={profile?.avatarUrl} name={profile?.displayName ?? auth.user?.displayName} size={32} />,
-              }}
-              hasChevron={false}
-              menuWidth={220}
-              placement="below"
-              items={[
-                { label: "个人资料", onClick: () => openSettings("profile") },
-                { label: "用户设置", onClick: () => openSettings("general") },
-                { type: "divider" },
-                { label: "退出登录", onClick: requestLogout },
-              ]}
-            />
-          </div>
-        </header>
-
         <div className="workbench-content">{renderContent()}</div>
       </section>
 
@@ -645,13 +892,25 @@ export function WorkbenchShell({ auth, runtimeLabel }: WorkbenchShellProps) {
                 <Section variant="muted" padding={4}>
                   <VStack gap={3} hAlign="stretch">
                     <Selector
-                      label="大模型"
+                      label="模型渠道"
                       value={settings.configuration.modelProvider}
-                      options={["OpenAI Compatible", "Enterprise Gateway", "本地模型网关"]}
+                      options={["Siliconflow"]}
                       onChange={(modelProvider) =>
                         setSettings((current) => ({
                           ...current,
                           configuration: { ...current.configuration, modelProvider },
+                        }))
+                      }
+                    />
+                    <TextInput
+                      label="模型名称"
+                      value={settings.configuration.modelName}
+                      placeholder="例如 gpt-4.1、qwen-max、deepseek-chat"
+                      width="100%"
+                      onChange={(modelName) =>
+                        setSettings((current) => ({
+                          ...current,
+                          configuration: { ...current.configuration, modelName },
                         }))
                       }
                     />
@@ -663,7 +922,7 @@ export function WorkbenchShell({ auth, runtimeLabel }: WorkbenchShellProps) {
                       label="模型 API Key"
                       type="password"
                       value={apiKeyDraft}
-                      placeholder="输入新密钥后保存，仅更新脱敏配置状态"
+                      placeholder={settings.configuration.apiKeyStatus === "configured" ? "已本地保存，如需更新请输入新密钥" : "输入密钥后将加密保存到本地"}
                       onChange={setApiKeyDraft}
                     />
                     <Switch
@@ -725,17 +984,66 @@ export function WorkbenchShell({ auth, runtimeLabel }: WorkbenchShellProps) {
         padding={5}
       >
         <VStack gap={4} hAlign="stretch">
-          <div>
-            <Text type="display-3" as="h2">
+          <div className="dialog-copy-stack">
+            <Text type="display-3" as="h2" display="block">
               确认退出登录
             </Text>
-            <Text type="body" color="secondary">
+            <Text type="body" color="secondary" display="block">
               退出后会清理当前登录态，并返回登录页。
             </Text>
           </div>
           <HStack hAlign="end" gap={2}>
             <Button label="取消" variant="secondary" onClick={() => setIsLogoutConfirmOpen(false)} />
             <Button label="确认退出" variant="destructive" onClick={confirmLogout} />
+          </HStack>
+        </VStack>
+      </Dialog>
+
+      <Dialog
+        isOpen={isModelConfigRequiredOpen}
+        onOpenChange={setIsModelConfigRequiredOpen}
+        width={460}
+        purpose="info"
+        padding={5}
+      >
+        <VStack gap={4} hAlign="stretch">
+          <div className="dialog-copy-stack">
+            <Text type="display-3" as="h2" display="block">
+              需要先配置大模型
+            </Text>
+            <Text type="body" color="secondary" display="block">
+              数据助手对话功能依赖大模型能力，请先配置模型渠道、模型名称和 API Key。
+            </Text>
+          </div>
+          <HStack hAlign="end" gap={2}>
+            <Button label="稍后配置" variant="secondary" onClick={() => setIsModelConfigRequiredOpen(false)} />
+            <Button label="打开智能体配置" variant="primary" onClick={openAgentSettingsFromPrompt} />
+          </HStack>
+        </VStack>
+      </Dialog>
+
+      <Dialog
+        isOpen={isSessionExpiredConfirmOpen}
+        onOpenChange={(open) => {
+          if (open) {
+            setIsSessionExpiredConfirmOpen(true);
+          }
+        }}
+        width={440}
+        purpose="info"
+        padding={5}
+      >
+        <VStack gap={4} hAlign="stretch">
+          <div className="dialog-copy-stack">
+            <Text type="display-3" as="h2" display="block">
+              登录态已过期
+            </Text>
+            <Text type="body" color="secondary" display="block">
+              当前登录态已失效，请退出登录后重新进行身份验证。
+            </Text>
+          </div>
+          <HStack hAlign="end" gap={2}>
+            <Button label="退出登录" variant="destructive" onClick={confirmSessionExpiredLogout} />
           </HStack>
         </VStack>
       </Dialog>

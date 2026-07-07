@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import type { KeyboardEvent } from "react";
 import { Avatar } from "@astryxdesign/core/Avatar";
 import { Button } from "@astryxdesign/core/Button";
 import { Card } from "@astryxdesign/core/Card";
@@ -9,8 +10,8 @@ import { Link } from "@astryxdesign/core/Link";
 import { Section } from "@astryxdesign/core/Section";
 import { Text } from "@astryxdesign/core/Text";
 import { TextInput } from "@astryxdesign/core/TextInput";
-import { useToast } from "@astryxdesign/core/Toast";
 import { authApi, errorMessage, type AuthFailure } from "./auth";
+import { useAppToast } from "./useAppToast";
 
 type LoginPageProps = {
   onPasswordLogin: (identifier: string, password: string) => Promise<boolean>;
@@ -31,7 +32,7 @@ export function LoginPage({ onPasswordLogin, onSsoComplete, lastError, onError }
   const [password, setPassword] = useState("");
   const [ssoState, setSsoState] = useState<{ token: string; providerName: string; email: string } | null>(null);
   const [isLoading, setIsLoading] = useState(false);
-  const toast = useToast();
+  const toast = useAppToast();
   const lastToastTraceId = useRef<string | null>(null);
 
   const canPasswordLogin = identifier.trim().length > 0 && password.length > 0;
@@ -66,12 +67,24 @@ export function LoginPage({ onPasswordLogin, onSsoComplete, lastError, onError }
   }, [lastError, toast]);
 
   const handlePasswordLogin = async () => {
+    if (!canPasswordLogin || isLoading) {
+      return;
+    }
     setIsLoading(true);
     const ok = await onPasswordLogin(identifier.trim(), password);
     setIsLoading(false);
     if (!ok) {
       setPassword("");
     }
+  };
+
+  const handleCredentialsKeyDown = (event: KeyboardEvent<HTMLFormElement>) => {
+    if (event.key !== "Enter" || !(event.target instanceof HTMLInputElement)) {
+      return;
+    }
+
+    event.preventDefault();
+    void handlePasswordLogin();
   };
 
   const handleSsoStart = async () => {
@@ -147,7 +160,7 @@ export function LoginPage({ onPasswordLogin, onSsoComplete, lastError, onError }
       <Card padding={8} width="100%" maxWidth={420}>
         <VStack gap={4} hAlign="stretch">
           {step === "credentials" && (
-            <>
+            <form className="login-form" onKeyDown={handleCredentialsKeyDown}>
               <VStack gap={1} hAlign="center">
                 <Text type="display-3" as="h1">
                   Cycle Probe
@@ -161,7 +174,7 @@ export function LoginPage({ onPasswordLogin, onSsoComplete, lastError, onError }
                 <TextInput
                   label="账号或邮箱"
                   type="email"
-                  placeholder="analyst / analyst@bank.example.com"
+                  placeholder="请输入账号或企业邮箱"
                   value={identifier}
                   size="lg"
                   hasAutoFocus
@@ -186,7 +199,7 @@ export function LoginPage({ onPasswordLogin, onSsoComplete, lastError, onError }
               </VStack>
 
               <Button
-                label="账号密码登录"
+                label="登录"
                 variant="primary"
                 size="lg"
                 isLoading={isLoading}
@@ -213,13 +226,7 @@ export function LoginPage({ onPasswordLogin, onSsoComplete, lastError, onError }
                   内部注册用户专用
                 </Text>
               </HStack>
-
-              <Section variant="muted" padding={3}>
-                <Text type="supporting" color="secondary">
-                  本地种子账号：analyst / admin，密码均为 Lifecycle@123。
-                </Text>
-              </Section>
-            </>
+            </form>
           )}
 
           {step === "sso-confirm" && ssoState && (

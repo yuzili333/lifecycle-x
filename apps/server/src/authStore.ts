@@ -74,6 +74,7 @@ export type WorkbenchSettings = {
   };
   configuration: {
     modelProvider: string;
+    modelName: string;
     apiKeyStatus: "not_configured" | "configured";
     skillEnabled: boolean;
     mcpEnabled: boolean;
@@ -442,7 +443,8 @@ export class AuthStore {
           dockIcon: "default",
         },
         configuration: {
-          modelProvider: "OpenAI Compatible",
+          modelProvider: "Siliconflow",
+          modelName: "",
           apiKeyStatus: "not_configured",
           skillEnabled: false,
           mcpEnabled: false,

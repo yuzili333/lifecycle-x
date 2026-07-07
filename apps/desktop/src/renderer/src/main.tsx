@@ -8,7 +8,7 @@ import App from "./App";
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
     <Theme theme={neutralTheme}>
-      <LayerProvider toast={{ position: "topEnd", maxVisible: 3 }}>
+      <LayerProvider toast={{ position: "bottomEnd", maxVisible: 3, inset: { bottom: 24, end: 24 } }}>
         <App />
       </LayerProvider>
     </Theme>
