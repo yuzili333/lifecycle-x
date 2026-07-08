@@ -8,6 +8,19 @@
   "astryx": {
     "theme": "@astryxdesign/theme-neutral"
   },
+  "build": {
+    "appId": "com.lifecycle-x.desktop",
+    "productName": "Cycle Probe",
+    "directories": {
+      "buildResources": "build"
+    },
+    "mac": {
+      "icon": "build/icon.icns"
+    },
+    "win": {
+      "icon": "build/icon.ico"
+    }
+  },
   "scripts": {
     "build": "electron-vite build",
     "dev": "electron-vite dev",

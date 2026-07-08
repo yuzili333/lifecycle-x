@@ -1,13 +1,27 @@
 import { app, BrowserWindow, Menu, ipcMain, nativeImage, safeStorage, shell, type MenuItemConstructorOptions } from "electron";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import dockIconPath from "../resources/cycle_probe_dock_icon_dark.png?asset";
+import defaultDockIconPath from "../../build/icon.png?asset";
+import dockIconDark512Path from "../resources/cycle_probe_docker_icon_dark_512.png?asset";
+import dockIconLight512Path from "../resources/cycle_probe_docker_icon_light_512.png?asset";
 import type { DataSourceMenuAction } from "../preload";
 
 const isMac = process.platform === "darwin";
-const dockIcon = nativeImage.createFromPath(dockIconPath);
 const secretStoreFileName = "cycle-probe-secrets.json";
 let refreshToken: string | null = null;
+
+type DockIconVariant = "dark" | "light";
+
+const dockIconPaths: Record<DockIconVariant, string> = {
+  dark: dockIconDark512Path,
+  light: dockIconLight512Path,
+};
+
+function createDockIcon(variant: DockIconVariant) {
+  return nativeImage.createFromPath(dockIconPaths[variant]);
+}
+
+let currentDockIcon = nativeImage.createFromPath(defaultDockIconPath);
 
 type SecretStore = {
   modelApiKeys?: Record<string, string>;
@@ -45,6 +59,22 @@ function encryptLocalSecret(secret: string) {
 function sendDataSourceAction(action: DataSourceMenuAction) {
   const targetWindow = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0];
   targetWindow?.webContents.send("data-source:action", action);
+}
+
+function applyDockIcon(variant: DockIconVariant) {
+  const nextDockIcon = createDockIcon(variant);
+  if (nextDockIcon.isEmpty()) {
+    return false;
+  }
+
+  currentDockIcon = nextDockIcon;
+  for (const window of BrowserWindow.getAllWindows()) {
+    window.setIcon(currentDockIcon);
+  }
+  if (isMac) {
+    app.dock.setIcon(currentDockIcon);
+  }
+  return true;
 }
 
 function buildApplicationMenu() {
@@ -87,7 +117,7 @@ function createMainWindow(): BrowserWindow {
     minWidth: 1080,
     minHeight: 720,
     title: "Cycle Probe",
-    icon: dockIcon,
+    icon: currentDockIcon,
     backgroundColor: "#f7fafc",
     show: false,
     webPreferences: {
@@ -135,6 +165,12 @@ ipcMain.handle("auth:clear-refresh-token", () => {
   return true;
 });
 ipcMain.handle("shell:open-external", (_event, url: string) => shell.openExternal(url));
+ipcMain.handle("dock-icon:set", (_event, variant: DockIconVariant) => {
+  if (!Object.hasOwn(dockIconPaths, variant)) {
+    return false;
+  }
+  return applyDockIcon(variant);
+});
 ipcMain.handle("model-api-key:has", async (_event, userId: string) => {
   const store = await readSecretStore();
   return Boolean(store.modelApiKeys?.[secretKeyForUser(userId)]);
@@ -158,8 +194,8 @@ ipcMain.handle("model-api-key:set", async (_event, userId: string, apiKey: strin
 
 app.whenReady().then(() => {
   app.setAppUserModelId("com.lifecycle-x.desktop");
-  if (isMac && !dockIcon.isEmpty()) {
-    app.dock.setIcon(dockIcon);
+  if (isMac && !currentDockIcon.isEmpty()) {
+    app.dock.setIcon(currentDockIcon);
   }
   buildApplicationMenu();
   createMainWindow();

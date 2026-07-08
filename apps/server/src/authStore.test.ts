@@ -103,7 +103,7 @@ describe("AuthStore", () => {
         codeFontSize: 14,
         translucentSidebar: true,
         contrast: "high",
-        dockIcon: "deep",
+        dockIcon: "light",
       },
       configuration: {
         modelProvider: "Siliconflow",

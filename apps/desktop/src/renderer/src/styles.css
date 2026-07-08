@@ -85,6 +85,25 @@ button {
   font-weight: 800;
 }
 
+.workbench-brand-icon {
+  display: block;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  object-fit: contain;
+}
+
+.dock-icon-preview {
+  display: block;
+  width: 52px;
+  height: 52px;
+  flex: 0 0 52px;
+  border: 1px solid color-mix(in srgb, var(--workbench-foreground, #e6edf6) 14%, transparent);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--workbench-background, #0f1724) 82%, #ffffff);
+  object-fit: contain;
+}
+
 .workbench-main {
   display: grid;
   grid-template-rows: 1fr;

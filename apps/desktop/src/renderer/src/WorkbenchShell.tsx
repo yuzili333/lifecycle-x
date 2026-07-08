@@ -23,9 +23,11 @@ import { DataManagementWorkspace } from "./DataManagementWorkspace";
 import { useAppToast } from "./useAppToast";
 import type { useAuthStore } from "./useAuthStore";
 import aiIcon from "./assets/ai.svg";
+import dockIconDark512 from "./assets/cycle_probe_docker_icon_dark_512.png";
+import dockIconLight512 from "./assets/cycle_probe_docker_icon_light_512.png";
 import databaseIcon from "./assets/database.svg";
 import { workbenchApi, type ApiResult, type UserProfile, type WorkbenchSettings } from "./workbenchApi";
-import type { DataSourceMenuAction } from "../../preload";
+import type { DataSourceMenuAction, DockIconVariant } from "../../preload";
 
 type WorkbenchAuth = ReturnType<typeof useAuthStore>;
 
@@ -58,7 +60,7 @@ const defaultSettings: WorkbenchSettings = {
     codeFontSize: 13,
     translucentSidebar: false,
     contrast: "standard",
-    dockIcon: "default",
+    dockIcon: "dark",
   },
   configuration: {
     modelProvider: "Siliconflow",
@@ -164,14 +166,27 @@ function isModelConfigurationReady(settings: WorkbenchSettings) {
   );
 }
 
+function normalizeDockIconTheme(value: unknown): WorkbenchSettings["appearance"]["dockIcon"] {
+  return value === "light" ? "light" : "dark";
+}
+
 function normalizeWorkbenchSettings(settings: WorkbenchSettings): WorkbenchSettings {
   return {
     general: { ...defaultSettings.general, ...settings.general },
-    appearance: { ...defaultSettings.appearance, ...settings.appearance },
+    appearance: {
+      ...defaultSettings.appearance,
+      ...settings.appearance,
+      dockIcon: normalizeDockIconTheme(settings.appearance?.dockIcon),
+    },
     configuration: { ...defaultSettings.configuration, ...settings.configuration },
     personalization: { ...defaultSettings.personalization, ...settings.personalization },
   };
 }
+
+const dockIconAssets: Record<DockIconVariant, string> = {
+  dark: dockIconDark512,
+  light: dockIconLight512,
+};
 
 async function hasLocalModelApiKey(user: WorkbenchAuth["user"]) {
   if (!user?.id || !window.lifecycleX?.modelApiKey) {
@@ -454,6 +469,8 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
   );
 
   const visibleNavItems = navItems.filter((item) => auth.permissions.includes(item.permission));
+  const activeDockIconVariant = settings.appearance.dockIcon;
+  const activeDockIcon = dockIconAssets[activeDockIconVariant];
   const workbenchStyle = {
     "--workbench-background": settings.appearance.backgroundColor,
     "--workbench-foreground": settings.appearance.foregroundColor,
@@ -468,6 +485,10 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
     setActiveSettingsTab(tab);
     setIsSettingsOpen(true);
   };
+
+  useEffect(() => {
+    void window.lifecycleX?.dockIcon?.set(activeDockIconVariant);
+  }, [activeDockIconVariant]);
 
   const openAgentSettingsFromPrompt = () => {
     setIsModelConfigRequiredOpen(false);
@@ -626,7 +647,7 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
     <div className="workbench-side-theme" style={workbenchStyle}>
       <SideNav
         className="workbench-side-nav"
-        header={<SideNavHeading heading="Cycle Probe" icon={<div className="workbench-brand-mark">CP</div>} />}
+        header={<SideNavHeading heading="Cycle Probe" icon={<img className="workbench-brand-icon" src={activeDockIcon} alt="" />} />}
         footer={<SideNavUserCard profile={profile} user={auth.user} onOpenSettings={() => openSettings("general")} onLogout={requestLogout} />}
         collapsible={{ defaultIsCollapsed: false, buttonLabel: "折叠工作台导航" }}
       >
@@ -866,21 +887,31 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
                     }
                   />
                   <Selector
-                    label="程序坞图标"
+                    label="程序坞图标主题"
                     value={settings.appearance.dockIcon}
                     options={[
-                      { label: "默认", value: "default" },
-                      { label: "浅色", value: "light" },
-                      { label: "深度", value: "deep" },
+                      { label: "深色主题图标", value: "dark" },
+                      { label: "浅色主题图标", value: "light" },
                     ]}
                     onChange={(dockIcon) =>
                       setSettings((current) => ({
                         ...current,
-                        appearance: { ...current.appearance, dockIcon: dockIcon as WorkbenchSettings["appearance"]["dockIcon"] },
+                        appearance: { ...current.appearance, dockIcon: normalizeDockIconTheme(dockIcon) },
                       }))
                     }
                   />
                 </HStack>
+                <Section variant="muted" padding={3}>
+                  <HStack gap={3} vAlign="center">
+                    <img className="dock-icon-preview" src={activeDockIcon} alt="" />
+                    <VStack gap={1} hAlign="stretch">
+                      <Text type="body">当前应用图标：{activeDockIconVariant}</Text>
+                      <Text type="supporting" color="secondary">
+                        程序坞和窗口开发期图标统一使用 512 尺寸 PNG；打包时 macOS 使用 ICNS，Windows 使用 ICO。
+                      </Text>
+                    </VStack>
+                  </HStack>
+                </Section>
               </VStack>
             )}
 

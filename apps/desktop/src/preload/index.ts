@@ -1,10 +1,14 @@
 import { contextBridge, ipcRenderer } from "electron";
 
 export type DataSourceMenuAction = "create-connection" | "import-csv";
+export type DockIconVariant = "dark" | "light";
 
 const lifecycleXApi = {
   getAppInfo: () => ipcRenderer.invoke("app:info"),
   openExternal: (url: string) => ipcRenderer.invoke("shell:open-external", url),
+  dockIcon: {
+    set: (variant: DockIconVariant) => ipcRenderer.invoke("dock-icon:set", variant) as Promise<boolean>,
+  },
   auth: {
     getRefreshToken: () => ipcRenderer.invoke("auth:get-refresh-token") as Promise<string | null>,
     setRefreshToken: (token: string) => ipcRenderer.invoke("auth:set-refresh-token", token) as Promise<boolean>,

@@ -70,7 +70,7 @@ export type WorkbenchSettings = {
     codeFontSize: number;
     translucentSidebar: boolean;
     contrast: "standard" | "high";
-    dockIcon: "default" | "light" | "deep";
+    dockIcon: "dark" | "light";
   };
   configuration: {
     modelProvider: string;
@@ -440,7 +440,7 @@ export class AuthStore {
           codeFontSize: 13,
           translucentSidebar: false,
           contrast: "standard",
-          dockIcon: "default",
+          dockIcon: "dark",
         },
         configuration: {
           modelProvider: "Siliconflow",

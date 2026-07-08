@@ -23,7 +23,7 @@ export type WorkbenchSettings = {
     codeFontSize: number;
     translucentSidebar: boolean;
     contrast: "standard" | "high";
-    dockIcon: "default" | "light" | "deep";
+    dockIcon: "dark" | "light";
   };
   configuration: {
     modelProvider: string;
