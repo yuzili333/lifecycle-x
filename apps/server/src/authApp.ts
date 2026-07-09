@@ -796,14 +796,23 @@ export function createAuthApp(store = new AuthStore(), dataStore = new DataManag
     response.json(result);
   });
 
-  app.get("/agent/context/schema", (request, response) => {
+  app.get("/agent/context/schema", async (request, response) => {
     const traceId = randomUUID();
     const auth = resolveAuthorizedRequest(store, request, "datasource:read");
     if (!auth.resolved) {
       sendFailure(response, auth.status, auth.code, auth.message, traceId);
       return;
     }
-    response.json(dataStore.schemaContext());
+    const context = await dataStore.schemaContext({
+      conversationId: typeof request.query.conversationId === "string" ? request.query.conversationId : undefined,
+      userQuestion: typeof request.query.question === "string" ? request.query.question : undefined,
+      purpose: typeof request.query.purpose === "string" ? (request.query.purpose as never) : undefined,
+      tokenBudget: {
+        maxChars: typeof request.query.maxChars === "string" ? Number(request.query.maxChars) : undefined,
+      },
+      userPermissionContext: typeof request.query.dataSourceId === "string" ? { allowedDataSourceIds: [request.query.dataSourceId] } : undefined,
+    });
+    response.json(context);
   });
 
   return { app, store };

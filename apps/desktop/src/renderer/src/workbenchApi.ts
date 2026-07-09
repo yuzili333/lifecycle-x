@@ -138,6 +138,27 @@ export type SampleDataResult = {
   };
 };
 
+export type SchemaContextResult = {
+  success: true;
+  context: {
+    contextId: string;
+    conversationId?: string;
+    dataSourceIds: string[];
+    systemInstruction: string;
+    markdown: string;
+    warnings: Array<{ code: string; message: string; dataSourceId?: string; tableName?: string }>;
+    generatedAt: string;
+  };
+};
+
+export type SchemaContextQuery = {
+  conversationId?: string;
+  question?: string;
+  dataSourceId?: string;
+  purpose?: "data_exploration" | "sql_generation" | "risk_analysis" | "report_generation" | "chart_generation";
+  maxChars?: number;
+};
+
 export type DataSourceInput = {
   name: string;
   type: "mysql";
@@ -318,6 +339,29 @@ export const workbenchApi = {
       job: { id: string; status: "completed"; importedTableId: string; dataSourceId: string; importedRows: number };
     }>(`/csv/files/${encodeURIComponent(fileId)}/import`, {
       method: "POST",
+      headers: authHeaders(accessToken),
+    });
+  },
+
+  schemaContext(accessToken: string, query: SchemaContextQuery) {
+    const params = new URLSearchParams();
+    if (query.conversationId) {
+      params.set("conversationId", query.conversationId);
+    }
+    if (query.question) {
+      params.set("question", query.question);
+    }
+    if (query.dataSourceId) {
+      params.set("dataSourceId", query.dataSourceId);
+    }
+    if (query.purpose) {
+      params.set("purpose", query.purpose);
+    }
+    if (query.maxChars) {
+      params.set("maxChars", String(query.maxChars));
+    }
+    const suffix = params.size > 0 ? `?${params.toString()}` : "";
+    return request<SchemaContextResult>(`/agent/context/schema${suffix}`, {
       headers: authHeaders(accessToken),
     });
   },

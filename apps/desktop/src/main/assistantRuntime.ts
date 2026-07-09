@@ -94,6 +94,7 @@ export type AssistantSendInput = {
   modelName: string;
   dataSourceId?: string | null;
   dataSourceLabel?: string | null;
+  schemaContextMarkdown?: string | null;
   skill?: AssistantSkill | null;
   approvalMode: AssistantApprovalMode;
 };
@@ -104,6 +105,7 @@ export type AssistantRetryInput = {
   clientRequestId: string;
   modelName: string;
   dataSourceLabel?: string | null;
+  schemaContextMarkdown?: string | null;
   skill?: AssistantSkill | null;
   approvalMode: AssistantApprovalMode;
 };
@@ -471,6 +473,7 @@ export class AssistantRuntime {
         prompt: sourceUserMessage.content,
         modelName,
         dataSourceLabel: input.dataSourceLabel,
+        schemaContextMarkdown: input.schemaContextMarkdown,
         skill: input.skill,
         approvalMode: input.approvalMode,
       },
@@ -946,7 +949,7 @@ export class AssistantRuntime {
         body: JSON.stringify({
           model: input.modelName,
           stream: true,
-          messages: this.buildProviderMessages(input.userId, conversation.id, input.prompt, input.dataSourceLabel, input.skill, input.approvalMode),
+          messages: this.buildProviderMessages(input.userId, conversation.id, input.prompt, input.dataSourceLabel, input.schemaContextMarkdown, input.skill, input.approvalMode),
           temperature: 0.7,
         }),
         signal: controller.signal,
@@ -1026,6 +1029,7 @@ export class AssistantRuntime {
     conversationId: string,
     prompt: string,
     dataSourceLabel: string | null | undefined,
+    schemaContextMarkdown: string | null | undefined,
     skill: AssistantSkill | null | undefined,
     approvalMode: AssistantApprovalMode,
   ) {
@@ -1042,11 +1046,13 @@ export class AssistantRuntime {
         role: "system",
         content: [
           "你是 Cycle Probe 的数据助手。请用中文回答。",
-          "不要编造数据库结果；需要执行 SQL 或 Python 时，请输出 /sql 或 /python 代码块，客户端会按审批权限处理。",
+          "不要编造数据库结果；需要查询数据源时，应优先使用 request_sql_query_execution 语义生成候选只读 SQL、查询目的和结果用途，SQL 必须先经过安全校验、权限校验、风险评估和用户审批。",
+          "仅在本地脚本调试场景才输出 /sql 或 /python 代码块，客户端会按审批权限处理。",
           `当前数据源：${dataSourceLabel || "未选择"}`,
           `当前 Skill：${skill || "未选择"}`,
           `审批权限：${approvalMode}`,
-        ].join("\n"),
+          schemaContextMarkdown ? `\n以下是已授权数据源 Schema Context。请遵守其中 Usage Policy、安全约束和工具调用要求，不要基于样例行推断全量结论。\n${schemaContextMarkdown}` : undefined,
+        ].filter(Boolean).join("\n"),
       },
       ...history,
       { role: "user", content: prompt },

@@ -455,7 +455,16 @@ function toolCallsFromMessage(message: AssistantMessage): ChatToolCallItem[] {
       errorMessage: block.toolStatus === "error" || block.toolStatus === "blocked" || block.toolStatus === "declined" ? block.content : undefined,
       resultDetail:
         block.type === "json" ? (
-          <CodeBlock code={renderJson(block.content)} language="json" hasCopyButton hasLanguageLabel isWrapped width="100%" size="sm" />
+          <CodeBlock
+            code={renderJson(block.content)}
+            language="json"
+            hasCopyButton
+            hasLanguageLabel
+            isWrapped
+            width="100%"
+            size="sm"
+            className="assistant-code-block"
+          />
         ) : (
           <Text type="supporting" color="secondary">
             {block.content}
@@ -781,6 +790,34 @@ export function DataAssistantWorkspace({
     [toast],
   );
 
+  const loadSchemaContextMarkdown = useCallback(
+    async (conversationId: string, question: string) => {
+      if (!selectedDataSource) {
+        return null;
+      }
+      const result = await requestWithRefresh((token) =>
+        workbenchApi.schemaContext(token, {
+          conversationId,
+          question,
+          dataSourceId: selectedDataSource.id,
+          purpose: "data_exploration",
+          maxChars: 16_000,
+        }),
+      );
+      if (!result.success) {
+        toast({
+          type: "error",
+          body: `数据源 Context 构建失败：${result.error.message}`,
+          uniqueID: "assistant-schema-context-error",
+          collisionBehavior: "overwrite",
+        });
+        return null;
+      }
+      return result.context.markdown;
+    },
+    [requestWithRefresh, selectedDataSource, toast],
+  );
+
   const retryAssistantMessage = useCallback(
     async (message: AssistantMessage) => {
       if (!user?.id || !window.lifecycleX?.assistant || message.role !== "assistant" || message.status !== "error") {
@@ -788,12 +825,14 @@ export function DataAssistantWorkspace({
       }
 
       try {
+        const schemaContextMarkdown = await loadSchemaContextMarkdown(message.conversationId, message.content);
         const result = await window.lifecycleX.assistant.retryMessage({
           userId: user.id,
           messageId: message.id,
           clientRequestId: createClientRequestId(),
           modelName,
           dataSourceLabel: selectedDataSource ? dataSourceLabel(selectedDataSource) : null,
+          schemaContextMarkdown,
           skill: selectedSkill,
           approvalMode,
         });
@@ -809,7 +848,7 @@ export function DataAssistantWorkspace({
         });
       }
     },
-    [approvalMode, modelName, selectedDataSource, selectedSkill, toast, upsertMessage, user?.id],
+    [approvalMode, loadSchemaContextMarkdown, modelName, selectedDataSource, selectedSkill, toast, upsertMessage, user?.id],
   );
 
   const renderMessageMetadata = useCallback(
@@ -817,6 +856,7 @@ export function DataAssistantWorkspace({
       const isThinking = message.role === "assistant" && (message.status === "receiving" || message.status === "processing");
       const showFailed = message.status === "error";
       const showStatus = isThinking || showFailed || message.status === "sending" || message.status === "awaiting_approval" || message.status === "stopped";
+      const showCopy = !(message.role === "assistant" && isThinking);
 
       return (
         <ChatMessageMetadata
@@ -827,7 +867,9 @@ export function DataAssistantWorkspace({
                 <MetadataStatusIcon status={message.status} isThinking={isThinking} />
               )}
               <div className="assistant-message-actions">
-                <MetadataIconButton label="复制" icon={Copy} onClick={() => void copyMessage(message)} />
+                {showCopy && (
+                  <MetadataIconButton label="复制" icon={Copy} onClick={() => void copyMessage(message)} />
+                )}
                 {message.role === "user" && (
                   <MetadataIconButton label="编辑" icon={Pencil} onClick={() => editUserMessage(message)} />
                 )}
@@ -879,6 +921,7 @@ export function DataAssistantWorkspace({
         upsertMessage(conversationId, optimisticUserMessage);
         setActiveConversationId(conversationId);
         setComposerValue("");
+        const schemaContextMarkdown = await loadSchemaContextMarkdown(conversationId, prompt);
         const result = await window.lifecycleX.assistant.sendMessage({
           userId: user.id,
           conversationId,
@@ -887,6 +930,7 @@ export function DataAssistantWorkspace({
           modelName,
           dataSourceId: selectedDataSource?.id ?? null,
           dataSourceLabel: selectedDataSource ? dataSourceLabel(selectedDataSource) : null,
+          schemaContextMarkdown,
           skill: selectedSkill,
           approvalMode,
         });
@@ -916,6 +960,7 @@ export function DataAssistantWorkspace({
       approvalMode,
       isModelConfigured,
       isStreaming,
+      loadSchemaContextMarkdown,
       modelName,
       onRequireModelConfig,
       selectedDataSource,
@@ -959,6 +1004,7 @@ export function DataAssistantWorkspace({
           isWrapped
           width="100%"
           size="sm"
+          className="assistant-code-block"
           onCopy={() =>
             toast({
               type: "info",
@@ -1054,6 +1100,7 @@ export function DataAssistantWorkspace({
               isWrapped
               width="100%"
               size="sm"
+              className="assistant-code-block"
               onCopy={() =>
                 toast({
                   type: "info",
@@ -1096,6 +1143,7 @@ export function DataAssistantWorkspace({
             isWrapped
             width="100%"
             size="sm"
+            className="assistant-code-block"
           />
         </div>
       );
@@ -1360,6 +1408,7 @@ export function DataAssistantWorkspace({
                     contentWidth="100%"
                     autolink="gfm"
                     components={markdownComponents}
+                    className="assistant-artifact-markdown"
                   >
                     {activeArtifactMessage.content}
                   </Markdown>

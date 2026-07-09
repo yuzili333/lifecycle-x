@@ -1,4 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
+import {
+  CsvSqliteTempProfiler,
+  SqlProfiler,
+  createSchemaContextBuilder,
+  type BuildSchemaContextInput,
+  type DataSourceRef,
+} from "./schemaContext/index.js";
 
 export type DataSourceType = "mysql" | "csv";
 export type DataSourceStatus = "online" | "offline" | "disabled" | "degraded";
@@ -173,21 +180,29 @@ function maskValue(value: unknown) {
 }
 
 function parseCsv(content: string) {
-  const lines = content
+  const normalizedContent = content.replace(/^\uFEFF/, "");
+  const lines = normalizedContent
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean);
   if (lines.length === 0) {
-    return { headers: [] as string[], rows: [] as Record<string, string>[] };
+    return { headers: [] as string[], rows: [] as Record<string, string>[], delimiter: ",", encoding: content.startsWith("\uFEFF") ? "utf-8-bom" : "utf-8" };
   }
 
-  const delimiter = lines[0].includes("\t") ? "\t" : ",";
+  const delimiter = detectDelimiter(lines[0]);
   const headers = lines[0].split(delimiter).map((item) => item.trim() || "column");
   const rows = lines.slice(1, 51).map((line) => {
     const values = line.split(delimiter);
     return Object.fromEntries(headers.map((header, index) => [header, values[index]?.trim() ?? ""]));
   });
-  return { headers, rows };
+  return { headers, rows, delimiter, encoding: content.startsWith("\uFEFF") ? "utf-8-bom" : "utf-8" };
+}
+
+function detectDelimiter(headerLine: string) {
+  const candidates = [",", "\t", ";"];
+  return candidates
+    .map((delimiter) => ({ delimiter, count: headerLine.split(delimiter).length }))
+    .sort((left, right) => right.count - left.count)[0]?.delimiter ?? ",";
 }
 
 export class DataManagementStore {
@@ -195,6 +210,7 @@ export class DataManagementStore {
   private schemas = new Map<string, DatabaseSchema[]>();
   private tables = new Map<string, DatabaseTable[]>();
   private csvFiles = new Map<string, { id: string; name: string; content: string; createdAt: string }>();
+  private csvFileProfiles = new Map<string, { fileName: string; fileSizeBytes: number; encoding: string; delimiter: string; rowCount: number; columnCount: number }>();
   readonly queryAuditLogs: QueryAuditLog[] = [];
 
   listDataSources() {
@@ -324,6 +340,10 @@ export class DataManagementStore {
     return schema ? tables.filter((table) => table.schema === schema) : tables;
   }
 
+  getCsvFileProfile(dataSourceId: string) {
+    return this.csvFileProfiles.get(dataSourceId);
+  }
+
   tableDetail(dataSourceId: string, tableId: string) {
     return this.listTables(dataSourceId).find((table) => table.id === tableId) ?? null;
   }
@@ -450,6 +470,14 @@ export class DataManagementStore {
     source.tableCount = 1;
     const actualSizeMb = Math.max(1, Math.round(file.content.length / 1024 / 1024));
     this.dataSources.set(dataSourceId, source);
+    this.csvFileProfiles.set(dataSourceId, {
+      fileName: file.name,
+      fileSizeBytes: file.content.length,
+      encoding: parsed.encoding,
+      delimiter: parsed.delimiter,
+      rowCount: parsed.rows.length,
+      columnCount: parsed.headers.length,
+    });
     this.schemas.set(dataSourceId, [{ id: `${dataSourceId}:schema:csv_imports`, dataSourceId, name: "csv_imports", tableCount: 1, viewCount: 0, lastSyncedAt: source.lastSyncedAt }]);
     this.tables.set(dataSourceId, [
       applyLargeTableRule({
@@ -483,29 +511,18 @@ export class DataManagementStore {
     return { success: true as const, job: { id: id("import_job"), status: "completed", importedTableId: tableId, dataSourceId, importedRows: parsed.rows.length } };
   }
 
-  schemaContext() {
+  async schemaContext(input: Partial<BuildSchemaContextInput> = {}) {
+    const dataSourceRefs = input.dataSourceRefs ?? this.listDataSources().map(toSchemaDataSourceRef);
+    const builder = createSchemaContextBuilder({
+      profilers: [new SqlProfiler(this), new CsvSqliteTempProfiler(this)],
+    });
+    const context = await builder.buildContext({
+      ...input,
+      dataSourceRefs,
+    });
     return {
       success: true as const,
-      context: this.listDataSources().map((source) => ({
-        dataSourceId: source.id,
-        name: source.name,
-        type: source.type,
-        environment: source.environment,
-        status: source.status,
-        schemas: this.listSchemas(source.id).map((schema) => ({
-          name: schema.name,
-          tables: this.listTables(source.id, schema.name).map((table) => ({
-            name: table.name,
-            type: table.type,
-            estimatedRows: table.estimatedRows,
-            isLarge: table.isLarge,
-            columns: table.columns
-              .filter((column) => !column.sensitive)
-              .slice(0, 20)
-              .map((column) => ({ name: column.name, type: column.type, comment: column.comment })),
-          })),
-        })),
-      })),
+      context,
     };
   }
 
@@ -650,4 +667,18 @@ export class DataManagementStore {
     return tables.map(applyLargeTableRule);
   }
 
+}
+
+function toSchemaDataSourceRef(source: DataSourceSummary): DataSourceRef {
+  return {
+    dataSourceId: source.id,
+    type: source.type === "csv" ? "csv_sqlite_temp" : "sql_database",
+    name: source.name,
+    description: source.type === "csv" ? "CSV 导入 SQLite 临时表" : `${source.type.toUpperCase()} 数据库 ${source.database}`,
+    updatedAt: source.lastSyncedAt,
+    metadata: {
+      environment: source.environment,
+      status: source.status,
+    },
+  };
 }

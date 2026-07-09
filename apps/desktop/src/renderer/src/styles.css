@@ -627,6 +627,7 @@ button {
 .assistant-artifact-card {
   min-width: 0;
   max-width: 100%;
+  overflow: hidden;
   color: color-mix(in srgb, var(--workbench-foreground, #e6edf6) 88%, transparent);
   font-size: 12px;
   line-height: 1.6;
@@ -643,10 +644,13 @@ button {
 
 .assistant-artifact-card.code {
   display: block;
+  overflow: hidden;
 }
 
 .assistant-artifact-card .astryx-markdown {
   color: inherit;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .assistant-artifact-card.markdown :where(h1, h2, h3, h4, h5, h6, p, li, td, th, blockquote) {
@@ -670,6 +674,7 @@ button {
   display: grid;
   gap: 4px;
   min-width: 0;
+  max-width: 100%;
   font-size: 12px;
   line-height: 1.6;
 }
@@ -841,6 +846,7 @@ button {
   max-width: min(920px, 72vw);
   height: 100%;
   min-height: 0;
+  min-inline-size: 0;
   overflow: hidden;
   border-left: 1px solid color-mix(in srgb, var(--workbench-foreground, #e6edf6) 12%, transparent);
   background: color-mix(in srgb, var(--workbench-background, #0f1724) 96%, #ffffff);
@@ -867,16 +873,97 @@ button {
 
 .assistant-artifact-body {
   min-height: 0;
+  min-width: 0;
+  max-width: 100%;
   overflow: auto;
   padding: 18px 22px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
+.assistant-artifact-body > *,
+.assistant-artifact-body .assistant-artifact-markdown,
 .assistant-artifact-body .astryx-markdown {
+  box-sizing: border-box;
+  width: 100%;
   max-width: 100%;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.assistant-artifact-body :where(p, li, blockquote, td, th, h1, h2, h3, h4, h5, h6, a, span, strong, em) {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.assistant-artifact-body :where(table) {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+  white-space: normal;
 }
 
 .assistant-artifact-body :where(pre) {
+  box-sizing: border-box;
+  width: 100% !important;
+  min-width: 0 !important;
   max-width: 100%;
+  overflow-x: auto;
+  white-space: pre-wrap;
+}
+
+.assistant-artifact-body :where(pre code, pre [data-line]) {
+  max-width: 100%;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.assistant-code-block {
+  box-sizing: border-box;
+  min-width: 0 !important;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.assistant-code-block > [role="group"],
+.assistant-code-block > [role="group"] > div,
+.assistant-code-block code {
+  box-sizing: border-box;
+  min-width: 0 !important;
+  max-width: 100%;
+}
+
+.assistant-code-block > [role="group"] {
+  width: 100%;
+  overflow-x: auto;
+}
+
+.assistant-code-block > [role="group"] > div {
+  width: 100%;
+}
+
+.assistant-code-block code {
+  overflow-wrap: anywhere !important;
+  white-space: pre-wrap !important;
+  word-break: break-word !important;
+}
+
+.assistant-code-block [data-line] {
+  max-width: 100%;
+  min-width: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.assistant-artifact-body :where(.assistant-artifact-card, .assistant-message-block) {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
 }
 
 .workbench-side-theme {
