@@ -3,6 +3,7 @@ node_modules/
 dist/
 out/
 apps/*/out/
+apps/desktop/.electron/
 artifacts/
 coverage/
 tmp/

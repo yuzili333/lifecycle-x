@@ -431,9 +431,9 @@ export class AuthStore {
         },
         appearance: {
           themeMode: "dark",
-          accentColor: "#65d6d2",
-          backgroundColor: "#0f1724",
-          foregroundColor: "#e6edf6",
+          accentColor: "#ebebeb",
+          backgroundColor: "#1b1b1b",
+          foregroundColor: "#fafafa",
           fontFamily: "Inter, PingFang SC, Microsoft YaHei, system-ui, sans-serif",
           codeFontFamily: "JetBrains Mono, SFMono-Regular, Menlo, Consolas, monospace",
           uiFontSize: 14,

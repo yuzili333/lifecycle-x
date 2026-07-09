@@ -23,8 +23,9 @@
   },
   "scripts": {
     "build": "electron-vite build",
-    "dev": "electron-vite dev",
-    "preview": "electron-vite preview",
+    "dev": "ELECTRON_EXEC_PATH=./.electron/dist/electron node ./node_modules/electron-vite/bin/electron-vite.js dev",
+    "native:rebuild": "node ./scripts/rebuild-native-deps.mjs",
+    "preview": "ELECTRON_EXEC_PATH=./.electron/dist/electron node ./node_modules/electron-vite/bin/electron-vite.js preview",
     "typecheck": "tsc --noEmit",
     "xds": "node node_modules/@astryxdesign/cli/bin/astryx.mjs"
   },
@@ -33,7 +34,9 @@
     "@astryxdesign/theme-neutral": "^0.1.3",
     "@stylexjs/stylex": "^0.18.3",
     "@vitejs/plugin-react": "^4.3.4",
+    "better-sqlite3": "^12.11.1",
     "electron-vite": "^3.0.0",
+    "lucide-react": "1.23.0",
     "react": "^19.2.7",
     "react-dom": "^19.2.7"
   },

@@ -1,4 +1,4 @@
-import { Activity, useCallback, useEffect, useMemo, useState, type CSSProperties, type FormEvent, type ReactNode } from "react";
+import { Activity, useCallback, useEffect, useMemo, useState, type CSSProperties } from "react";
 import { AppShell } from "@astryxdesign/core/AppShell";
 import { Avatar } from "@astryxdesign/core/Avatar";
 import { Button } from "@astryxdesign/core/Button";
@@ -19,6 +19,7 @@ import { Switch } from "@astryxdesign/core/Switch";
 import { Text } from "@astryxdesign/core/Text";
 import { TextInput } from "@astryxdesign/core/TextInput";
 import type { AuthFailure } from "./auth";
+import { DataAssistantWorkspace } from "./DataAssistantWorkspace";
 import { DataManagementWorkspace } from "./DataManagementWorkspace";
 import { useAppToast } from "./useAppToast";
 import type { useAuthStore } from "./useAuthStore";
@@ -42,6 +43,29 @@ type SettingsTab = "profile" | "general" | "appearance" | "agent" | "logout";
 const DEFAULT_WORKBENCH_MODULE: WorkbenchModule = "data-assistant";
 const WORKBENCH_NAV_CACHE_KEY_PREFIX = "cycle-probe:workbench:last-module";
 const MODEL_CONFIG_PROMPT_CACHE_KEY_PREFIX = "cycle-probe:workbench:model-config-prompted";
+const APP_THEME_MODE_CACHE_KEY = "cycle-probe:theme-mode";
+const APP_THEME_MODE_EVENT = "cycle-probe:theme-mode-change";
+const NEUTRAL_THEME_APPEARANCE_BY_MODE: Record<WorkbenchSettings["appearance"]["themeMode"], {
+  themeMode: WorkbenchSettings["appearance"]["themeMode"];
+  accentColor: string;
+  backgroundColor: string;
+  foregroundColor: string;
+}> = {
+  light: {
+    themeMode: "light",
+    accentColor: "#262626",
+    backgroundColor: "#f1f1f1",
+    foregroundColor: "#171717",
+  },
+  dark: {
+    themeMode: "dark",
+    accentColor: "#ebebeb",
+    backgroundColor: "#1b1b1b",
+    foregroundColor: "#fafafa",
+  },
+};
+const DEFAULT_THEME_MODE: WorkbenchSettings["appearance"]["themeMode"] = "dark";
+const DEFAULT_NEUTRAL_THEME_APPEARANCE = NEUTRAL_THEME_APPEARANCE_BY_MODE[DEFAULT_THEME_MODE];
 
 const defaultSettings: WorkbenchSettings = {
   general: {
@@ -50,10 +74,7 @@ const defaultSettings: WorkbenchSettings = {
     notificationsEnabled: true,
   },
   appearance: {
-    themeMode: "dark",
-    accentColor: "#65d6d2",
-    backgroundColor: "#0f1724",
-    foregroundColor: "#e6edf6",
+    ...DEFAULT_NEUTRAL_THEME_APPEARANCE,
     fontFamily: "Inter, PingFang SC, Microsoft YaHei, system-ui, sans-serif",
     codeFontFamily: "JetBrains Mono, SFMono-Regular, Menlo, Consolas, monospace",
     uiFontSize: 14,
@@ -170,12 +191,45 @@ function normalizeDockIconTheme(value: unknown): WorkbenchSettings["appearance"]
   return value === "light" ? "light" : "dark";
 }
 
+function isThemeMode(value: unknown): value is WorkbenchSettings["appearance"]["themeMode"] {
+  return value === "light" || value === "dark";
+}
+
+function readCachedThemeMode(): WorkbenchSettings["appearance"]["themeMode"] | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+
+  try {
+    const cached = window.localStorage.getItem(APP_THEME_MODE_CACHE_KEY);
+    return isThemeMode(cached) ? cached : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeCachedThemeMode(themeMode: WorkbenchSettings["appearance"]["themeMode"]) {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(APP_THEME_MODE_CACHE_KEY, themeMode);
+  } catch {
+    // Ignore storage failures; the current session can still switch theme.
+  }
+
+  window.dispatchEvent(new CustomEvent(APP_THEME_MODE_EVENT, { detail: themeMode }));
+}
+
 function normalizeWorkbenchSettings(settings: WorkbenchSettings): WorkbenchSettings {
+  const themeMode = readCachedThemeMode() ?? DEFAULT_THEME_MODE;
   return {
     general: { ...defaultSettings.general, ...settings.general },
     appearance: {
       ...defaultSettings.appearance,
       ...settings.appearance,
+      ...NEUTRAL_THEME_APPEARANCE_BY_MODE[themeMode],
       dockIcon: normalizeDockIconTheme(settings.appearance?.dockIcon),
     },
     configuration: { ...defaultSettings.configuration, ...settings.configuration },
@@ -241,31 +295,6 @@ function ReadOnlyField({ label, value }: { label: string; value: string }) {
   );
 }
 
-function PlaceholderView({
-  title,
-  description,
-  children,
-}: {
-  title: string;
-  description: string;
-  children?: ReactNode;
-}) {
-  return (
-    <section className="empty-module" aria-labelledby={`${title}-title`}>
-      <div className="empty-module-mark" aria-hidden="true">
-        LX
-      </div>
-      <Text type="display-3" as="h2" id={`${title}-title`}>
-        {title}
-      </Text>
-      <Text type="body" color="secondary">
-        {description}
-      </Text>
-      {children}
-    </section>
-  );
-}
-
 function NavAssetIcon({ src }: { src: string }) {
   return <span className="nav-asset-icon" style={{ "--nav-icon-url": `url(${src})` } as CSSProperties} aria-hidden="true" />;
 }
@@ -327,7 +356,6 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
   const [activeSettingsTab, setActiveSettingsTab] = useState<SettingsTab>("profile");
   const [profile, setProfile] = useState<UserProfile | null>(() => fallbackProfile(auth.user));
   const [avatarDraft, setAvatarDraft] = useState(auth.user?.avatarUrl ?? "");
-  const [assistantDraft, setAssistantDraft] = useState("");
   const [apiKeyDraft, setApiKeyDraft] = useState("");
   const [settings, setSettings] = useState<WorkbenchSettings>(defaultSettings);
   const [isSavingAvatar, setIsSavingAvatar] = useState(false);
@@ -472,9 +500,9 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
   const activeDockIconVariant = settings.appearance.dockIcon;
   const activeDockIcon = dockIconAssets[activeDockIconVariant];
   const workbenchStyle = {
-    "--workbench-background": settings.appearance.backgroundColor,
-    "--workbench-foreground": settings.appearance.foregroundColor,
-    "--workbench-accent": settings.appearance.accentColor,
+    "--workbench-background": "var(--color-background-body)",
+    "--workbench-foreground": "var(--color-text-primary)",
+    "--workbench-accent": "var(--color-accent)",
     "--workbench-font": settings.appearance.fontFamily,
     "--workbench-code-font": settings.appearance.codeFontFamily,
     "--workbench-ui-font-size": `${settings.appearance.uiFontSize}px`,
@@ -507,21 +535,6 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
   const confirmSessionExpiredLogout = async () => {
     setIsSessionExpiredConfirmOpen(false);
     await auth.logout();
-  };
-
-  const handleAssistantSubmit = (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    if (!isModelConfigurationReady(settings)) {
-      setIsModelConfigRequiredOpen(true);
-      return;
-    }
-
-    toast({
-      type: "info",
-      body: `已使用 ${settings.configuration.modelName} 接收对话请求，数据助手对话能力待接入。`,
-      uniqueID: "assistant-chat-pending",
-      collisionBehavior: "overwrite",
-    });
   };
 
   const handleAvatarSave = async () => {
@@ -608,22 +621,14 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
       <div className="workbench-module-stack">
         <Activity mode={activeModule === "data-assistant" ? "visible" : "hidden"} name="workbench-data-assistant">
           <div className="workbench-module">
-            <PlaceholderView title="数据助手" description="对话能力依赖大模型配置，完成配置后即可接入智能体交互。">
-              <form className="assistant-chat-entry" onSubmit={handleAssistantSubmit}>
-                <TextInput
-                  label="对话内容"
-                  value={assistantDraft}
-                  placeholder="输入需要分析或查询的问题"
-                  width="100%"
-                  hasClear
-                  onChange={setAssistantDraft}
-                />
-                <Button label="发送" variant="primary" type="submit" />
-              </form>
-              <Text type="supporting" color="secondary">
-                {isModelConfigurationReady(settings) ? `当前模型：${settings.configuration.modelName}` : "尚未完成大模型配置"}
-              </Text>
-            </PlaceholderView>
+            <DataAssistantWorkspace
+              user={auth.user}
+              modelName={settings.configuration.modelName}
+              isModelConfigured={isModelConfigurationReady(settings)}
+              canReadDataSources={auth.permissions.includes("datasource:read")}
+              requestWithRefresh={requestWithRefresh}
+              onRequireModelConfig={() => setIsModelConfigRequiredOpen(true)}
+            />
           </div>
         </Activity>
         <Activity mode={activeModule === "data-management" ? "visible" : "hidden"} name="workbench-data-management">
@@ -790,12 +795,17 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
                     { label: "浅色主题", value: "light" },
                     { label: "深色主题", value: "dark" },
                   ]}
-                  onChange={(themeMode) =>
+                  onChange={(themeMode) => {
+                    const nextThemeMode = isThemeMode(themeMode) ? themeMode : DEFAULT_THEME_MODE;
+                    writeCachedThemeMode(nextThemeMode);
                     setSettings((current) => ({
                       ...current,
-                      appearance: { ...current.appearance, themeMode: themeMode as WorkbenchSettings["appearance"]["themeMode"] },
-                    }))
-                  }
+                      appearance: {
+                        ...current.appearance,
+                        ...NEUTRAL_THEME_APPEARANCE_BY_MODE[nextThemeMode],
+                      },
+                    }));
+                  }}
                 />
                 <TextInput
                   label="强调色"

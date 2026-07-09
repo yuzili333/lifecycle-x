@@ -5,6 +5,7 @@ import defaultDockIconPath from "../../build/icon.png?asset";
 import dockIconDark512Path from "../resources/cycle_probe_docker_icon_dark_512.png?asset";
 import dockIconLight512Path from "../resources/cycle_probe_docker_icon_light_512.png?asset";
 import type { DataSourceMenuAction } from "../preload";
+import { AssistantRuntime, type AssistantStreamEvent } from "./assistantRuntime";
 
 const isMac = process.platform === "darwin";
 const secretStoreFileName = "cycle-probe-secrets.json";
@@ -22,6 +23,7 @@ function createDockIcon(variant: DockIconVariant) {
 }
 
 let currentDockIcon = nativeImage.createFromPath(defaultDockIconPath);
+let assistantRuntime: AssistantRuntime | null = null;
 
 type SecretStore = {
   modelApiKeys?: Record<string, string>;
@@ -56,6 +58,23 @@ function encryptLocalSecret(secret: string) {
   return `base64:${Buffer.from(secret, "utf8").toString("base64")}`;
 }
 
+function decryptLocalSecret(secret: string) {
+  if (secret.startsWith("safe:")) {
+    if (!safeStorage.isEncryptionAvailable()) {
+      return null;
+    }
+    try {
+      return safeStorage.decryptString(Buffer.from(secret.slice("safe:".length), "base64"));
+    } catch {
+      return null;
+    }
+  }
+  if (secret.startsWith("base64:")) {
+    return Buffer.from(secret.slice("base64:".length), "base64").toString("utf8");
+  }
+  return null;
+}
+
 function sendDataSourceAction(action: DataSourceMenuAction) {
   const targetWindow = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0];
   targetWindow?.webContents.send("data-source:action", action);
@@ -75,6 +94,29 @@ function applyDockIcon(variant: DockIconVariant) {
     app.dock.setIcon(currentDockIcon);
   }
   return true;
+}
+
+async function modelApiKeyForUser(userId: string) {
+  const store = await readSecretStore();
+  const encrypted = store.modelApiKeys?.[secretKeyForUser(userId)];
+  return encrypted ? decryptLocalSecret(encrypted) : null;
+}
+
+function broadcastAssistantEvent(event: AssistantStreamEvent) {
+  for (const window of BrowserWindow.getAllWindows()) {
+    window.webContents.send("assistant:stream-event", event);
+  }
+}
+
+function getAssistantRuntime() {
+  if (!assistantRuntime) {
+    assistantRuntime = new AssistantRuntime({
+      dbPath: join(app.getPath("userData"), "cycle-probe-assistant.sqlite3"),
+      getModelApiKey: modelApiKeyForUser,
+      emit: broadcastAssistantEvent,
+    });
+  }
+  return assistantRuntime;
 }
 
 function buildApplicationMenu() {
@@ -128,13 +170,56 @@ function createMainWindow(): BrowserWindow {
     },
   });
 
-  mainWindow.once("ready-to-show", () => {
+  let windowShown = false;
+  const showWindow = () => {
+    if (windowShown || mainWindow.isDestroyed()) {
+      return;
+    }
+    windowShown = true;
+    if (mainWindow.isMinimized()) {
+      mainWindow.restore();
+    }
     mainWindow.show();
+    mainWindow.moveTop();
+    mainWindow.focus();
+    if (isMac) {
+      app.dock.show();
+      app.focus({ steal: true });
+      setTimeout(() => {
+        if (mainWindow.isDestroyed()) {
+          return;
+        }
+        mainWindow.moveTop();
+        mainWindow.focus();
+        app.focus({ steal: true });
+      }, 150);
+    }
+  };
+
+  const showWindowFallback = setTimeout(showWindow, 1500);
+
+  mainWindow.once("ready-to-show", showWindow);
+  mainWindow.webContents.once("did-finish-load", showWindow);
+  mainWindow.on("closed", () => {
+    clearTimeout(showWindowFallback);
   });
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     void shell.openExternal(url);
     return { action: "deny" };
+  });
+
+  mainWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL) => {
+    console.error("[main] renderer load failed", {
+      errorCode,
+      errorDescription,
+      validatedURL,
+    });
+    showWindow();
+  });
+
+  mainWindow.webContents.on("render-process-gone", (_event, details) => {
+    console.error("[main] renderer process gone", details);
   });
 
   if (process.env.ELECTRON_RENDERER_URL) {
@@ -191,9 +276,26 @@ ipcMain.handle("model-api-key:set", async (_event, userId: string, apiKey: strin
   });
   return true;
 });
+ipcMain.handle("assistant:conversations:list", (_event, userId: string) => getAssistantRuntime().listConversations(userId));
+ipcMain.handle("assistant:conversation:create", (_event, userId: string) => getAssistantRuntime().createConversation(userId));
+ipcMain.handle("assistant:messages:list", (_event, userId: string, conversationId: string) =>
+  getAssistantRuntime().getConversationMessages(userId, conversationId),
+);
+ipcMain.handle("assistant:message:send", (_event, input) => getAssistantRuntime().sendMessage(input));
+ipcMain.handle("assistant:message:retry", (_event, input) => getAssistantRuntime().retryAssistantMessage(input));
+ipcMain.handle("assistant:message:cancel", (_event, messageId: string) => {
+  getAssistantRuntime().cancelMessage(messageId);
+  return true;
+});
+ipcMain.handle("assistant:tool:approve", (_event, userId: string, toolCallId: string, approved: boolean) =>
+  getAssistantRuntime().approveTool(userId, toolCallId, approved),
+);
 
 app.whenReady().then(() => {
   app.setAppUserModelId("com.lifecycle-x.desktop");
+  if (isMac) {
+    app.setActivationPolicy("regular");
+  }
   if (isMac && !currentDockIcon.isEmpty()) {
     app.dock.setIcon(currentDockIcon);
   }

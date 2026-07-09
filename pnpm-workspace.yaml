@@ -2,9 +2,14 @@ packages:
   - "apps/*"
   - "packages/*"
 
+"strict-dep-builds": false
+"verify-deps-before-run": false
+
 onlyBuiltDependencies:
-  - electron
   - esbuild
+neverBuiltDependencies:
+  - electron
 allowBuilds:
-  electron: true
+  better-sqlite3: true
+  electron: false
   esbuild: true

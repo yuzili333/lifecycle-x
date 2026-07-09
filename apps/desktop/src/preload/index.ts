@@ -1,4 +1,13 @@
 import { contextBridge, ipcRenderer } from "electron";
+import type {
+  AssistantConversation,
+  AssistantMessage,
+  AssistantRetryInput,
+  AssistantRetryResult,
+  AssistantSendInput,
+  AssistantSendResult,
+  AssistantStreamEvent,
+} from "../main/assistantRuntime";
 
 export type DataSourceMenuAction = "create-connection" | "import-csv";
 export type DockIconVariant = "dark" | "light";
@@ -17,6 +26,33 @@ const lifecycleXApi = {
   modelApiKey: {
     has: (userId: string) => ipcRenderer.invoke("model-api-key:has", userId) as Promise<boolean>,
     set: (userId: string, apiKey: string) => ipcRenderer.invoke("model-api-key:set", userId, apiKey) as Promise<boolean>,
+  },
+  assistant: {
+    listConversations: (userId: string) =>
+      ipcRenderer.invoke("assistant:conversations:list", userId) as Promise<AssistantConversation[]>,
+    createConversation: (userId: string) =>
+      ipcRenderer.invoke("assistant:conversation:create", userId) as Promise<AssistantConversation>,
+    listMessages: (userId: string, conversationId: string) =>
+      ipcRenderer.invoke("assistant:messages:list", userId, conversationId) as Promise<AssistantMessage[]>,
+    sendMessage: (input: AssistantSendInput) =>
+      ipcRenderer.invoke("assistant:message:send", input) as Promise<AssistantSendResult>,
+    retryMessage: (input: AssistantRetryInput) =>
+      ipcRenderer.invoke("assistant:message:retry", input) as Promise<AssistantRetryResult>,
+    cancelMessage: (messageId: string) =>
+      ipcRenderer.invoke("assistant:message:cancel", messageId) as Promise<boolean>,
+    approveTool: (userId: string, toolCallId: string, approved: boolean) =>
+      ipcRenderer.invoke("assistant:tool:approve", userId, toolCallId, approved) as Promise<{
+        success: true;
+        toolCall: unknown;
+        message: AssistantMessage;
+      }>,
+    onStreamEvent: (handler: (event: AssistantStreamEvent) => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, event: AssistantStreamEvent) => handler(event);
+      ipcRenderer.on("assistant:stream-event", listener);
+      return () => {
+        ipcRenderer.removeListener("assistant:stream-event", listener);
+      };
+    },
   },
   dataSource: {
     onAction: (handler: (action: DataSourceMenuAction) => void) => {
