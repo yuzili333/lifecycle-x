@@ -32,6 +32,10 @@ const lifecycleXApi = {
       ipcRenderer.invoke("assistant:conversations:list", userId) as Promise<AssistantConversation[]>,
     createConversation: (userId: string) =>
       ipcRenderer.invoke("assistant:conversation:create", userId) as Promise<AssistantConversation>,
+    renameConversation: (userId: string, conversationId: string, title: string) =>
+      ipcRenderer.invoke("assistant:conversation:rename", userId, conversationId, title) as Promise<AssistantConversation>,
+    deleteConversation: (userId: string, conversationId: string) =>
+      ipcRenderer.invoke("assistant:conversation:delete", userId, conversationId) as Promise<{ success: true; conversationId: string }>,
     listMessages: (userId: string, conversationId: string) =>
       ipcRenderer.invoke("assistant:messages:list", userId, conversationId) as Promise<AssistantMessage[]>,
     sendMessage: (input: AssistantSendInput) =>

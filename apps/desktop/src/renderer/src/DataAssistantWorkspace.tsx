@@ -15,17 +15,19 @@ import {
   type ChatToolCallItem,
 } from "@astryxdesign/core/Chat";
 import { CodeBlock } from "@astryxdesign/core/CodeBlock";
+import { Dialog } from "@astryxdesign/core/Dialog";
 import { DropdownMenu, type DropdownMenuOption } from "@astryxdesign/core/DropdownMenu";
 import { Icon } from "@astryxdesign/core/Icon";
 import { Card, HStack, StackItem, VStack } from "@astryxdesign/core/Layout";
 import { Markdown, type MarkdownComponents } from "@astryxdesign/core/Markdown";
 import { ResizeHandle, useResizable } from "@astryxdesign/core/Resizable";
 import { Section } from "@astryxdesign/core/Section";
+import { TextInput } from "@astryxdesign/core/TextInput";
 import { Text } from "@astryxdesign/core/Text";
 import { Token } from "@astryxdesign/core/Token";
 import { Toolbar } from "@astryxdesign/core/Toolbar";
 import { Tooltip } from "@astryxdesign/core/Tooltip";
-import { ChevronRight, CircleAlert, Clock, Copy, FileText, LoaderCircle, Maximize2, Minimize2, Pencil, RotateCcw, X, type LucideIcon } from "lucide-react";
+import { ChevronRight, CircleAlert, Clock, Copy, FileText, LoaderCircle, Maximize2, Minimize2, Pencil, Plus, RotateCcw, Trash2, X, type LucideIcon } from "lucide-react";
 import type { AuthFailure, AuthUser } from "./auth";
 import { useAppToast } from "./useAppToast";
 import { workbenchApi, type ApiResult, type DataSourceSummary } from "./workbenchApi";
@@ -69,6 +71,7 @@ const skillOptions: Array<{ label: string; value: AssistantSkill }> = [
 const ARTIFACT_WINDOW_STATE_KEY = "cycle-probe:assistant:artifact-window";
 const ARTIFACT_PANEL_WIDTH_KEY = "cycle-probe:assistant:artifact-panel-width";
 const SKILL_TOKEN_PREFIX = "[skill:";
+const MAX_CONVERSATION_TITLE_LENGTH = 200;
 
 type ArtifactWindowState = {
   messageId: string | null;
@@ -492,6 +495,9 @@ export function DataAssistantWorkspace({
   const [approvalMode, setApprovalMode] = useState<AssistantApprovalMode>("request_approval");
   const [isLoadingDataSources, setIsLoadingDataSources] = useState(false);
   const [isLoadingConversations, setIsLoadingConversations] = useState(false);
+  const [editingConversation, setEditingConversation] = useState<AssistantConversation | null>(null);
+  const [editTitleDraft, setEditTitleDraft] = useState("");
+  const [deletingConversation, setDeletingConversation] = useState<AssistantConversation | null>(null);
   const [artifactWindow, setArtifactWindow] = useState<ArtifactWindowState>(() => readArtifactWindowState());
   const artifactResize = useResizable({
     defaultSize: 440,
@@ -708,6 +714,89 @@ export function DataAssistantWorkspace({
     setMessagesByConversation((current) => ({ ...current, [conversation.id]: [] }));
     setActiveConversationId(conversation.id);
     setComposerValue("");
+  };
+
+  const openEditConversation = (conversation: AssistantConversation) => {
+    setEditingConversation(conversation);
+    setEditTitleDraft(conversation.title.slice(0, MAX_CONVERSATION_TITLE_LENGTH));
+  };
+
+  const closeEditConversation = () => {
+    setEditingConversation(null);
+    setEditTitleDraft("");
+  };
+
+  const saveConversationTitle = async () => {
+    if (!user?.id || !window.lifecycleX?.assistant || !editingConversation) {
+      return;
+    }
+    const nextTitle = editTitleDraft.trim().slice(0, MAX_CONVERSATION_TITLE_LENGTH);
+    if (!nextTitle) {
+      toast({
+        type: "error",
+        body: "记录名称不能为空。",
+        uniqueID: "assistant-conversation-title-empty",
+        collisionBehavior: "overwrite",
+      });
+      return;
+    }
+
+    try {
+      const updated = await window.lifecycleX.assistant.renameConversation(user.id, editingConversation.id, nextTitle);
+      setConversations((current) => mergeConversation(current, updated));
+      closeEditConversation();
+    } catch (error) {
+      toast({
+        type: "error",
+        body: error instanceof Error ? error.message : "记录名称保存失败。",
+        uniqueID: "assistant-conversation-rename-error",
+        collisionBehavior: "overwrite",
+      });
+    }
+  };
+
+  const closeDeleteConversation = () => {
+    setDeletingConversation(null);
+  };
+
+  const confirmDeleteConversation = async () => {
+    if (!user?.id || !window.lifecycleX?.assistant || !deletingConversation) {
+      return;
+    }
+
+    try {
+      if (deletingConversation.id === activeConversation?.id && activeStreamingMessageId) {
+        await window.lifecycleX.assistant.cancelMessage(activeStreamingMessageId);
+      }
+      await window.lifecycleX.assistant.deleteConversation(user.id, deletingConversation.id);
+      setConversations((current) => {
+        const remaining = current.filter((conversation) => conversation.id !== deletingConversation.id);
+        if (activeConversation?.id === deletingConversation.id) {
+          const nextActiveId = remaining[0]?.id ?? "";
+          setActiveConversationId(nextActiveId);
+          if (nextActiveId && !messagesByConversation[nextActiveId]) {
+            void loadConversationMessages(nextActiveId);
+          }
+        }
+        return remaining;
+      });
+      setMessagesByConversation((current) => {
+        const next = { ...current };
+        delete next[deletingConversation.id];
+        return next;
+      });
+      if (artifactWindow.messageId && deletingConversation.id === activeConversation?.id) {
+        closeArtifact();
+      }
+      closeDeleteConversation();
+    } catch (error) {
+      toast({
+        type: "error",
+        body: error instanceof Error ? error.message : "对话记录删除失败。",
+        uniqueID: "assistant-conversation-delete-error",
+        collisionBehavior: "overwrite",
+      });
+    }
   };
 
   const stopStreaming = useCallback(() => {
@@ -1174,29 +1263,56 @@ export function DataAssistantWorkspace({
 
   return (
     <section className="data-assistant-workspace" aria-label="数据助手">
-      <aside className="assistant-history-panel" aria-label="对话历史记录">
+      <aside className="assistant-history-panel" aria-label="对话列表">
         <div className="assistant-history-heading">
-          <Text type="supporting" color="secondary">
-            对话历史
-          </Text>
-          <Button label="新建对话" variant="ghost" size="sm" isLoading={isLoadingConversations} onClick={startConversation} />
+          <Button
+            label="New Chat"
+            variant="primary"
+            size="sm"
+            icon={<Icon icon={Plus} size="sm" color="inherit" />}
+            isIconOnly
+            isLoading={isLoadingConversations}
+            onClick={startConversation}
+          />
         </div>
         <div className="assistant-history-list">
           {conversations.map((conversation) => (
-            <button
+            <div
               key={conversation.id}
-              type="button"
               className={conversation.id === activeConversation?.id ? "assistant-history-item active" : "assistant-history-item"}
-              onClick={() => {
-                setActiveConversationId(conversation.id);
-                if (!messagesByConversation[conversation.id]) {
-                  void loadConversationMessages(conversation.id);
-                }
-              }}
             >
-              <strong>{conversation.title}</strong>
-              <span>{formatChatTime(conversation.updatedAt)}</span>
-            </button>
+              <button
+                type="button"
+                className="assistant-history-select"
+                onClick={() => {
+                  setActiveConversationId(conversation.id);
+                  if (!messagesByConversation[conversation.id]) {
+                    void loadConversationMessages(conversation.id);
+                  }
+                }}
+              >
+                <strong>{conversation.title}</strong>
+                <span>{formatChatTime(conversation.updatedAt)}</span>
+              </button>
+              <div className="assistant-history-actions">
+                <Button
+                  label="编辑记录"
+                  variant="secondary"
+                  size="sm"
+                  icon={<Icon icon={Pencil} size="xsm" color="inherit" />}
+                  isIconOnly
+                  onClick={() => openEditConversation(conversation)}
+                />
+                <Button
+                  label="删除记录"
+                  variant="destructive"
+                  size="sm"
+                  icon={<Icon icon={Trash2} size="xsm" color="inherit" />}
+                  isIconOnly
+                  onClick={() => setDeletingConversation(conversation)}
+                />
+              </div>
+            </div>
           ))}
         </div>
       </aside>
@@ -1418,6 +1534,46 @@ export function DataAssistantWorkspace({
           </>
         )}
       </div>
+
+      <Dialog isOpen={editingConversation !== null} onOpenChange={(open) => !open && closeEditConversation()} width={460} purpose="form" padding={5}>
+        <VStack gap={4} hAlign="stretch">
+          <div className="dialog-copy-stack">
+            <Text type="display-3" as="h2" display="block">
+              编辑记录名称
+            </Text>
+            <Text type="body" color="secondary" display="block">
+              记录名称最多支持 {MAX_CONVERSATION_TITLE_LENGTH} 个字符。
+            </Text>
+          </div>
+          <TextInput
+            label="记录名称"
+            value={editTitleDraft}
+            onChange={(value) => setEditTitleDraft(value.slice(0, MAX_CONVERSATION_TITLE_LENGTH))}
+            width="100%"
+          />
+          <HStack hAlign="end" gap={2}>
+            <Button label="取消" variant="secondary" onClick={closeEditConversation} />
+            <Button label="保存" variant="primary" onClick={saveConversationTitle} />
+          </HStack>
+        </VStack>
+      </Dialog>
+
+      <Dialog isOpen={deletingConversation !== null} onOpenChange={(open) => !open && closeDeleteConversation()} width={420} purpose="info" padding={5}>
+        <VStack gap={4} hAlign="stretch">
+          <div className="dialog-copy-stack">
+            <Text type="display-3" as="h2" display="block">
+              请确认是否删除
+            </Text>
+            <Text type="body" color="secondary" display="block">
+              删除后对话数据将无法恢复
+            </Text>
+          </div>
+          <HStack hAlign="end" gap={2}>
+            <Button label="取消" variant="secondary" onClick={closeDeleteConversation} />
+            <Button label="确认" variant="destructive" onClick={confirmDeleteConversation} />
+          </HStack>
+        </VStack>
+      </Dialog>
     </section>
   );
 }

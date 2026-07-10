@@ -1,23 +1,17 @@
-import { Activity, useCallback, useEffect, useMemo, useState, type CSSProperties } from "react";
+import { Activity, useCallback, useEffect, useState, type CSSProperties } from "react";
 import { AppShell } from "@astryxdesign/core/AppShell";
 import { Avatar } from "@astryxdesign/core/Avatar";
 import { Button } from "@astryxdesign/core/Button";
 import { Dialog } from "@astryxdesign/core/Dialog";
-import { DropdownMenu } from "@astryxdesign/core/DropdownMenu";
 import { HStack, VStack } from "@astryxdesign/core/Layout";
 import { Section } from "@astryxdesign/core/Section";
 import { Selector } from "@astryxdesign/core/Selector";
-import {
-  SideNav,
-  SideNavHeading,
-  SideNavItem,
-  SideNavSection,
-  useSideNavCollapse,
-} from "@astryxdesign/core/SideNav";
 import { Slider } from "@astryxdesign/core/Slider";
 import { Switch } from "@astryxdesign/core/Switch";
 import { Text } from "@astryxdesign/core/Text";
 import { TextInput } from "@astryxdesign/core/TextInput";
+import { TopNav, TopNavHeading, TopNavItem, TopNavMenu } from "@astryxdesign/core/TopNav";
+import { UserCircle } from "lucide-react";
 import type { AuthFailure } from "./auth";
 import { DataAssistantWorkspace } from "./DataAssistantWorkspace";
 import { DataManagementWorkspace } from "./DataManagementWorkspace";
@@ -26,6 +20,7 @@ import type { useAuthStore } from "./useAuthStore";
 import aiIcon from "./assets/ai.svg";
 import dockIconDark512 from "./assets/cycle_probe_docker_icon_dark_512.png";
 import dockIconLight512 from "./assets/cycle_probe_docker_icon_light_512.png";
+import csvIcon from "./assets/csv.svg";
 import databaseIcon from "./assets/database.svg";
 import { workbenchApi, type ApiResult, type UserProfile, type WorkbenchSettings } from "./workbenchApi";
 import type { DataSourceMenuAction, DockIconVariant } from "../../preload";
@@ -299,52 +294,6 @@ function NavAssetIcon({ src }: { src: string }) {
   return <span className="nav-asset-icon" style={{ "--nav-icon-url": `url(${src})` } as CSSProperties} aria-hidden="true" />;
 }
 
-function SideNavUserCard({
-  profile,
-  user,
-  onOpenSettings,
-  onLogout,
-}: {
-  profile: UserProfile | null;
-  user: WorkbenchAuth["user"];
-  onOpenSettings: () => void;
-  onLogout: () => void;
-}) {
-  const { isCollapsed } = useSideNavCollapse();
-  const displayName = profile?.displayName ?? user?.displayName ?? "用户";
-  const email = profile?.email ?? user?.email ?? "";
-
-  return (
-    <DropdownMenu
-      button={{
-        label: "用户菜单",
-        variant: "ghost",
-        size: "md",
-        className: isCollapsed ? "side-user-menu-trigger collapsed" : "side-user-menu-trigger",
-        children: (
-          <span className={isCollapsed ? "side-user-avatar-only" : "side-user"}>
-            <Avatar src={profile?.avatarUrl} name={displayName} size={isCollapsed ? 32 : 36} />
-            {!isCollapsed && (
-              <span className="side-user-copy">
-                <strong>{displayName}</strong>
-                <span>{email}</span>
-              </span>
-            )}
-          </span>
-        ),
-      }}
-      hasChevron={false}
-      menuWidth={180}
-      placement="above"
-      items={[
-        { label: "设置", onClick: onOpenSettings },
-        { type: "divider" },
-        { label: "退出登录", onClick: onLogout },
-      ]}
-    />
-  );
-}
-
 export function WorkbenchShell({ auth }: WorkbenchShellProps) {
   const toast = useAppToast();
   const [activeModule, setActiveModule] = useState<WorkbenchModule>(() => readCachedWorkbenchModule(auth.user, auth.permissions));
@@ -488,15 +437,6 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
     return () => dispose?.();
   }, []);
 
-  const navItems = useMemo(
-    () => [
-      { id: "data-assistant" as const, label: "数据助手", permission: "analysis:read", icon: aiIcon },
-      { id: "data-management" as const, label: "数据管理", permission: "datasource:read", icon: databaseIcon },
-    ],
-    [],
-  );
-
-  const visibleNavItems = navItems.filter((item) => auth.permissions.includes(item.permission));
   const activeDockIconVariant = settings.appearance.dockIcon;
   const activeDockIcon = dockIconAssets[activeDockIconVariant];
   const workbenchStyle = {
@@ -521,6 +461,22 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
   const openAgentSettingsFromPrompt = () => {
     setIsModelConfigRequiredOpen(false);
     openSettings("agent");
+  };
+
+  const activateDataManagement = (action?: DataSourceMenuAction) => {
+    if (!auth.permissions.includes("datasource:read")) {
+      toast({
+        type: "error",
+        body: "当前账号无数据管理访问权限。",
+        uniqueID: "data-source-nav-denied",
+        collisionBehavior: "overwrite",
+      });
+      return;
+    }
+    setActiveModule("data-management");
+    if (action) {
+      setPendingDataSourceAction(action);
+    }
   };
 
   const requestLogout = () => {
@@ -648,33 +604,64 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
     );
   };
 
-  const sideNav = (
-    <div className="workbench-side-theme" style={workbenchStyle}>
-      <SideNav
-        className="workbench-side-nav"
-        header={<SideNavHeading heading="Cycle Probe" icon={<img className="workbench-brand-icon" src={activeDockIcon} alt="" />} />}
-        footer={<SideNavUserCard profile={profile} user={auth.user} onOpenSettings={() => openSettings("general")} onLogout={requestLogout} />}
-        collapsible={{ defaultIsCollapsed: false, buttonLabel: "折叠工作台导航" }}
-      >
-        <SideNavSection title="主导航" isHeaderHidden>
-          {visibleNavItems.map((item) => (
-            <SideNavItem
-              key={item.id}
-              label={item.label}
-              icon={<NavAssetIcon src={item.icon} />}
-              selectedIcon={<NavAssetIcon src={item.icon} />}
-              isSelected={activeModule === item.id}
-              size="sm"
-              onClick={() => setActiveModule(item.id)}
-            />
-          ))}
-        </SideNavSection>
-      </SideNav>
+  const topNav = (
+    <div className="workbench-top-nav-frame" style={workbenchStyle}>
+      <TopNav
+        label="Cycle Probe navigation"
+        heading={<TopNavHeading heading="Cycle Probe" logo={<img className="workbench-brand-icon" src={activeDockIcon} alt="" />} />}
+        startContent={
+          <>
+            {auth.permissions.includes("analysis:read") && (
+              <TopNavItem
+                label="Assistant"
+                href="#assistant"
+                icon={<NavAssetIcon src={aiIcon} />}
+                isSelected={activeModule === "data-assistant"}
+                onClick={(event) => {
+                  event.preventDefault();
+                  setActiveModule("data-assistant");
+                }}
+              />
+            )}
+            {auth.permissions.includes("datasource:read") && (
+              <TopNavMenu
+                label="DataSource"
+                items={[
+                  {
+                    title: "Database",
+                    description: "Database Connection",
+                    icon: <NavAssetIcon src={databaseIcon} />,
+                    href: "#database",
+                    onClick: () => activateDataManagement(),
+                  },
+                  {
+                    title: "CSV",
+                    description: "Import CSV",
+                    icon: <NavAssetIcon src={csvIcon} />,
+                    href: "#csv",
+                    onClick: () => activateDataManagement("import-csv"),
+                  },
+                ]}
+              />
+            )}
+          </>
+        }
+        endContent={
+          <Button
+            label="Profile"
+            variant="ghost"
+            icon={<UserCircle size={18} />}
+            isIconOnly
+            className="workbench-profile-button"
+            onClick={() => openSettings("profile")}
+          />
+        }
+      />
     </div>
   );
 
   return (
-    <AppShell variant="section" sideNav={sideNav} contentPadding={0} mobileNav={{ breakpoint: "md" }}>
+    <AppShell variant="section" topNav={topNav} contentPadding={0} mobileNav={{ breakpoint: "md" }}>
       <section className="workbench-main" data-theme-mode={settings.appearance.themeMode} style={workbenchStyle}>
         <div className="workbench-content">{renderContent()}</div>
       </section>

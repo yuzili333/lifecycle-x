@@ -278,6 +278,12 @@ ipcMain.handle("model-api-key:set", async (_event, userId: string, apiKey: strin
 });
 ipcMain.handle("assistant:conversations:list", (_event, userId: string) => getAssistantRuntime().listConversations(userId));
 ipcMain.handle("assistant:conversation:create", (_event, userId: string) => getAssistantRuntime().createConversation(userId));
+ipcMain.handle("assistant:conversation:rename", (_event, userId: string, conversationId: string, title: string) =>
+  getAssistantRuntime().renameConversation(userId, conversationId, title),
+);
+ipcMain.handle("assistant:conversation:delete", (_event, userId: string, conversationId: string) =>
+  getAssistantRuntime().deleteConversation(userId, conversationId),
+);
 ipcMain.handle("assistant:messages:list", (_event, userId: string, conversationId: string) =>
   getAssistantRuntime().getConversationMessages(userId, conversationId),
 );

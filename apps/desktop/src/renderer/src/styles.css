@@ -73,19 +73,6 @@ button {
   max-width: min(420px, calc(100vw - 48px));
 }
 
-.workbench-brand-mark {
-  display: grid;
-  width: 32px;
-  height: 32px;
-  place-items: center;
-  border: 1px solid color-mix(in srgb, var(--workbench-accent, #65d6d2) 58%, #ffffff);
-  border-radius: 8px;
-  color: #031317;
-  background: var(--workbench-accent, #65d6d2);
-  font-size: 12px;
-  font-weight: 800;
-}
-
 .workbench-brand-icon {
   display: block;
   width: 32px;
@@ -108,54 +95,34 @@ button {
 .workbench-main {
   display: grid;
   grid-template-rows: 1fr;
-  min-height: 100vh;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
   color: var(--workbench-foreground, #172033);
   background: var(--workbench-background, #f7fafc);
   font-family: var(--workbench-font);
   font-size: var(--workbench-ui-font-size, 14px);
 }
 
-.workbench-topbar {
+.workbench-top-nav-frame {
   display: flex;
-  justify-content: space-between;
-  gap: 24px;
-  align-items: center;
-  min-height: 88px;
-  border-bottom: 1px solid color-mix(in srgb, var(--workbench-foreground, #e6edf6) 14%, transparent);
-  padding: 22px 28px;
+  width: 100%;
+  color: var(--workbench-foreground, #e6edf6);
   background: color-mix(in srgb, var(--workbench-background, #0f1724) 94%, #ffffff);
 }
 
-.workbench-actions {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  white-space: nowrap;
+.workbench-top-nav-frame [data-xds="top-nav"],
+.workbench-top-nav-frame nav {
+  min-height: 52px;
 }
 
-.workbench-actions .topbar-avatar-trigger {
-  width: 32px !important;
-  min-width: 32px !important;
-  height: 32px !important;
-  min-height: 32px !important;
-  border: 0 !important;
+.workbench-profile-button {
+  width: 34px !important;
+  min-width: 34px !important;
+  height: 34px !important;
+  min-height: 34px !important;
   border-radius: 999px !important;
   padding: 0 !important;
-  color: inherit;
-  background: transparent !important;
-  box-shadow: none !important;
-}
-
-.workbench-actions .topbar-avatar-trigger:hover,
-.workbench-actions .topbar-avatar-trigger:active,
-.workbench-actions .topbar-avatar-trigger[data-state="open"] {
-  background: transparent !important;
-  box-shadow: none !important;
-}
-
-.workbench-actions .topbar-avatar-trigger:focus-visible {
-  outline: 2px solid var(--workbench-accent, #65d6d2);
-  outline-offset: 2px;
 }
 
 .nav-asset-icon {
@@ -171,27 +138,31 @@ button {
 .workbench-content {
   display: grid;
   min-width: 0;
-  min-height: 100vh;
+  height: 100%;
+  min-height: 0;
   padding: 0;
   font-size: 12px;
+  overflow: hidden;
 }
 
 .workbench-module-stack {
   display: grid;
   min-width: 0;
-  min-height: 100vh;
+  height: 100%;
+  min-height: 0;
 }
 
 .workbench-module {
   display: grid;
   min-width: 0;
-  min-height: 100vh;
+  height: 100%;
+  min-height: 0;
 }
 
 .data-management-workspace {
   display: grid;
   grid-template-rows: auto 1fr;
-  min-height: 100vh;
+  min-height: 0;
   border: 1px solid color-mix(in srgb, var(--workbench-foreground, #e6edf6) 14%, transparent);
   border-radius: 0;
   overflow: hidden;
@@ -486,7 +457,7 @@ button {
   display: grid;
   grid-template-columns: 236px minmax(0, 1fr);
   min-width: 0;
-  min-height: 100vh;
+  min-height: 0;
   overflow: hidden;
   color: var(--workbench-foreground, #e6edf6);
   background: var(--workbench-background, #0f1724);
@@ -508,12 +479,12 @@ button {
 
 .assistant-history-heading {
   display: flex;
-  justify-content: space-between;
-  gap: 8px;
+  justify-content: flex-end;
+  gap: 6px;
   align-items: center;
   min-width: 0;
   border-bottom: 1px solid color-mix(in srgb, var(--workbench-foreground, #e6edf6) 10%, transparent);
-  padding: 8px 10px;
+  padding: 6px 8px;
 }
 
 .assistant-history-list {
@@ -526,15 +497,15 @@ button {
 }
 
 .assistant-history-item {
-  display: grid;
-  gap: 4px;
+  display: flex;
+  gap: 6px;
+  align-items: center;
   width: 100%;
   border: 1px solid transparent;
   border-radius: 6px;
-  padding: 8px 10px;
+  padding: 5px;
   color: color-mix(in srgb, var(--workbench-foreground, #e6edf6) 78%, transparent);
   background: transparent;
-  text-align: left;
 }
 
 .assistant-history-item:hover,
@@ -544,21 +515,57 @@ button {
   background: color-mix(in srgb, var(--workbench-background, #0f1724) 76%, var(--workbench-accent, #65d6d2));
 }
 
-.assistant-history-item strong,
-.assistant-history-item span {
+.assistant-history-select {
+  display: grid;
+  flex: 1 1 auto;
+  gap: 4px;
+  min-width: 0;
+  border: 0;
+  padding: 3px 5px;
+  color: inherit;
+  background: transparent;
+  text-align: left;
+  cursor: default;
+}
+
+.assistant-history-select strong,
+.assistant-history-select span {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.assistant-history-item strong {
+.assistant-history-select strong {
   font-size: 12px;
   font-weight: 600;
 }
 
-.assistant-history-item span {
+.assistant-history-select span {
   color: color-mix(in srgb, currentColor 68%, transparent);
   font-size: 11px;
+}
+
+.assistant-history-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.assistant-history-item:hover .assistant-history-actions,
+.assistant-history-item:focus-within .assistant-history-actions,
+.assistant-history-item.active .assistant-history-actions {
+  opacity: 1;
+}
+
+.assistant-history-actions button {
+  width: 24px !important;
+  min-width: 24px !important;
+  height: 24px !important;
+  min-height: 24px !important;
+  padding: 0 !important;
+  border-radius: 5px !important;
 }
 
 .assistant-chat-shell {
@@ -966,109 +973,9 @@ button {
   overflow: hidden;
 }
 
-.workbench-side-theme {
-  height: 100%;
-  color: var(--workbench-foreground, #e6edf6);
-  background: var(--workbench-background, #0f1724);
-}
-
-.workbench-side-nav {
-  color: var(--workbench-foreground, #e6edf6);
-  background: var(--workbench-background, #0f1724);
-}
-
-.workbench-side-nav [data-xds="side-nav-item"],
-.workbench-side-nav [data-xds="side-nav-item"] *,
-.workbench-side-nav [role="menuitem"],
-.workbench-side-nav [role="treeitem"],
-.workbench-side-nav button {
-  font-size: 14px !important;
-}
-
-.workbench-side-nav .nav-asset-icon {
-  width: 14px;
-  height: 14px;
-  flex-basis: 14px;
-}
-
-.side-user-menu-trigger {
-  width: 100% !important;
-  min-width: 0 !important;
-  height: auto !important;
-  min-height: 0 !important;
-  border: 0 !important;
-  padding: 0 !important;
-  color: inherit;
-  background: transparent !important;
-  box-shadow: none !important;
-}
-
-.side-user-menu-trigger:hover,
-.side-user-menu-trigger:active,
-.side-user-menu-trigger[data-state="open"] {
-  background: transparent !important;
-  box-shadow: none !important;
-}
-
-.side-user-menu-trigger:focus-visible {
-  outline: 2px solid var(--workbench-accent, #65d6d2);
-  outline-offset: 2px;
-}
-
-.side-user-menu-trigger.collapsed {
-  display: grid !important;
-  place-items: center;
-}
-
-.side-user {
-  display: grid;
-  grid-template-columns: auto 1fr;
-  width: 100%;
-  gap: 10px;
-  align-items: center;
-  min-width: 0;
-  padding: 12px;
-  border: 1px solid color-mix(in srgb, var(--workbench-foreground, #e6edf6) 16%, transparent);
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--workbench-background, #0f1724) 88%, #ffffff);
-}
-
-.side-user-avatar-only {
-  display: grid;
-  width: 32px;
-  place-items: center;
-  padding: 4px 0;
-  border: 0;
-  background: transparent;
-}
-
-.side-user-copy {
-  display: grid;
-  min-width: 0;
-  gap: 2px;
-  text-align: left;
-}
-
-.side-user-copy strong,
-.side-user-copy span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.side-user-copy strong {
-  color: var(--workbench-foreground, #e6edf6);
-  font-size: 13px;
-}
-
-.side-user-copy span {
-  color: color-mix(in srgb, var(--workbench-foreground, #e6edf6) 68%, transparent);
-  font-size: 12px;
-}
-
 .empty-module {
   display: grid;
-  min-height: calc(100vh - 48px);
+  min-height: 100%;
   place-items: center;
   align-content: center;
   gap: 14px;
@@ -1192,11 +1099,6 @@ button {
 @media (max-width: 860px) {
   body {
     min-width: 0;
-  }
-
-  .workbench-topbar {
-    align-items: flex-start;
-    flex-direction: column;
   }
 
   .compass-toolbar {

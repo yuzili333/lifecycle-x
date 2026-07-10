@@ -320,6 +320,33 @@ export class AssistantRuntime {
     return conversation;
   }
 
+  renameConversation(userId: string, conversationId: string, title: string): AssistantConversation {
+    const normalizedTitle = title.trim().slice(0, 200);
+    if (!normalizedTitle) {
+      throw new Error("记录名称不能为空。");
+    }
+    const conversation = this.findConversation(userId, conversationId);
+    if (!conversation) {
+      throw new Error("对话记录不存在。");
+    }
+    const next: AssistantConversation = {
+      ...conversation,
+      title: normalizedTitle,
+      updatedAt: nowIso(),
+    };
+    this.persistConversation(next);
+    return next;
+  }
+
+  deleteConversation(userId: string, conversationId: string): { success: true; conversationId: string } {
+    const conversation = this.findConversation(userId, conversationId);
+    if (!conversation) {
+      throw new Error("对话记录不存在。");
+    }
+    this.db.prepare("delete from conversations where id = ? and user_id = ?").run(conversationId, userId);
+    return { success: true, conversationId };
+  }
+
   async sendMessage(input: AssistantSendInput): Promise<AssistantSendResult> {
     const prompt = input.prompt.trim();
     if (!prompt) {
