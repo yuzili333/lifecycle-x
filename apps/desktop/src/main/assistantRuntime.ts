@@ -1,7 +1,7 @@
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
-import { mkdirSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -132,8 +132,23 @@ export type AssistantRetryResult = {
 
 type AssistantRuntimeOptions = {
   dbPath: string;
+  csvSqlitePath: string;
+  toolLogPath: string;
   getModelApiKey: (userId: string) => Promise<string | null>;
   emit: (event: AssistantStreamEvent) => void;
+};
+
+type CsvDatasetTableRow = {
+  data_source_id: string;
+  table_id: string;
+  sqlite_table_name: string;
+  display_name: string;
+};
+
+type CsvDatasetColumnRow = {
+  name: string;
+  sqlite_column_name: string;
+  ordinal_index: number;
 };
 
 type ToolDetection = {
@@ -169,6 +184,20 @@ function isReadonlySql(sql: string) {
   return /^(select|with|pragma)\b/i.test(normalized) && !/\b(insert|update|delete|drop|alter|create|attach|detach|vacuum|replace|load_extension)\b/i.test(normalized);
 }
 
+function quoteIdentifier(value: string) {
+  return `"${value.replaceAll('"', '""')}"`;
+}
+
+function normalizeSqliteAlias(value: string) {
+  return value.trim().replace(/^["'`\[]|["'`\]]$/g, "");
+}
+
+function normalizeCsvSchemaQualifiedSql(sql: string) {
+  return sql.replace(/\b(from|join)\s+csv_imports\.([`"[]?[\w.-]+[`"\]]?)/gi, (_match, keyword: string, tableName: string) => {
+    return `${keyword} ${tableName}`;
+  });
+}
+
 function extractFencedCode(prompt: string, language: AssistantToolKind) {
   const pattern = new RegExp("```" + language + "\\s*([\\s\\S]*?)```", "i");
   const match = prompt.match(pattern);
@@ -196,6 +225,29 @@ function detectTool(prompt: string): ToolDetection | null {
   }
 
   return null;
+}
+
+function detectToolFromAssistantOutput(content: string): ToolDetection | null {
+  const fencedTool = detectTool(content);
+  if (fencedTool) {
+    return fencedTool;
+  }
+
+  const sqlMatch = content.match(/(?:^|\n)\s*((?:select|with|pragma)\b[\s\S]*?)(?:;|\n\s*\n|$)/i);
+  const sql = sqlMatch?.[1]?.trim();
+  if (sql && isReadonlySql(sql)) {
+    return { kind: "sql", script: sql };
+  }
+
+  return null;
+}
+
+function replaceToolBlock(blocks: AssistantBlock[], toolBlock: AssistantBlock) {
+  return [...blocks.filter((block) => block.toolCallId !== toolBlock.toolCallId), toolBlock];
+}
+
+function hasRenderableNonToolContent(message: AssistantMessage) {
+  return message.blocks.some((block) => !block.toolCallId && block.content.trim().length > 0);
 }
 
 function extractSqlTarget(script: string) {
@@ -239,6 +291,24 @@ function toolTarget(toolCall: AssistantToolCall) {
   return "Python 脚本";
 }
 
+function isMarkdownLikeContent(content: string) {
+  return (
+    /(^|\n)\s{0,3}#{1,6}\s+\S/.test(content) ||
+    /(^|\n)\s{0,3}(?:[-*+]|\d+\.)\s+\S/.test(content) ||
+    /(^|\n)\s{0,3}>\s+\S/.test(content) ||
+    /(^|\n)\|.+\|/.test(content) ||
+    /[*_`~]{1,3}[^*_`~]+[*_`~]{1,3}/.test(content) ||
+    /\b(?:报告|方案|步骤|清单|结论|摘要|分析结果)\b/.test(content)
+  );
+}
+
+function assistantBlockTypeForContent(content: string): AssistantBlockType {
+  if (content.startsWith("{") || content.startsWith("[")) {
+    return "json";
+  }
+  return isMarkdownLikeContent(content) ? "markdown" : "text";
+}
+
 function parseAssistantBlocks(content: string): AssistantBlock[] {
   const blocks: AssistantBlock[] = [];
   const fencePattern = /```([a-z0-9_+#.-]+)?\s*([\s\S]*?)```/gi;
@@ -248,7 +318,7 @@ function parseAssistantBlocks(content: string): AssistantBlock[] {
   while ((match = fencePattern.exec(content))) {
     const before = content.slice(cursor, match.index).trim();
     if (before) {
-      blocks.push({ id: randomUUID(), type: "markdown", content: before });
+      blocks.push({ id: randomUUID(), type: assistantBlockTypeForContent(before), content: before });
     }
 
     const language = (match[1] ?? "markdown").toLowerCase();
@@ -266,7 +336,7 @@ function parseAssistantBlocks(content: string): AssistantBlock[] {
 
   const rest = content.slice(cursor).trim();
   if (rest) {
-    const type: AssistantBlockType = rest.startsWith("{") || rest.startsWith("[") ? "json" : "markdown";
+    const type = assistantBlockTypeForContent(rest);
     blocks.push({ id: randomUUID(), type, content: rest, title: type === "json" ? "JSON" : undefined });
   }
 
@@ -558,8 +628,21 @@ export class AssistantRuntime {
         updated_at text not null,
         integrity_hash text not null
       );
+      create table if not exists tool_call_logs (
+        id text primary key,
+        tool_call_id text,
+        conversation_id text,
+        user_id text,
+        kind text not null,
+        phase text not null,
+        status text not null,
+        message text not null,
+        detail_json text,
+        created_at text not null
+      );
       create index if not exists idx_conversations_user_updated on conversations(user_id, updated_at desc);
       create index if not exists idx_messages_conversation_created on messages(conversation_id, created_at);
+      create index if not exists idx_tool_call_logs_tool_created on tool_call_logs(tool_call_id, created_at);
     `);
     try {
       this.db.prepare("alter table messages add column context_json text").run();
@@ -806,6 +889,135 @@ export class AssistantRuntime {
     return next;
   }
 
+  private appendToolLog(
+    toolCall: AssistantToolCall | Pick<AssistantToolCall, "id" | "conversationId" | "userId" | "kind">,
+    phase: string,
+    status: "info" | "success" | "error",
+    message: string,
+    detail?: Record<string, unknown>,
+  ) {
+    const log = {
+      id: randomUUID(),
+      toolCallId: toolCall.id,
+      conversationId: toolCall.conversationId,
+      userId: toolCall.userId,
+      kind: toolCall.kind,
+      phase,
+      status,
+      message,
+      detail,
+      createdAt: nowIso(),
+    };
+    this.db
+      .prepare(
+        `insert into tool_call_logs
+          (id, tool_call_id, conversation_id, user_id, kind, phase, status, message, detail_json, created_at)
+         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        log.id,
+        log.toolCallId,
+        log.conversationId,
+        log.userId,
+        log.kind,
+        log.phase,
+        log.status,
+        log.message,
+        log.detail ? JSON.stringify(log.detail) : null,
+        log.createdAt,
+      );
+
+    try {
+      mkdirSync(dirname(this.options.toolLogPath), { recursive: true });
+      appendFileSync(this.options.toolLogPath, `${JSON.stringify(log)}\n`, "utf8");
+    } catch {
+      // SQLite logs remain available if file logging is temporarily unavailable.
+    }
+  }
+
+  private prepareCsvSqlViews(toolCall: AssistantToolCall) {
+    if (!existsSync(this.options.csvSqlitePath)) {
+      this.appendToolLog(toolCall, "sql-csv-views", "info", "CSV SQLite 数据库不存在，跳过 CSV 表视图挂载。", {
+        csvSqlitePath: this.options.csvSqlitePath,
+      });
+      return [];
+    }
+
+    const alias = "csvdata";
+    const databases = this.db.prepare("pragma database_list").all() as Array<{ name: string; file: string }>;
+    const attached = databases.some((database) => database.name === alias);
+    if (!attached) {
+      this.db.prepare(`attach database ? as ${quoteIdentifier(alias)}`).run(this.options.csvSqlitePath);
+    }
+    const datasets = this.db
+      .prepare(
+        `select data_source_id, table_id, sqlite_table_name, display_name
+         from ${quoteIdentifier(alias)}.csv_dataset_tables
+         order by updated_at desc`,
+      )
+      .all() as CsvDatasetTableRow[];
+    const preparedViews: string[] = [];
+
+    for (const dataset of datasets) {
+      const columns = this.db
+        .prepare(
+          `select name, sqlite_column_name, ordinal_index
+           from ${quoteIdentifier(alias)}.csv_dataset_columns
+           where data_source_id = ?
+           order by ordinal_index`,
+        )
+        .all(dataset.data_source_id) as CsvDatasetColumnRow[];
+      const selectList =
+        columns.length > 0
+          ? columns
+              .map((column) => `${quoteIdentifier(column.sqlite_column_name)} as ${quoteIdentifier(column.name)}`)
+              .join(", ")
+          : "*";
+      const viewNames = Array.from(
+        new Set(
+          [dataset.display_name, dataset.table_id, dataset.sqlite_table_name]
+            .map(normalizeSqliteAlias)
+            .filter((name) => name.length > 0),
+        ),
+      );
+      for (const viewName of viewNames) {
+        this.dropTempViewIfExists(viewName, toolCall);
+        this.db
+          .prepare(
+            `create temp view ${quoteIdentifier(viewName)} as select ${selectList} from ${quoteIdentifier(alias)}.${quoteIdentifier(dataset.sqlite_table_name)}`,
+          )
+          .run();
+        preparedViews.push(viewName);
+      }
+    }
+
+    this.appendToolLog(toolCall, "sql-csv-views", "success", "CSV SQLite 表视图已挂载到 SQL 工具执行上下文。", {
+      csvSqlitePath: this.options.csvSqlitePath,
+      views: preparedViews,
+    });
+    return preparedViews;
+  }
+
+  private dropTempViewIfExists(viewName: string, toolCall: AssistantToolCall) {
+    const existing = this.db.prepare("select type from sqlite_temp_master where name = ?").get(viewName) as
+      | { type?: string }
+      | undefined;
+    if (!existing) {
+      return;
+    }
+    if (existing.type !== "view") {
+      this.appendToolLog(
+        toolCall,
+        "sql-csv-views",
+        "error",
+        "临时对象名称被非视图对象占用，无法重建 CSV 查询视图。",
+        { viewName, existingType: existing.type },
+      );
+      throw new Error(`临时 SQL 对象名称冲突：${viewName}`);
+    }
+    this.db.prepare(`drop view if exists temp.${quoteIdentifier(viewName)}`).run();
+  }
+
   private toolBlock(toolCall: AssistantToolCall, body: string): AssistantBlock {
     const files = extractScriptFiles(toolCall.script);
     return {
@@ -822,7 +1034,32 @@ export class AssistantRuntime {
     };
   }
 
-  private async handleToolCall(input: AssistantSendInput, conversation: AssistantConversation, message: AssistantMessage, tool: ToolDetection) {
+  private async handleToolCall(input: AssistantSendInput, conversation: AssistantConversation, message: AssistantMessage, tool: ToolDetection, options: { appendToMessage?: boolean } = {}) {
+    if (tool.kind === "sql" && !isReadonlySql(tool.script)) {
+      const toolCall = this.insertToolCall({
+        conversationId: conversation.id,
+        messageId: message.id,
+        userId: input.userId,
+        kind: tool.kind,
+        script: tool.script,
+        approvalMode: input.approvalMode,
+        status: "blocked",
+        errorMessage: "SQL 安全校验未通过。",
+      });
+      this.appendToolLog(toolCall, "safety-check", "error", "SQL 安全校验未通过。", { script: tool.script });
+      const toolBlock = this.toolBlock(toolCall, "SQL 安全校验未通过：仅允许单条只读 SELECT / WITH / PRAGMA 查询。");
+      const current = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(message.id));
+      const keepContent = options.appendToMessage && current.content.trim();
+      const updated = this.updateMessage(message.id, {
+        status: "error",
+        content: keepContent ? current.content : "SQL 安全校验未通过。",
+        blocks: options.appendToMessage ? replaceToolBlock(current.blocks, toolBlock) : [toolBlock],
+        errorMessage: "SQL 安全校验未通过。",
+      });
+      this.options.emit({ type: "tool", conversationId: conversation.id, toolCall, message: updated });
+      return;
+    }
+
     if (input.approvalMode === "no_access") {
       const toolCall = this.insertToolCall({
         conversationId: conversation.id,
@@ -834,10 +1071,14 @@ export class AssistantRuntime {
         status: "blocked",
         errorMessage: "当前审批权限禁止执行脚本工具。",
       });
+      this.appendToolLog(toolCall, "permission-check", "error", "审批权限禁止执行脚本工具。", { approvalMode: input.approvalMode });
+      const toolBlock = this.toolBlock(toolCall, "当前审批权限为“禁止访问权限”，工具调用已被拦截。");
+      const current = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(message.id));
+      const keepContent = options.appendToMessage && current.content.trim();
       const updated = this.updateMessage(message.id, {
         status: "error",
-        content: "当前审批权限禁止执行脚本工具。",
-        blocks: [this.toolBlock(toolCall, "当前审批权限为“禁止访问权限”，工具调用已被拦截。")],
+        content: keepContent ? current.content : "当前审批权限禁止执行脚本工具。",
+        blocks: options.appendToMessage ? replaceToolBlock(current.blocks, toolBlock) : [toolBlock],
         errorMessage: "工具调用被权限策略拦截。",
       });
       this.options.emit({ type: "tool", conversationId: conversation.id, toolCall, message: updated });
@@ -856,10 +1097,22 @@ export class AssistantRuntime {
     });
 
     if (input.approvalMode === "request_approval") {
+      this.appendToolLog(toolCall, "approval", "info", "工具调用已创建，等待用户审批。", {
+        approvalMode: input.approvalMode,
+        script: tool.script,
+      });
+      const toolBlock = this.toolBlock(
+        toolCall,
+        tool.kind === "sql"
+          ? "SQL 安全校验通过，已创建审批单。审批通过后执行查询。"
+          : `检测到 ${tool.kind.toUpperCase()} 脚本调用。审批通过后执行。`,
+      );
+      const current = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(message.id));
+      const keepContent = options.appendToMessage && current.content.trim();
       const updated = this.updateMessage(message.id, {
         status: "awaiting_approval",
-        content: "工具调用等待审批。",
-        blocks: [this.toolBlock(toolCall, `检测到 ${tool.kind.toUpperCase()} 脚本调用。审批通过后执行。`)],
+        content: keepContent ? current.content : "工具调用等待审批。",
+        blocks: options.appendToMessage ? replaceToolBlock(current.blocks, toolBlock) : [toolBlock],
       });
       this.options.emit({ type: "tool", conversationId: conversation.id, toolCall, message: updated });
       return;
@@ -870,30 +1123,45 @@ export class AssistantRuntime {
 
   private async executeToolCall(toolCall: AssistantToolCall) {
     const running = this.updateToolCall(toolCall.id, "running");
+    this.appendToolLog(running, "execution-start", "info", "工具调用开始执行。", { script: running.script });
+    const currentBeforeRun = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(toolCall.messageId));
+    const preserveContent = hasRenderableNonToolContent(currentBeforeRun);
+    const runningBlock = this.toolBlock(running, toolCall.kind === "sql" ? "SQL 已通过审批，正在执行受控只读查询。" : "工具调用执行中，请稍候。");
     let runningMessage = this.updateMessage(toolCall.messageId, {
       status: "processing",
-      content: "工具调用执行中。",
-      blocks: [this.toolBlock(running, "工具调用执行中，请稍候。")],
+      content: preserveContent ? currentBeforeRun.content : "工具调用执行中。",
+      blocks: preserveContent ? replaceToolBlock(currentBeforeRun.blocks, runningBlock) : [runningBlock],
     });
     this.options.emit({ type: "tool", conversationId: toolCall.conversationId, toolCall: running, message: runningMessage });
 
     try {
-      const result = toolCall.kind === "sql" ? this.executeReadonlySql(toolCall.script) : await this.executePython(toolCall.script);
+      const result = toolCall.kind === "sql" ? this.executeReadonlySql(toolCall.script, running) : await this.executePython(toolCall.script);
       const completed = this.updateToolCall(toolCall.id, "completed", result);
+      this.appendToolLog(completed, "execution-complete", "success", "工具调用执行完成。", {
+        resultPreview: result.slice(0, 2_000),
+      });
+      const currentBeforeComplete = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(toolCall.messageId));
+      const completedBlock = this.toolBlock(completed, result);
       const message = this.updateMessage(toolCall.messageId, {
         status: "completed",
-        content: result,
-        blocks: [this.toolBlock(completed, result)],
+        content: preserveContent ? currentBeforeComplete.content : result,
+        blocks: preserveContent ? replaceToolBlock(currentBeforeComplete.blocks, completedBlock) : [completedBlock],
       });
       this.options.emit({ type: "tool", conversationId: toolCall.conversationId, toolCall: completed, message });
       return { success: true as const, toolCall: completed, message };
     } catch (error) {
       const messageText = error instanceof Error ? error.message : "工具调用失败。";
       const failed = this.updateToolCall(toolCall.id, "error", undefined, messageText);
+      this.appendToolLog(failed, "execution-error", "error", messageText, {
+        script: failed.script,
+        stack: error instanceof Error ? error.stack : undefined,
+      });
+      const currentBeforeFailure = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(toolCall.messageId));
+      const failedBlock = this.toolBlock(failed, messageText);
       runningMessage = this.updateMessage(toolCall.messageId, {
         status: "error",
-        content: messageText,
-        blocks: [this.toolBlock(failed, messageText)],
+        content: preserveContent ? currentBeforeFailure.content : messageText,
+        blocks: preserveContent ? replaceToolBlock(currentBeforeFailure.blocks, failedBlock) : [failedBlock],
         errorMessage: messageText,
       });
       this.options.emit({ type: "tool", conversationId: toolCall.conversationId, toolCall: failed, message: runningMessage });
@@ -901,11 +1169,22 @@ export class AssistantRuntime {
     }
   }
 
-  private executeReadonlySql(script: string) {
+  private executeReadonlySql(script: string, toolCall: AssistantToolCall) {
     if (!isReadonlySql(script)) {
       throw new Error("SQL 安全网已拦截：仅允许单条只读 SELECT / WITH / PRAGMA 查询。");
     }
-    const rows = this.db.prepare(script).all().slice(0, 50);
+    const views = this.prepareCsvSqlViews(toolCall);
+    const executableScript = normalizeCsvSchemaQualifiedSql(script);
+    this.appendToolLog(toolCall, "sql-execute", "info", "开始执行只读 SQL。", {
+      script,
+      executableScript,
+      mountedCsvViews: views,
+    });
+    const rows = this.db.prepare(executableScript).all().slice(0, 50);
+    this.appendToolLog(toolCall, "sql-execute", "success", "只读 SQL 执行完成。", {
+      rowCount: rows.length,
+      rowLimit: 50,
+    });
     return JSON.stringify({ rows, rowLimit: 50 }, null, 2);
   }
 
@@ -1032,6 +1311,11 @@ export class AssistantRuntime {
         providerTraceId,
       });
       this.options.emit({ type: "message", conversationId: conversation.id, message: completed });
+
+      const tool = detectToolFromAssistantOutput(content);
+      if (tool) {
+        await this.handleToolCall(input, conversation, completed, tool, { appendToMessage: true });
+      }
     } catch (error) {
       const aborted = controller.signal.aborted;
       const messageText = aborted ? "用户已停止生成。" : error instanceof Error ? error.message : "消息接收失败。";
@@ -1073,7 +1357,9 @@ export class AssistantRuntime {
         role: "system",
         content: [
           "你是 Cycle Probe 的数据助手。请用中文回答。",
+          "所有模型回复必须流式输出。默认普通问答、说明和简短结论使用流式 text；只有报告、方案、结构化分析、代码块、SQL 候选语句、工具调用执行结果和需要长期查看的产物使用流式 markdown。",
           "不要编造数据库结果；需要查询数据源时，应优先使用 request_sql_query_execution 语义生成候选只读 SQL、查询目的和结果用途，SQL 必须先经过安全校验、权限校验、风险评估和用户审批。",
+          "当用户要求统计、筛选或读取数据源内容时，必须输出单个 ```sql 代码块承载候选只读 SQL；客户端会自动捕获该 SQL 并进入安全校验、审批和工具执行流程。",
           "仅在本地脚本调试场景才输出 /sql 或 /python 代码块，客户端会按审批权限处理。",
           `当前数据源：${dataSourceLabel || "未选择"}`,
           `当前 Skill：${skill || "未选择"}`,

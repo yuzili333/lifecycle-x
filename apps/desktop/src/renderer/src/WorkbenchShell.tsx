@@ -23,7 +23,7 @@ import dockIconLight512 from "./assets/cycle_probe_docker_icon_light_512.png";
 import csvIcon from "./assets/csv.svg";
 import databaseIcon from "./assets/database.svg";
 import { workbenchApi, type ApiResult, type UserProfile, type WorkbenchSettings } from "./workbenchApi";
-import type { DataSourceMenuAction, DockIconVariant } from "../../preload";
+import type { DataSourceMenuAction } from "../../preload";
 
 type WorkbenchAuth = ReturnType<typeof useAuthStore>;
 
@@ -37,6 +37,7 @@ type SettingsTab = "profile" | "general" | "appearance" | "agent" | "logout";
 
 const DEFAULT_WORKBENCH_MODULE: WorkbenchModule = "data-assistant";
 const WORKBENCH_NAV_CACHE_KEY_PREFIX = "cycle-probe:workbench:last-module";
+const WORKBENCH_SETTINGS_CACHE_KEY_PREFIX = "cycle-probe:workbench:settings";
 const MODEL_CONFIG_PROMPT_CACHE_KEY_PREFIX = "cycle-probe:workbench:model-config-prompted";
 const APP_THEME_MODE_CACHE_KEY = "cycle-probe:theme-mode";
 const APP_THEME_MODE_EVENT = "cycle-probe:theme-mode-change";
@@ -76,7 +77,7 @@ const defaultSettings: WorkbenchSettings = {
     codeFontSize: 13,
     translucentSidebar: false,
     contrast: "standard",
-    dockIcon: "dark",
+    dockIcon: "light",
   },
   configuration: {
     modelProvider: "Siliconflow",
@@ -114,6 +115,10 @@ function fallbackWorkbenchModule(permissions: string[]): WorkbenchModule {
 
 function workbenchNavCacheKey(user: WorkbenchAuth["user"]) {
   return `${WORKBENCH_NAV_CACHE_KEY_PREFIX}:${user?.id ?? "anonymous"}`;
+}
+
+function workbenchSettingsCacheKey(user: WorkbenchAuth["user"]) {
+  return `${WORKBENCH_SETTINGS_CACHE_KEY_PREFIX}:${user?.id ?? "anonymous"}`;
 }
 
 function readCachedWorkbenchModule(user: WorkbenchAuth["user"], permissions: string[]): WorkbenchModule {
@@ -232,7 +237,62 @@ function normalizeWorkbenchSettings(settings: WorkbenchSettings): WorkbenchSetti
   };
 }
 
-const dockIconAssets: Record<DockIconVariant, string> = {
+function readCachedWorkbenchSettings(user: WorkbenchAuth["user"]) {
+  if (typeof window === "undefined") {
+    return null;
+  }
+
+  try {
+    const cached = window.localStorage.getItem(workbenchSettingsCacheKey(user));
+    if (!cached) {
+      return null;
+    }
+    return normalizeWorkbenchSettings(JSON.parse(cached) as WorkbenchSettings);
+  } catch {
+    return null;
+  }
+}
+
+function writeCachedWorkbenchSettings(user: WorkbenchAuth["user"], settings: WorkbenchSettings) {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(workbenchSettingsCacheKey(user), JSON.stringify(settings));
+  } catch {
+    // Ignore storage failures; server-side settings and in-memory state still apply.
+  }
+}
+
+function mergeCachedWorkbenchSettings(serverSettings: WorkbenchSettings, cachedSettings: WorkbenchSettings | null) {
+  const normalizedServerSettings = normalizeWorkbenchSettings(serverSettings);
+  if (!cachedSettings) {
+    return normalizedServerSettings;
+  }
+
+  return normalizeWorkbenchSettings({
+    ...normalizedServerSettings,
+    general: { ...normalizedServerSettings.general, ...cachedSettings.general },
+    appearance: { ...normalizedServerSettings.appearance, ...cachedSettings.appearance },
+    configuration: { ...normalizedServerSettings.configuration, ...cachedSettings.configuration },
+    personalization: { ...normalizedServerSettings.personalization, ...cachedSettings.personalization },
+  });
+}
+
+function withLocalModelApiKeyStatus(settings: WorkbenchSettings, hasLocalApiKey: boolean): WorkbenchSettings {
+  return {
+    ...settings,
+    configuration: {
+      ...settings.configuration,
+      apiKeyStatus: hasLocalApiKey ? "configured" : "not_configured",
+    },
+  };
+}
+
+type AppIconVariant = WorkbenchSettings["appearance"]["dockIcon"];
+
+const appIconAssets: Record<AppIconVariant, string> = {
   dark: dockIconDark512,
   light: dockIconLight512,
 };
@@ -290,8 +350,8 @@ function ReadOnlyField({ label, value }: { label: string; value: string }) {
   );
 }
 
-function NavAssetIcon({ src }: { src: string }) {
-  return <span className="nav-asset-icon" style={{ "--nav-icon-url": `url(${src})` } as CSSProperties} aria-hidden="true" />;
+function NavAssetIcon({ src, size = "sm" }: { src: string; size?: "sm" | "lg" }) {
+  return <span className={`nav-asset-icon ${size === "lg" ? "nav-asset-icon-lg" : ""}`} style={{ "--nav-icon-url": `url(${src})` } as CSSProperties} aria-hidden="true" />;
 }
 
 export function WorkbenchShell({ auth }: WorkbenchShellProps) {
@@ -306,7 +366,7 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
   const [profile, setProfile] = useState<UserProfile | null>(() => fallbackProfile(auth.user));
   const [avatarDraft, setAvatarDraft] = useState(auth.user?.avatarUrl ?? "");
   const [apiKeyDraft, setApiKeyDraft] = useState("");
-  const [settings, setSettings] = useState<WorkbenchSettings>(defaultSettings);
+  const [settings, setSettings] = useState<WorkbenchSettings>(() => readCachedWorkbenchSettings(auth.user) ?? defaultSettings);
   const [isSavingAvatar, setIsSavingAvatar] = useState(false);
   const [isSavingSettings, setIsSavingSettings] = useState(false);
 
@@ -380,6 +440,7 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
     let isMounted = true;
 
     async function loadWorkbench() {
+      const cachedSettings = readCachedWorkbenchSettings(auth.user);
       const profileResult = await requestWithRefresh(workbenchApi.profile);
       const settingsResult = await requestWithRefresh(workbenchApi.settings);
       const localModelApiKeyConfigured = await hasLocalModelApiKey(auth.user);
@@ -398,16 +459,26 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
 
       if (isFailure(settingsResult)) {
         showError(settingsResult);
+        if (cachedSettings) {
+          const nextSettings = withLocalModelApiKeyStatus(cachedSettings, localModelApiKeyConfigured);
+          setSettings(nextSettings);
+          if (!isModelConfigurationReady(nextSettings) && !hasPromptedModelConfiguration(auth.user)) {
+            markModelConfigurationPrompted(auth.user);
+            setActiveSettingsTab("agent");
+            setIsSettingsOpen(true);
+            toast({
+              type: "info",
+              body: "请先完成大模型配置后再使用数据助手对话功能。",
+              uniqueID: "model-config-required",
+              collisionBehavior: "overwrite",
+            });
+          }
+        }
       } else {
-        const normalizedSettings = normalizeWorkbenchSettings(settingsResult.settings);
-        const nextSettings: WorkbenchSettings = {
-          ...normalizedSettings,
-          configuration: {
-            ...normalizedSettings.configuration,
-            apiKeyStatus: localModelApiKeyConfigured ? "configured" : "not_configured",
-          },
-        };
+        const mergedSettings = mergeCachedWorkbenchSettings(settingsResult.settings, cachedSettings);
+        const nextSettings = withLocalModelApiKeyStatus(mergedSettings, localModelApiKeyConfigured);
         setSettings(nextSettings);
+        writeCachedWorkbenchSettings(auth.user, nextSettings);
         if (!isModelConfigurationReady(nextSettings) && !hasPromptedModelConfiguration(auth.user)) {
           markModelConfigurationPrompted(auth.user);
           setActiveSettingsTab("agent");
@@ -437,8 +508,8 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
     return () => dispose?.();
   }, []);
 
-  const activeDockIconVariant = settings.appearance.dockIcon;
-  const activeDockIcon = dockIconAssets[activeDockIconVariant];
+  const activeAppIconVariant = settings.appearance.dockIcon;
+  const activeAppIcon = appIconAssets[activeAppIconVariant];
   const workbenchStyle = {
     "--workbench-background": "var(--color-background-body)",
     "--workbench-foreground": "var(--color-text-primary)",
@@ -454,16 +525,12 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
     setIsSettingsOpen(true);
   };
 
-  useEffect(() => {
-    void window.lifecycleX?.dockIcon?.set(activeDockIconVariant);
-  }, [activeDockIconVariant]);
-
   const openAgentSettingsFromPrompt = () => {
     setIsModelConfigRequiredOpen(false);
     openSettings("agent");
   };
 
-  const activateDataManagement = (action?: DataSourceMenuAction) => {
+  const activateDataManagement = (action: DataSourceMenuAction = "open-database") => {
     if (!auth.permissions.includes("datasource:read")) {
       toast({
         type: "error",
@@ -474,9 +541,7 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
       return;
     }
     setActiveModule("data-management");
-    if (action) {
-      setPendingDataSourceAction(action);
-    }
+    setPendingDataSourceAction(action);
   };
 
   const requestLogout = () => {
@@ -555,6 +620,10 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
           }
         : settings;
 
+    const cachedSettings = withLocalModelApiKeyStatus(nextSettings, nextApiKey.length > 0 || await hasLocalModelApiKey(auth.user));
+    writeCachedWorkbenchSettings(auth.user, cachedSettings);
+    setSettings(cachedSettings);
+
     const result = await requestWithRefresh((token) => workbenchApi.updateSettings(token, nextSettings));
     setIsSavingSettings(false);
     if (isFailure(result)) {
@@ -562,7 +631,9 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
       return;
     }
 
-    setSettings(normalizeWorkbenchSettings(result.settings));
+    const savedSettings = withLocalModelApiKeyStatus(normalizeWorkbenchSettings(result.settings), nextApiKey.length > 0 || await hasLocalModelApiKey(auth.user));
+    setSettings(savedSettings);
+    writeCachedWorkbenchSettings(auth.user, savedSettings);
     setApiKeyDraft("");
     toast({
       type: "info",
@@ -608,7 +679,7 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
     <div className="workbench-top-nav-frame" style={workbenchStyle}>
       <TopNav
         label="Cycle Probe navigation"
-        heading={<TopNavHeading heading="Cycle Probe" logo={<img className="workbench-brand-icon" src={activeDockIcon} alt="" />} />}
+        heading={<TopNavHeading heading="Cycle Probe" logo={<img className="workbench-brand-icon" src={activeAppIcon} alt="" />} />}
         startContent={
           <>
             {auth.permissions.includes("analysis:read") && (
@@ -630,16 +701,16 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
                   {
                     title: "Database",
                     description: "Database Connection",
-                    icon: <NavAssetIcon src={databaseIcon} />,
+                    icon: <NavAssetIcon src={databaseIcon} size="lg" />,
                     href: "#database",
-                    onClick: () => activateDataManagement(),
+                    onClick: () => activateDataManagement("open-database"),
                   },
                   {
                     title: "CSV",
                     description: "Import CSV",
-                    icon: <NavAssetIcon src={csvIcon} />,
+                    icon: <NavAssetIcon src={csvIcon} size="lg" />,
                     href: "#csv",
-                    onClick: () => activateDataManagement("import-csv"),
+                    onClick: () => activateDataManagement("open-csv"),
                   },
                 ]}
               />
@@ -884,7 +955,7 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
                     }
                   />
                   <Selector
-                    label="程序坞图标主题"
+                    label="应用内图标主题"
                     value={settings.appearance.dockIcon}
                     options={[
                       { label: "深色主题图标", value: "dark" },
@@ -900,11 +971,11 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
                 </HStack>
                 <Section variant="muted" padding={3}>
                   <HStack gap={3} vAlign="center">
-                    <img className="dock-icon-preview" src={activeDockIcon} alt="" />
+                    <img className="dock-icon-preview" src={activeAppIcon} alt="" />
                     <VStack gap={1} hAlign="stretch">
-                      <Text type="body">当前应用图标：{activeDockIconVariant}</Text>
+                      <Text type="body">当前应用内图标：{activeAppIconVariant}</Text>
                       <Text type="supporting" color="secondary">
-                        程序坞和窗口开发期图标统一使用 512 尺寸 PNG；打包时 macOS 使用 ICNS，Windows 使用 ICO。
+                        程序坞图标固定使用浅色图标；工作台界面图标按当前设置显示。
                       </Text>
                     </VStack>
                   </HStack>

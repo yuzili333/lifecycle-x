@@ -796,6 +796,65 @@ export function createAuthApp(store = new AuthStore(), dataStore = new DataManag
     response.json(result);
   });
 
+  app.delete("/csv/data-sources/:dataSourceId", (request, response) => {
+    const traceId = randomUUID();
+    const auth = resolveAuthorizedRequest(store, request, "datasource:manage");
+    if (!auth.resolved) {
+      sendFailure(response, auth.status, auth.code, auth.message, traceId);
+      return;
+    }
+    const result = dataStore.deleteCsvDataSource(request.params.dataSourceId);
+    if (!result) {
+      sendFailure(response, 404, "DATA_SOURCE_UNAVAILABLE", "CSV 数据集不存在。", traceId);
+      return;
+    }
+    response.json(result);
+  });
+
+  app.post("/csv/data-sources/:dataSourceId/delete", (request, response) => {
+    const traceId = randomUUID();
+    const auth = resolveAuthorizedRequest(store, request, "datasource:manage");
+    if (!auth.resolved) {
+      sendFailure(response, auth.status, auth.code, auth.message, traceId);
+      return;
+    }
+    const result = dataStore.deleteCsvDataSource(request.params.dataSourceId);
+    if (!result) {
+      sendFailure(response, 404, "DATA_SOURCE_UNAVAILABLE", "CSV 数据集不存在。", traceId);
+      return;
+    }
+    response.json(result);
+  });
+
+  app.post("/csv/data-sources/:dataSourceId/rename", (request, response) => {
+    const traceId = randomUUID();
+    const auth = resolveAuthorizedRequest(store, request, "datasource:manage");
+    if (!auth.resolved) {
+      sendFailure(response, auth.status, auth.code, auth.message, traceId);
+      return;
+    }
+    const { name } = request.body as { name?: string };
+    const nextName = name?.trim() ?? "";
+    if (!nextName) {
+      sendFailure(response, 400, "VALIDATION_ERROR", "CSV 表名称不能为空。", traceId, {
+        fields: { name: "CSV 表名称不能为空。" },
+      });
+      return;
+    }
+    if (nextName.length > 100) {
+      sendFailure(response, 400, "VALIDATION_ERROR", "CSV 表名称不能超过 100 个字符。", traceId, {
+        fields: { name: "CSV 表名称不能超过 100 个字符。" },
+      });
+      return;
+    }
+    const result = dataStore.renameCsvDataSource(request.params.dataSourceId, nextName);
+    if (!result) {
+      sendFailure(response, 404, "DATA_SOURCE_UNAVAILABLE", "CSV 数据集不存在。", traceId);
+      return;
+    }
+    response.json(result);
+  });
+
   app.get("/agent/context/schema", async (request, response) => {
     const traceId = randomUUID();
     const auth = resolveAuthorizedRequest(store, request, "datasource:read");

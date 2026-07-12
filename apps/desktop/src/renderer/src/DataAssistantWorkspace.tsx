@@ -9,7 +9,6 @@ import {
   ChatMessageBubble,
   ChatMessageList,
   ChatMessageMetadata,
-  ChatSystemMessage,
   ChatTokenizedText,
   ChatToolCalls,
   type ChatToolCallItem,
@@ -27,7 +26,7 @@ import { Text } from "@astryxdesign/core/Text";
 import { Token } from "@astryxdesign/core/Token";
 import { Toolbar } from "@astryxdesign/core/Toolbar";
 import { Tooltip } from "@astryxdesign/core/Tooltip";
-import { ChevronRight, CircleAlert, Clock, Copy, FileText, LoaderCircle, Maximize2, Minimize2, Pencil, Plus, RotateCcw, Trash2, X, type LucideIcon } from "lucide-react";
+import { ChevronRight, CircleAlert, Clock, Copy, FileText, LoaderCircle, Maximize2, Minimize2, Pencil, Plus, RotateCcw, Sparkles, Trash2, X, type LucideIcon } from "lucide-react";
 import type { AuthFailure, AuthUser } from "./auth";
 import { useAppToast } from "./useAppToast";
 import { workbenchApi, type ApiResult, type DataSourceSummary } from "./workbenchApi";
@@ -276,6 +275,27 @@ function ArtifactSummaryCard({
   );
 }
 
+function AssistantLanding({ userName }: { userName: string }) {
+  return (
+    <div className="assistant-landing">
+      <VStack gap={2} hAlign="stretch" className="assistant-landing-greeting">
+        <HStack gap={2} vAlign="center">
+          <Icon icon={Sparkles} size="md" color="accent" />
+          <Text type="large" as="h2">
+            Hi, {userName}
+          </Text>
+        </HStack>
+        <Text type="display-2" as="h1">
+          从哪里开始？
+        </Text>
+        <Text type="body" color="secondary">
+          选择数据源、Skill 和审批权限后，输入你想分析的问题。
+        </Text>
+      </VStack>
+    </div>
+  );
+}
+
 function statusLabel(status: AssistantMessageStatus) {
   switch (status) {
     case "sending":
@@ -512,6 +532,7 @@ export function DataAssistantWorkspace({
   );
 
   const activeMessages = activeConversation ? messagesByConversation[activeConversation.id] ?? [] : [];
+  const landingUserName = user?.displayName?.trim() || user?.username || "Yuzili";
   const activeArtifactMessage = useMemo(
     () =>
       artifactWindow.isOpen && artifactWindow.messageId
@@ -546,11 +567,11 @@ export function DataAssistantWorkspace({
         [conversationId]: (current[conversationId] ?? []).map((message) =>
           message.id === messageId
             ? {
-                ...message,
-                ...patch,
-                blocks: patch.blocks ?? message.blocks,
-                updatedAt: new Date().toISOString(),
-              }
+              ...message,
+              ...patch,
+              blocks: patch.blocks ?? message.blocks,
+              updatedAt: new Date().toISOString(),
+            }
             : message,
         ),
       }));
@@ -586,8 +607,7 @@ export function DataAssistantWorkspace({
 
       setIsLoadingConversations(true);
       try {
-        const existing = await window.lifecycleX.assistant.listConversations(user.id);
-        const nextConversations = existing.length > 0 ? existing : [await window.lifecycleX.assistant.createConversation(user.id)];
+        const nextConversations = await window.lifecycleX.assistant.listConversations(user.id);
         if (!isMounted) {
           return;
         }
@@ -985,6 +1005,8 @@ export function DataAssistantWorkspace({
 
       if (!isModelConfigured) {
         onRequireModelConfig();
+        setComposerValue(value);
+        window.setTimeout(() => setComposerValue(value), 0);
         return;
       }
 
@@ -999,7 +1021,11 @@ export function DataAssistantWorkspace({
       }
 
       try {
-        const conversationId = activeConversation?.id ?? (await window.lifecycleX.assistant.createConversation(user.id)).id;
+        const conversation =
+          activeConversation ?? await window.lifecycleX.assistant.createConversation(user.id, prompt.slice(0, 18) || "新对话");
+        setConversations((current) => mergeConversation(current, conversation));
+        setMessagesByConversation((current) => ({ ...current, [conversation.id]: current[conversation.id] ?? [] }));
+        const conversationId = conversation.id;
         optimisticConversationId = conversationId;
         const optimisticContext: AssistantMessage["context"] = {
           dataSourceLabel: selectedDataSource ? dataSourceLabel(selectedDataSource) : null,
@@ -1045,7 +1071,7 @@ export function DataAssistantWorkspace({
       }
     },
     [
-      activeConversation?.id,
+      activeConversation,
       approvalMode,
       isModelConfigured,
       isStreaming,
@@ -1112,10 +1138,10 @@ export function DataAssistantWorkspace({
     () =>
       connectedDataSources.length > 0
         ? connectedDataSources.map((dataSource) => ({
-            label: `${selectedDataSourceId === dataSource.id ? "✓ " : ""}${dataSourceLabel(dataSource)}`,
-            onClick: () =>
-              setSelectedDataSourceId((current) => (current === dataSource.id ? null : dataSource.id)),
-          }))
+          label: `${selectedDataSourceId === dataSource.id ? "✓ " : ""}${dataSourceLabel(dataSource)}`,
+          onClick: () =>
+            setSelectedDataSourceId((current) => (current === dataSource.id ? null : dataSource.id)),
+        }))
         : [{ label: canReadDataSources ? "暂无已连通数据源" : "无数据源权限", isDisabled: true }],
     [canReadDataSources, connectedDataSources, selectedDataSourceId],
   );
@@ -1321,127 +1347,119 @@ export function DataAssistantWorkspace({
         <ChatLayout
           density="compact"
           className="assistant-chat-layout"
-          emptyState={
-            <div className="assistant-empty-state">
-              <Text type="display-3" as="h2">
-                数据助手
-              </Text>
-              <Text type="body" color="secondary">
-                从工具栏选择上下文后输入问题，消息会以流式方式渲染。
-              </Text>
+          emptyState={<AssistantLanding userName={landingUserName} />}
+          composer={
+            <div className="assistant-composer-shell">
+              <ChatComposer
+                value={composerValue}
+                onChange={setComposerValue}
+                onSubmit={handleSubmit}
+                onStop={stopStreaming}
+                isStopShown={isStreaming}
+                placeholder="问问数据助手"
+                density="compact"
+                footerActions={
+                  <div className="assistant-composer-actions" aria-label="数据助手工具栏">
+                    <DropdownMenu
+                      hasChevron={false}
+                      placement="above"
+                      menuWidth={240}
+                      button={{
+                        label: dataSourceButtonLabel(selectedDataSource),
+                        variant: "ghost",
+                        size: "sm",
+                        className: "assistant-composer-action-button",
+                        icon: <AssistantActionIcon src={attachIcon} />,
+                        tooltip: "数据库",
+                        isLoading: isLoadingDataSources,
+                      }}
+                      items={dataSourceMenuItems}
+                    />
+                    <DropdownMenu
+                      hasChevron={false}
+                      placement="above"
+                      menuWidth={190}
+                      button={{
+                        label: skillOptions.find((item) => item.value === selectedSkill)?.label ?? "Skill",
+                        variant: "ghost",
+                        size: "sm",
+                        className: "assistant-composer-action-button",
+                        icon: <AssistantActionIcon src={mentionIcon} />,
+                        tooltip: "Skill",
+                      }}
+                      items={skillMenuItems}
+                    />
+                    <DropdownMenu
+                      hasChevron={false}
+                      placement="above"
+                      menuWidth={190}
+                      button={{
+                        label: approvalOptions.find((item) => item.value === approvalMode)?.label ?? "请求批准",
+                        variant: "ghost",
+                        size: "sm",
+                        className: "assistant-composer-action-button",
+                        icon: <AssistantActionIcon src={approveIcon} />,
+                        tooltip: "审批权限",
+                      }}
+                      items={approvalMenuItems}
+                    />
+                  </div>
+                }
+              />
             </div>
           }
-          composer={
-            <ChatComposer
-              value={composerValue}
-              onChange={setComposerValue}
-              onSubmit={handleSubmit}
-              onStop={stopStreaming}
-              isStopShown={isStreaming}
-              placeholder="输入需要分析、查询或解释的数据问题"
-              density="compact"
-              footerActions={
-                <div className="assistant-composer-actions" aria-label="数据助手工具栏">
-                  <DropdownMenu
-                    hasChevron={false}
-                    placement="above"
-                    menuWidth={240}
-                    button={{
-                      label: dataSourceButtonLabel(selectedDataSource),
-                      variant: "ghost",
-                      size: "sm",
-                      className: "assistant-composer-action-button",
-                      icon: <AssistantActionIcon src={attachIcon} />,
-                      tooltip: "数据库",
-                      isLoading: isLoadingDataSources,
-                    }}
-                    items={dataSourceMenuItems}
-                  />
-                  <DropdownMenu
-                    hasChevron={false}
-                    placement="above"
-                    menuWidth={190}
-                    button={{
-                      label: skillOptions.find((item) => item.value === selectedSkill)?.label ?? "Skill",
-                      variant: "ghost",
-                      size: "sm",
-                      className: "assistant-composer-action-button",
-                      icon: <AssistantActionIcon src={mentionIcon} />,
-                      tooltip: "Skill",
-                    }}
-                    items={skillMenuItems}
-                  />
-                  <DropdownMenu
-                    hasChevron={false}
-                    placement="above"
-                    menuWidth={190}
-                    button={{
-                      label: approvalOptions.find((item) => item.value === approvalMode)?.label ?? "请求批准",
-                      variant: "ghost",
-                      size: "sm",
-                      className: "assistant-composer-action-button",
-                      icon: <AssistantActionIcon src={approveIcon} />,
-                      tooltip: "审批权限",
-                    }}
-                    items={approvalMenuItems}
-                  />
-                </div>
-              }
-            />
-          }
         >
-          <ChatMessageList isStreaming={isStreaming} density="compact">
-            {activeMessages.length === 0 && (
-              <ChatSystemMessage variant="divider">对话已创建，消息将持久化保存到本地 SQLite。</ChatSystemMessage>
-            )}
-            {activeMessages.map((message) => {
-              const sender = message.role === "user" ? "user" : "assistant";
-              const isArtifactMessage = isAssistantArtifactMessage(message);
-              const toolCalls = sender === "assistant" ? toolCallsFromMessage(message) : [];
-              return (
-                <ChatMessage
-                  key={message.id}
-                  sender={sender}
-                  avatar={
-                    sender === "user" ? (
-                      <Avatar src={user?.avatarUrl} name={user?.displayName ?? "用户"} size={32} />
-                    ) : (
-                      <span className="assistant-bot-avatar">AI</span>
-                    )
-                  }
-                >
-                  {sender === "user" && renderUserContext(message)}
-                  <ChatMessageBubble
-                    variant={sender === "assistant" ? "ghost" : "filled"}
-                    metadata={renderMessageMetadata(message)}
+          {activeMessages.length > 0 ? (
+            <ChatMessageList isStreaming={isStreaming} density="compact">
+              {activeMessages.map((message) => {
+                const sender = message.role === "user" ? "user" : "assistant";
+                const isArtifactMessage = isAssistantArtifactMessage(message);
+                const toolCalls = sender === "assistant" ? toolCallsFromMessage(message) : [];
+                return (
+                  <ChatMessage
+                    key={message.id}
+                    sender={sender}
+                    avatar={
+                      sender === "user" ? (
+                        <Avatar src={user?.avatarUrl} name={user?.displayName ?? "用户"} size={32} />
+                      ) : (
+                        <span className="assistant-bot-avatar">AI</span>
+                      )
+                    }
                   >
-                    {sender === "user" ? (
-                      renderUserMessageBody(message)
-                    ) : isArtifactMessage ? (
-                      renderArtifactCard(message)
-                    ) : message.blocks.length > 0 ? (
-                      <div className="assistant-message-blocks">
-                        {message.blocks.map((block) => renderBlock(block, message.role, message.status))}
-                      </div>
-                    ) : (
-                      <span className="assistant-stream-cursor">
-                        <Icon icon={LoaderCircle} size="xsm" color="inherit" className="assistant-message-status-spinner" />
-                        <span>思考中...</span>
-                      </span>
+                    {sender === "user" && renderUserContext(message)}
+                    <ChatMessageBubble
+                      variant={sender === "assistant" ? "ghost" : "filled"}
+                      metadata={renderMessageMetadata(message)}
+                    >
+                      {sender === "user" ? (
+                        renderUserMessageBody(message)
+                      ) : isArtifactMessage ? (
+                        renderArtifactCard(message)
+                      ) : message.blocks.length > 0 ? (
+                        <div className="assistant-message-blocks">
+                          {message.blocks.map((block) => renderBlock(block, message.role, message.status))}
+                        </div>
+                      ) : (
+                        <span className="assistant-stream-cursor">
+                          <Icon icon={LoaderCircle} size="xsm" color="inherit" className="assistant-message-status-spinner" />
+                          <span>思考中...</span>
+                        </span>
+                      )}
+                    </ChatMessageBubble>
+                    {toolCalls.length > 0 && (
+                      <ChatToolCalls
+                        defaultIsExpanded
+                        label={`${toolCalls.length} tool calls`}
+                        calls={toolCalls}
+                        className="assistant-tool-call-list"
+                      />
                     )}
-                  </ChatMessageBubble>
-                  {toolCalls.length > 0 && (
-                    <ChatToolCalls
-                      defaultIsExpanded
-                      label={`${toolCalls.length} tool calls`}
-                      calls={toolCalls}
-                      className="assistant-tool-call-list"
-                    />
-                  )}
-                </ChatMessage>
-              );
-            })}
-          </ChatMessageList>
+                  </ChatMessage>
+                );
+              })}
+            </ChatMessageList>
+          ) : []}
         </ChatLayout>
         {activeArtifactMessage && (
           <>

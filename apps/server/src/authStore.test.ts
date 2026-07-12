@@ -12,6 +12,18 @@ describe("AuthStore", () => {
     expect(user && store.permissionsFor(user)).not.toContain("audit:read");
   });
 
+  it("includes requested local administrator seed accounts", () => {
+    const store = new AuthStore();
+
+    for (const [username, password] of [["yuzili", "yuzili"], ["weiqi", "weiqi"]] as const) {
+      const user = store.findUserByIdentifier(username);
+      expect(user).toBeDefined();
+      expect(user?.role).toBe("admin");
+      expect(user && store.isPasswordValid(user, password)).toBe(true);
+      expect(user && store.permissionsFor(user)).toEqual(expect.arrayContaining(["user:manage", "audit:read", "datasource:manage"]));
+    }
+  });
+
   it("locks an account after five failed attempts", () => {
     const store = new AuthStore();
     const user = store.findUserByIdentifier("analyst");

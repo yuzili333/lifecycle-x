@@ -1,4 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import {
   CsvSqliteTempProfiler,
   SqlProfiler,
@@ -6,6 +10,9 @@ import {
   type BuildSchemaContextInput,
   type DataSourceRef,
 } from "./schemaContext/index.js";
+
+const require = createRequire(import.meta.url);
+const { DatabaseSync } = require("node:sqlite") as { DatabaseSync: new (path: string) => any };
 
 export type DataSourceType = "mysql" | "csv";
 export type DataSourceStatus = "online" | "offline" | "disabled" | "degraded";
@@ -125,6 +132,24 @@ export type QueryAuditLog = {
   createdAt: string;
 };
 
+type StoredDataSource = DataSourceSummary & { credentialHash?: string; createdBy: string; createdAt: string };
+type CsvFileProfile = {
+  fileName: string;
+  fileSizeBytes: number;
+  encoding: string;
+  delimiter: string;
+  rowCount: number;
+  columnCount: number;
+};
+type DataManagementSnapshot = {
+  version: 1;
+  dataSources: StoredDataSource[];
+  schemas: Array<[string, DatabaseSchema[]]>;
+  tables: Array<[string, DatabaseTable[]]>;
+  csvFileProfiles: Array<[string, CsvFileProfile]>;
+};
+type CsvSqliteColumn = DatabaseColumn & { sqliteColumnName: string; ordinalIndex: number };
+
 const DEFAULT_POOL_CONFIG: PoolConfig = {
   min: 0,
   max: 3,
@@ -136,6 +161,24 @@ const DEFAULT_POOL_CONFIG: PoolConfig = {
 const LARGE_TABLE_ROW_THRESHOLD = 1_000_000;
 const LARGE_TABLE_SIZE_MB_THRESHOLD = 1_024;
 const LARGE_TABLE_COLUMN_THRESHOLD = 100;
+const DATA_MANAGEMENT_STORE_FILE = "data-management-store.json";
+const CSV_SQLITE_STORE_FILE = "csv-data.sqlite";
+const CSV_PREVIEW_ROW_LIMIT = 20;
+
+function defaultPersistencePath() {
+  if (process.env.VITEST) {
+    return null;
+  }
+
+  return join(process.env.LIFECYCLE_X_DATA_DIR ?? join(homedir(), ".cycle-probe"), DATA_MANAGEMENT_STORE_FILE);
+}
+
+function defaultCsvSqlitePath(persistencePath: string | null) {
+  if (process.env.LIFECYCLE_X_CSV_SQLITE_PATH) {
+    return process.env.LIFECYCLE_X_CSV_SQLITE_PATH;
+  }
+  return persistencePath ? join(dirname(persistencePath), CSV_SQLITE_STORE_FILE) : null;
+}
 
 function nowIso() {
   return new Date().toISOString();
@@ -191,7 +234,7 @@ function parseCsv(content: string) {
 
   const delimiter = detectDelimiter(lines[0]);
   const headers = lines[0].split(delimiter).map((item) => item.trim() || "column");
-  const rows = lines.slice(1, 51).map((line) => {
+  const rows = lines.slice(1).map((line) => {
     const values = line.split(delimiter);
     return Object.fromEntries(headers.map((header, index) => [header, values[index]?.trim() ?? ""]));
   });
@@ -205,13 +248,242 @@ function detectDelimiter(headerLine: string) {
     .sort((left, right) => right.count - left.count)[0]?.delimiter ?? ",";
 }
 
+function quoteIdentifier(value: string) {
+  return `"${value.replaceAll('"', '""')}"`;
+}
+
+function sqliteSafeName(value: string, fallback: string) {
+  const normalized = value.trim().replace(/[^\da-z_]/gi, "_").replace(/_+/g, "_").replace(/^_+|_+$/g, "");
+  const withPrefix = /^[a-z_]/i.test(normalized) ? normalized : `col_${normalized}`;
+  return (withPrefix || fallback).slice(0, 80);
+}
+
+function uniqueSqliteColumnNames(headers: string[]) {
+  const used = new Map<string, number>();
+  return headers.map((header, index) => {
+    const baseName = sqliteSafeName(header, `column_${index + 1}`);
+    const count = used.get(baseName) ?? 0;
+    used.set(baseName, count + 1);
+    return count === 0 ? baseName : `${baseName}_${count + 1}`;
+  });
+}
+
+class CsvSqliteStore {
+  private db: any | null = null;
+
+  constructor(private readonly dbPath: string | null) {
+    if (!dbPath) {
+      return;
+    }
+
+    mkdirSync(dirname(dbPath), { recursive: true });
+    this.db = new DatabaseSync(dbPath);
+    this.db.exec("PRAGMA journal_mode = WAL");
+    this.db.exec("PRAGMA foreign_keys = ON");
+    this.ensureSchema();
+  }
+
+  get isAvailable() {
+    return Boolean(this.db);
+  }
+
+  hasDataset(dataSourceId: string) {
+    if (!this.db) {
+      return false;
+    }
+    const row = this.db.prepare("SELECT 1 FROM csv_dataset_tables WHERE data_source_id = ? LIMIT 1").get(dataSourceId);
+    return Boolean(row);
+  }
+
+  importDataset(input: {
+    dataSourceId: string;
+    tableId: string;
+    tableName: string;
+    columns: DatabaseColumn[];
+    rows: Record<string, string>[];
+    importedAt: string;
+  }) {
+    if (!this.db) {
+      return;
+    }
+
+    const sqliteTableName = `csv_${input.dataSourceId.replace(/[^\da-z_]/gi, "_")}`;
+    const sqliteColumnNames = uniqueSqliteColumnNames(input.columns.map((column) => column.name));
+    const sqliteColumns: CsvSqliteColumn[] = input.columns.map((column, index) => ({
+      ...column,
+      sqliteColumnName: sqliteColumnNames[index] ?? `column_${index + 1}`,
+      ordinalIndex: index,
+    }));
+    const sqliteDataColumns = sqliteColumns.map((column) => quoteIdentifier(column.sqliteColumnName));
+    const createSql = `CREATE TABLE ${quoteIdentifier(sqliteTableName)} ("__row_index" INTEGER PRIMARY KEY${
+      sqliteDataColumns.length > 0 ? `, ${sqliteDataColumns.map((columnName) => `${columnName} TEXT`).join(", ")}` : ""
+    })`;
+
+    this.transaction(() => {
+      this.deleteDatasetWithoutTransaction(input.dataSourceId);
+      this.db.prepare(createSql).run();
+      this.db
+        .prepare(
+          "INSERT INTO csv_dataset_tables (data_source_id, table_id, sqlite_table_name, display_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .run(input.dataSourceId, input.tableId, sqliteTableName, input.tableName, input.importedAt, input.importedAt);
+
+      const insertColumn = this.db.prepare(
+        [
+          "INSERT INTO csv_dataset_columns",
+          "(data_source_id, table_id, ordinal_index, name, sqlite_column_name, type, nullable, primary_key, indexed, sensitive, large_field, comment)",
+          "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ].join(" "),
+      );
+      for (const column of sqliteColumns) {
+        insertColumn.run(
+          input.dataSourceId,
+          input.tableId,
+          column.ordinalIndex,
+          column.name,
+          column.sqliteColumnName,
+          column.type,
+          column.nullable ? 1 : 0,
+          column.primaryKey ? 1 : 0,
+          column.indexed ? 1 : 0,
+          column.sensitive ? 1 : 0,
+          column.largeField ? 1 : 0,
+          column.comment,
+        );
+      }
+
+      if (input.rows.length === 0) {
+        return;
+      }
+      const insertColumns = ['"__row_index"', ...sqliteDataColumns].join(", ");
+      const placeholders = ["?", ...sqliteColumns.map(() => "?")].join(", ");
+      const insertRow = this.db.prepare(
+        `INSERT INTO ${quoteIdentifier(sqliteTableName)} (${insertColumns}) VALUES (${placeholders})`,
+      );
+      for (const [rowIndex, row] of input.rows.entries()) {
+        insertRow.run(rowIndex + 1, ...input.columns.map((column) => row[column.name] ?? null));
+      }
+    });
+  }
+
+  readRows(dataSourceId: string, columns: DatabaseColumn[], limit: number) {
+    if (!this.db) {
+      return null;
+    }
+    const table = this.datasetTable(dataSourceId);
+    if (!table) {
+      return null;
+    }
+    const sqliteColumns = this.sqliteColumns(dataSourceId);
+    const selectColumns = columns
+      .map((column) => {
+        const sqliteColumn = sqliteColumns.find((candidate) => candidate.name === column.name);
+        return sqliteColumn ? `${quoteIdentifier(sqliteColumn.sqlite_column_name)} AS ${quoteIdentifier(column.name)}` : null;
+      })
+      .filter(Boolean);
+    if (selectColumns.length === 0) {
+      return [];
+    }
+    return this.db
+      .prepare(`SELECT ${selectColumns.join(", ")} FROM ${quoteIdentifier(table.sqlite_table_name)} ORDER BY "__row_index" LIMIT ?`)
+      .all(limit) as Record<string, string | null>[];
+  }
+
+  deleteDataset(dataSourceId: string) {
+    if (!this.db) {
+      return;
+    }
+    this.transaction(() => this.deleteDatasetWithoutTransaction(dataSourceId));
+  }
+
+  private deleteDatasetWithoutTransaction(dataSourceId: string) {
+    const table = this.datasetTable(dataSourceId);
+    if (table) {
+      this.db.prepare(`DROP TABLE IF EXISTS ${quoteIdentifier(table.sqlite_table_name)}`).run();
+    }
+    this.db.prepare("DELETE FROM csv_dataset_columns WHERE data_source_id = ?").run(dataSourceId);
+    this.db.prepare("DELETE FROM csv_dataset_tables WHERE data_source_id = ?").run(dataSourceId);
+  }
+
+  renameDataset(dataSourceId: string, tableName: string, updatedAt: string) {
+    if (!this.db) {
+      return;
+    }
+    this.db
+      .prepare("UPDATE csv_dataset_tables SET display_name = ?, updated_at = ? WHERE data_source_id = ?")
+      .run(tableName, updatedAt, dataSourceId);
+  }
+
+  private ensureSchema() {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS csv_dataset_tables (
+        data_source_id TEXT PRIMARY KEY,
+        table_id TEXT NOT NULL,
+        sqlite_table_name TEXT NOT NULL UNIQUE,
+        display_name TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS csv_dataset_columns (
+        data_source_id TEXT NOT NULL,
+        table_id TEXT NOT NULL,
+        ordinal_index INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        sqlite_column_name TEXT NOT NULL,
+        type TEXT NOT NULL,
+        nullable INTEGER NOT NULL,
+        primary_key INTEGER NOT NULL,
+        indexed INTEGER NOT NULL,
+        sensitive INTEGER NOT NULL,
+        large_field INTEGER NOT NULL,
+        comment TEXT NOT NULL,
+        PRIMARY KEY (data_source_id, ordinal_index),
+        FOREIGN KEY (data_source_id) REFERENCES csv_dataset_tables(data_source_id) ON DELETE CASCADE
+      );
+    `);
+  }
+
+  private transaction(callback: () => void) {
+    this.db.exec("BEGIN");
+    try {
+      callback();
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  private datasetTable(dataSourceId: string) {
+    return this.db
+      .prepare("SELECT data_source_id, table_id, sqlite_table_name FROM csv_dataset_tables WHERE data_source_id = ?")
+      .get(dataSourceId) as { data_source_id: string; table_id: string; sqlite_table_name: string } | undefined;
+  }
+
+  private sqliteColumns(dataSourceId: string) {
+    return this.db
+      .prepare("SELECT name, sqlite_column_name FROM csv_dataset_columns WHERE data_source_id = ? ORDER BY ordinal_index")
+      .all(dataSourceId) as Array<{ name: string; sqlite_column_name: string }>;
+  }
+}
+
 export class DataManagementStore {
-  private dataSources = new Map<string, DataSourceSummary & { credentialHash?: string; createdBy: string; createdAt: string }>();
+  private dataSources = new Map<string, StoredDataSource>();
   private schemas = new Map<string, DatabaseSchema[]>();
   private tables = new Map<string, DatabaseTable[]>();
   private csvFiles = new Map<string, { id: string; name: string; content: string; createdAt: string }>();
-  private csvFileProfiles = new Map<string, { fileName: string; fileSizeBytes: number; encoding: string; delimiter: string; rowCount: number; columnCount: number }>();
+  private csvFileProfiles = new Map<string, CsvFileProfile>();
+  private csvSqliteStore: CsvSqliteStore;
   readonly queryAuditLogs: QueryAuditLog[] = [];
+
+  constructor(
+    private readonly persistencePath: string | null = defaultPersistencePath(),
+    csvSqlitePath: string | null = defaultCsvSqlitePath(persistencePath),
+  ) {
+    this.csvSqliteStore = new CsvSqliteStore(csvSqlitePath);
+    this.loadPersistedState();
+    this.migrateSnapshotCsvRowsToSqlite();
+  }
 
   listDataSources() {
     return Array.from(this.dataSources.values()).map(({ credentialHash: _credentialHash, createdBy: _createdBy, createdAt: _createdAt, ...summary }) => summary);
@@ -261,6 +533,7 @@ export class DataManagementStore {
       poolConfig: { ...current.poolConfig, ...input.poolConfig },
     };
     this.dataSources.set(dataSourceId, next);
+    this.persist();
     return this.getDataSource(dataSourceId);
   }
 
@@ -311,6 +584,7 @@ export class DataManagementStore {
           lastSyncedAt: syncedAt,
         })),
       );
+      this.persist();
       return this.getDataSource(dataSourceId);
     }
 
@@ -328,6 +602,7 @@ export class DataManagementStore {
     ]);
     source.tableCount = generated.length;
     source.schemaCount = 1;
+    this.persist();
     return this.getDataSource(dataSourceId);
   }
 
@@ -360,7 +635,12 @@ export class DataManagementStore {
       .filter((column) => !column.largeField)
       .filter((column) => !columns || columns.length === 0 || columns.includes(column.name))
       .slice(0, source.safety.fieldLimit);
-    const rows = table.sampleRows.slice(0, Math.min(limit, source.safety.sampleLimit)).map((row) =>
+    const rowLimit = table.type === "imported" && !table.isLarge ? table.estimatedRows : Math.min(limit, source.safety.sampleLimit);
+    const sourceRows =
+      table.type === "imported"
+        ? (this.csvSqliteStore.readRows(dataSourceId, safeColumns, rowLimit) ?? table.sampleRows.slice(0, rowLimit))
+        : table.sampleRows.slice(0, rowLimit);
+    const rows = sourceRows.map((row) =>
       Object.fromEntries(
         safeColumns.map((column) => [column.name, column.sensitive ? maskValue(row[column.name]) : row[column.name] ?? null]),
       ),
@@ -371,7 +651,7 @@ export class DataManagementStore {
       columns: safeColumns,
       rows,
       policy: {
-        maxRows: source.safety.sampleLimit,
+        maxRows: rowLimit,
         maxFields: source.safety.fieldLimit,
         maskedFields: safeColumns.filter((column) => column.sensitive).map((column) => column.name),
         skippedLargeFields: table.columns.filter((column) => column.largeField).map((column) => column.name),
@@ -449,6 +729,7 @@ export class DataManagementStore {
     const parsed = parseCsv(file.content);
     const dataSourceId = id("ds_csv");
     const tableId = id("tbl_csv");
+    const importedAt = nowIso();
     const source = this.buildSource(
       {
         name: file.name.replace(/\.[^.]+$/, ""),
@@ -465,10 +746,29 @@ export class DataManagementStore {
     );
     source.id = dataSourceId;
     source.status = "online";
-    source.lastSyncedAt = nowIso();
+    source.lastSyncedAt = importedAt;
     source.schemaCount = 1;
     source.tableCount = 1;
     const actualSizeMb = Math.max(1, Math.round(file.content.length / 1024 / 1024));
+    const columns: DatabaseColumn[] = parsed.headers.map((header) => ({
+      id: `${tableId}:col:${header}`,
+      name: header,
+      type: "text",
+      nullable: true,
+      primaryKey: false,
+      indexed: false,
+      sensitive: isSensitiveName(header),
+      largeField: false,
+      comment: "CSV 推断字段",
+    }));
+    this.csvSqliteStore.importDataset({
+      dataSourceId,
+      tableId,
+      tableName: source.name,
+      columns,
+      rows: parsed.rows,
+      importedAt,
+    });
     this.dataSources.set(dataSourceId, source);
     this.csvFileProfiles.set(dataSourceId, {
       fileName: file.name,
@@ -479,6 +779,7 @@ export class DataManagementStore {
       columnCount: parsed.headers.length,
     });
     this.schemas.set(dataSourceId, [{ id: `${dataSourceId}:schema:csv_imports`, dataSourceId, name: "csv_imports", tableCount: 1, viewCount: 0, lastSyncedAt: source.lastSyncedAt }]);
+    const previewRows = this.csvSqliteStore.isAvailable ? parsed.rows.slice(0, CSV_PREVIEW_ROW_LIMIT) : parsed.rows;
     this.tables.set(dataSourceId, [
       applyLargeTableRule({
         id: tableId,
@@ -489,26 +790,56 @@ export class DataManagementStore {
         comment: "CSV 导入补充数据源",
         estimatedRows: parsed.rows.length,
         estimatedSizeMb: actualSizeMb,
-        updatedAt: nowIso(),
+        updatedAt: importedAt,
         isLarge: false,
         isSensitive: parsed.headers.some(isSensitiveName),
-        columns: parsed.headers.map((header) => ({
-          id: `${tableId}:col:${header}`,
-          name: header,
-          type: "text",
-          nullable: true,
-          primaryKey: false,
-          indexed: false,
-          sensitive: isSensitiveName(header),
-          largeField: false,
-          comment: "CSV 推断字段",
-        })),
+        columns,
         indexes: [],
         foreignKeys: [],
-        sampleRows: parsed.rows,
+        sampleRows: previewRows,
       }),
     ]);
+    this.csvFiles.delete(fileId);
+    this.persist();
     return { success: true as const, job: { id: id("import_job"), status: "completed", importedTableId: tableId, dataSourceId, importedRows: parsed.rows.length } };
+  }
+
+  deleteCsvDataSource(dataSourceId: string) {
+    const source = this.dataSources.get(dataSourceId);
+    if (!source || source.type !== "csv") {
+      return null;
+    }
+    this.dataSources.delete(dataSourceId);
+    this.schemas.delete(dataSourceId);
+    this.tables.delete(dataSourceId);
+    this.csvFileProfiles.delete(dataSourceId);
+    this.csvSqliteStore.deleteDataset(dataSourceId);
+    this.persist();
+    return { success: true as const, dataSourceId };
+  }
+
+  renameCsvDataSource(dataSourceId: string, name: string) {
+    const source = this.dataSources.get(dataSourceId);
+    const nextName = name.trim();
+    if (!source || source.type !== "csv" || !nextName || nextName.length > 100) {
+      return null;
+    }
+    const updatedAt = nowIso();
+    source.name = nextName;
+    source.lastSyncedAt = updatedAt;
+    const sourceTables = this.tables.get(dataSourceId) ?? [];
+    const importedTable = sourceTables.find((table) => table.type === "imported") ?? sourceTables[0];
+    if (importedTable) {
+      importedTable.name = nextName;
+      importedTable.updatedAt = updatedAt;
+    }
+    this.csvSqliteStore.renameDataset(dataSourceId, nextName, updatedAt);
+    this.persist();
+    return {
+      success: true as const,
+      dataSource: this.getDataSource(dataSourceId),
+      table: importedTable ? this.tableDetail(dataSourceId, importedTable.id) : null,
+    };
   }
 
   async schemaContext(input: Partial<BuildSchemaContextInput> = {}) {
@@ -530,7 +861,80 @@ export class DataManagementStore {
     this.queryAuditLogs.push({ ...log, id: id("query_audit"), createdAt: nowIso() });
   }
 
-  private buildSource(input: ConnectionInput, userId: string): DataSourceSummary & { credentialHash?: string; createdBy: string; createdAt: string } {
+  private persist() {
+    if (!this.persistencePath) {
+      return;
+    }
+
+    try {
+      mkdirSync(dirname(this.persistencePath), { recursive: true });
+      const snapshot: DataManagementSnapshot = {
+        version: 1,
+        dataSources: Array.from(this.dataSources.values()),
+        schemas: Array.from(this.schemas.entries()),
+        tables: Array.from(this.tables.entries()),
+        csvFileProfiles: Array.from(this.csvFileProfiles.entries()),
+      };
+      writeFileSync(this.persistencePath, JSON.stringify(snapshot), "utf8");
+    } catch {
+      // Data management can continue with in-memory state; the next mutation will retry persistence.
+    }
+  }
+
+  private loadPersistedState() {
+    if (!this.persistencePath || !existsSync(this.persistencePath)) {
+      return;
+    }
+
+    try {
+      const snapshot = JSON.parse(readFileSync(this.persistencePath, "utf8")) as Partial<DataManagementSnapshot>;
+      if (snapshot.version !== 1) {
+        return;
+      }
+
+      this.dataSources = new Map((snapshot.dataSources ?? []).map((source) => [source.id, source]));
+      this.schemas = new Map(snapshot.schemas ?? []);
+      this.tables = new Map(snapshot.tables ?? []);
+      this.csvFileProfiles = new Map(snapshot.csvFileProfiles ?? []);
+    } catch {
+      this.dataSources.clear();
+      this.schemas.clear();
+      this.tables.clear();
+      this.csvFileProfiles.clear();
+    }
+  }
+
+  private migrateSnapshotCsvRowsToSqlite() {
+    let didMigrate = false;
+    for (const source of this.dataSources.values()) {
+      if (source.type !== "csv" || this.csvSqliteStore.hasDataset(source.id)) {
+        continue;
+      }
+      const importedTable = (this.tables.get(source.id) ?? []).find((table) => table.type === "imported");
+      if (!importedTable || importedTable.sampleRows.length === 0) {
+        continue;
+      }
+      const importedAt = importedTable.updatedAt || source.lastSyncedAt || nowIso();
+      this.csvSqliteStore.importDataset({
+        dataSourceId: source.id,
+        tableId: importedTable.id,
+        tableName: importedTable.name,
+        columns: importedTable.columns,
+        rows: importedTable.sampleRows.map((row) =>
+          Object.fromEntries(importedTable.columns.map((column) => [column.name, row[column.name] == null ? "" : String(row[column.name])])),
+        ),
+        importedAt,
+      });
+      importedTable.sampleRows = importedTable.sampleRows.slice(0, CSV_PREVIEW_ROW_LIMIT);
+      didMigrate = true;
+    }
+
+    if (didMigrate) {
+      this.persist();
+    }
+  }
+
+  private buildSource(input: ConnectionInput, userId: string): StoredDataSource {
     const sourceId = id(input.type === "csv" ? "ds_csv" : "ds_mysql");
     return {
       id: sourceId,

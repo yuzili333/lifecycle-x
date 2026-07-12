@@ -93,6 +93,14 @@ describe("PythonScriptValidator", () => {
     expect(result.detectedOutputs).toContain("artifacts/chart.png");
   });
 
+  it("allows only sandbox input reads and output or artifact writes", () => {
+    expect(validator.validate("open('input/ds_customers.csv')\nopen('output/summary.txt', 'w')\nopen('artifacts/chart.png', 'wb')").passed).toBe(true);
+    expect(validator.validate("open('customers.csv')").passed).toBe(false);
+    expect(validator.validate("open('../customers.csv')").passed).toBe(false);
+    expect(validator.validate("import pandas as pd\npd.read_csv('output/summary.csv')").passed).toBe(false);
+    expect(validator.validate("import matplotlib.pyplot as plt\nplt.savefig('chart.png')").passed).toBe(false);
+  });
+
   it("blocks network, shell, dynamic execution, env, package install and database direct access", () => {
     for (const script of [
       "import requests\nrequests.get('https://example.com')",

@@ -9,15 +9,11 @@ import type {
   AssistantStreamEvent,
 } from "../main/assistantRuntime";
 
-export type DataSourceMenuAction = "create-connection" | "import-csv";
-export type DockIconVariant = "dark" | "light";
+export type DataSourceMenuAction = "open-database" | "open-csv" | "create-connection" | "import-csv";
 
 const lifecycleXApi = {
   getAppInfo: () => ipcRenderer.invoke("app:info"),
   openExternal: (url: string) => ipcRenderer.invoke("shell:open-external", url),
-  dockIcon: {
-    set: (variant: DockIconVariant) => ipcRenderer.invoke("dock-icon:set", variant) as Promise<boolean>,
-  },
   auth: {
     getRefreshToken: () => ipcRenderer.invoke("auth:get-refresh-token") as Promise<string | null>,
     setRefreshToken: (token: string) => ipcRenderer.invoke("auth:set-refresh-token", token) as Promise<boolean>,
@@ -30,8 +26,8 @@ const lifecycleXApi = {
   assistant: {
     listConversations: (userId: string) =>
       ipcRenderer.invoke("assistant:conversations:list", userId) as Promise<AssistantConversation[]>,
-    createConversation: (userId: string) =>
-      ipcRenderer.invoke("assistant:conversation:create", userId) as Promise<AssistantConversation>,
+    createConversation: (userId: string, title?: string) =>
+      ipcRenderer.invoke("assistant:conversation:create", userId, title) as Promise<AssistantConversation>,
     renameConversation: (userId: string, conversationId: string, title: string) =>
       ipcRenderer.invoke("assistant:conversation:rename", userId, conversationId, title) as Promise<AssistantConversation>,
     deleteConversation: (userId: string, conversationId: string) =>

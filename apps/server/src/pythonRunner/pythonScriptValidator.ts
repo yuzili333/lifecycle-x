@@ -81,14 +81,7 @@ export class PythonScriptValidator {
       }
     }
 
-    if (/\bopen\s*\(\s*['"]\//.test(normalizedScript) || /Path\s*\(\s*['"]\//.test(normalizedScript)) {
-      usesFileSystem = true;
-      issues.push(issue("UNAUTHORIZED_FILE_ACCESS", "critical", "禁止读取或写入沙箱之外的绝对路径。"));
-    }
-    if (/\bpd\s*\.\s*read_(?:csv|json|excel|parquet)\s*\(\s*['"]\//.test(normalizedScript) || /\bpandas\s*\.\s*read_(?:csv|json|excel|parquet)\s*\(\s*['"]\//.test(normalizedScript)) {
-      usesFileSystem = true;
-      issues.push(issue("UNAUTHORIZED_FILE_ACCESS", "critical", "pandas 只能读取注入到沙箱 input/ 下的数据集。"));
-    }
+    usesFileSystem = validateSandboxPathLiterals(normalizedScript, issues) || usesFileSystem;
     if (/\bwhile\s+True\s*:/.test(normalizedScript)) {
       issues.push(issue("UNBOUNDED_LOOP_RISK", "warning", "检测到可能无限循环：while True。"));
     }
@@ -115,6 +108,76 @@ const FORBIDDEN_CALLS: Array<[RegExp, PythonScriptSafetyIssue["code"], string]> 
   [/\bpip\s+install\b|\bconda\s+install\b/, "PACKAGE_INSTALL", "禁止安装 Python 包。"],
   [/\bopen\s*\(\s*['"](?:~|\.env|id_rsa|id_ed25519)/, "UNAUTHORIZED_FILE_ACCESS", "禁止读取敏感文件。"],
 ];
+
+function validateSandboxPathLiterals(script: string, issues: PythonScriptSafetyIssue[]) {
+  let usesFileSystem = false;
+
+  for (const match of script.matchAll(/\bopen\s*\(\s*(['"])([^'"]+)\1\s*(?:,\s*(['"])([^'"]*)\3)?/g)) {
+    usesFileSystem = true;
+    const mode = match[4] ?? "r";
+    const access: "read" | "write" = /[wax+]/.test(mode) ? "write" : "read";
+    const message = validateSandboxPath(match[2], access);
+    if (message) {
+      issues.push(issue("UNAUTHORIZED_FILE_ACCESS", "critical", message));
+    }
+  }
+
+  for (const match of script.matchAll(/\bPath\s*\(\s*(['"])([^'"]+)\1/g)) {
+    usesFileSystem = true;
+    const message = validateSandboxPath(match[2], "any");
+    if (message) {
+      issues.push(issue("UNAUTHORIZED_FILE_ACCESS", "critical", message));
+    }
+  }
+
+  for (const match of script.matchAll(/\b(?:pd|pandas)\s*\.\s*read_(?:csv|json|excel|parquet)\s*\(\s*(['"])([^'"]+)\1/g)) {
+    usesFileSystem = true;
+    const message = validateSandboxPath(match[2], "read");
+    if (message) {
+      issues.push(issue("UNAUTHORIZED_FILE_ACCESS", "critical", "pandas 只能读取注入到沙箱 input/ 下的数据集。"));
+    }
+  }
+
+  for (const match of script.matchAll(/\bto_(?:csv|json|html)\s*\(\s*(['"])([^'"]+)\1/g)) {
+    usesFileSystem = true;
+    const message = validateSandboxPath(match[2], "write");
+    if (message) {
+      issues.push(issue("UNAUTHORIZED_FILE_ACCESS", "critical", message));
+    }
+  }
+
+  for (const match of script.matchAll(/\bsavefig\s*\(\s*(['"])([^'"]+)\1/g)) {
+    usesFileSystem = true;
+    const message = validateSandboxPath(match[2], "artifact");
+    if (message) {
+      issues.push(issue("UNAUTHORIZED_FILE_ACCESS", "critical", "图表文件只能写入沙箱 artifacts/ 目录。"));
+    }
+  }
+
+  return usesFileSystem;
+}
+
+function validateSandboxPath(path: string, access: "read" | "write" | "artifact" | "any") {
+  if (/^(?:\/|~|[a-zA-Z]:[\\/])/.test(path) || path.includes("..") || path.includes("://")) {
+    return "禁止读取或写入沙箱允许目录之外的路径。";
+  }
+  if (/(?:^|\/)(?:\.env|id_rsa|id_ed25519)(?:$|\/)/.test(path)) {
+    return "禁止读取敏感文件。";
+  }
+  if (access === "read" && !path.startsWith("input/")) {
+    return "Python 脚本只能从沙箱 input/ 目录读取授权数据集。";
+  }
+  if (access === "write" && !(path.startsWith("output/") || path.startsWith("artifacts/"))) {
+    return "Python 脚本只能写入沙箱 output/ 或 artifacts/ 目录。";
+  }
+  if (access === "artifact" && !path.startsWith("artifacts/")) {
+    return "图表文件只能写入沙箱 artifacts/ 目录。";
+  }
+  if (access === "any" && !(path.startsWith("input/") || path.startsWith("output/") || path.startsWith("artifacts/"))) {
+    return "Path 访问只能限定在沙箱 input/、output/ 或 artifacts/ 目录。";
+  }
+  return null;
+}
 
 function detectImports(script: string) {
   const imports = new Set<string>();

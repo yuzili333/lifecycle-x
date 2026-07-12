@@ -343,6 +343,24 @@ export const workbenchApi = {
     });
   },
 
+  deleteCsvDataSource(accessToken: string, dataSourceId: string) {
+    return request<{ success: true; dataSourceId: string }>(
+      `/csv/data-sources/${encodeURIComponent(dataSourceId)}/delete`,
+      { method: "POST", headers: authHeaders(accessToken) },
+    );
+  },
+
+  renameCsvDataSource(accessToken: string, dataSourceId: string, name: string) {
+    return request<{ success: true; dataSource: DataSourceSummary; table: DatabaseTable | null }>(
+      `/csv/data-sources/${encodeURIComponent(dataSourceId)}/rename`,
+      {
+        method: "POST",
+        headers: authHeaders(accessToken),
+        body: JSON.stringify({ name }),
+      },
+    );
+  },
+
   schemaContext(accessToken: string, query: SchemaContextQuery) {
     const params = new URLSearchParams();
     if (query.conversationId) {

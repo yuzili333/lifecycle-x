@@ -1,26 +1,14 @@
 import { app, BrowserWindow, Menu, ipcMain, nativeImage, safeStorage, shell, type MenuItemConstructorOptions } from "electron";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import defaultDockIconPath from "../../build/icon.png?asset";
-import dockIconDark512Path from "../resources/cycle_probe_docker_icon_dark_512.png?asset";
-import dockIconLight512Path from "../resources/cycle_probe_docker_icon_light_512.png?asset";
 import type { DataSourceMenuAction } from "../preload";
 import { AssistantRuntime, type AssistantStreamEvent } from "./assistantRuntime";
 
 const isMac = process.platform === "darwin";
 const secretStoreFileName = "cycle-probe-secrets.json";
 let refreshToken: string | null = null;
-
-type DockIconVariant = "dark" | "light";
-
-const dockIconPaths: Record<DockIconVariant, string> = {
-  dark: dockIconDark512Path,
-  light: dockIconLight512Path,
-};
-
-function createDockIcon(variant: DockIconVariant) {
-  return nativeImage.createFromPath(dockIconPaths[variant]);
-}
 
 let currentDockIcon = nativeImage.createFromPath(defaultDockIconPath);
 let assistantRuntime: AssistantRuntime | null = null;
@@ -80,22 +68,6 @@ function sendDataSourceAction(action: DataSourceMenuAction) {
   targetWindow?.webContents.send("data-source:action", action);
 }
 
-function applyDockIcon(variant: DockIconVariant) {
-  const nextDockIcon = createDockIcon(variant);
-  if (nextDockIcon.isEmpty()) {
-    return false;
-  }
-
-  currentDockIcon = nextDockIcon;
-  for (const window of BrowserWindow.getAllWindows()) {
-    window.setIcon(currentDockIcon);
-  }
-  if (isMac) {
-    app.dock.setIcon(currentDockIcon);
-  }
-  return true;
-}
-
 async function modelApiKeyForUser(userId: string) {
   const store = await readSecretStore();
   const encrypted = store.modelApiKeys?.[secretKeyForUser(userId)];
@@ -112,6 +84,8 @@ function getAssistantRuntime() {
   if (!assistantRuntime) {
     assistantRuntime = new AssistantRuntime({
       dbPath: join(app.getPath("userData"), "cycle-probe-assistant.sqlite3"),
+      csvSqlitePath: join(process.env.LIFECYCLE_X_DATA_DIR ?? join(homedir(), ".cycle-probe"), "csv-data.sqlite"),
+      toolLogPath: join(app.getPath("userData"), "cycle-probe-tool-calls.jsonl"),
       getModelApiKey: modelApiKeyForUser,
       emit: broadcastAssistantEvent,
     });
@@ -250,15 +224,8 @@ ipcMain.handle("auth:clear-refresh-token", () => {
   return true;
 });
 ipcMain.handle("shell:open-external", (_event, url: string) => shell.openExternal(url));
-ipcMain.handle("dock-icon:set", (_event, variant: DockIconVariant) => {
-  if (!Object.hasOwn(dockIconPaths, variant)) {
-    return false;
-  }
-  return applyDockIcon(variant);
-});
 ipcMain.handle("model-api-key:has", async (_event, userId: string) => {
-  const store = await readSecretStore();
-  return Boolean(store.modelApiKeys?.[secretKeyForUser(userId)]);
+  return Boolean(await modelApiKeyForUser(userId));
 });
 ipcMain.handle("model-api-key:set", async (_event, userId: string, apiKey: string) => {
   const normalizedKey = apiKey.trim();
@@ -277,7 +244,7 @@ ipcMain.handle("model-api-key:set", async (_event, userId: string, apiKey: strin
   return true;
 });
 ipcMain.handle("assistant:conversations:list", (_event, userId: string) => getAssistantRuntime().listConversations(userId));
-ipcMain.handle("assistant:conversation:create", (_event, userId: string) => getAssistantRuntime().createConversation(userId));
+ipcMain.handle("assistant:conversation:create", (_event, userId: string, title?: string) => getAssistantRuntime().createConversation(userId, title));
 ipcMain.handle("assistant:conversation:rename", (_event, userId: string, conversationId: string, title: string) =>
   getAssistantRuntime().renameConversation(userId, conversationId, title),
 );

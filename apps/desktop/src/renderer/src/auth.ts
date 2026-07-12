@@ -64,7 +64,33 @@ export async function request<T>(path: string, init: RequestInit = {}): Promise<
         ...init.headers,
       },
     });
-    return (await response.json()) as ApiResult<T>;
+    const text = await response.text();
+    if (!text) {
+      if (response.ok) {
+        return { success: true } as ApiResult<T>;
+      }
+      return {
+        success: false,
+        error: {
+          code: "INTERNAL_ERROR",
+          message: `认证服务返回空响应，HTTP ${response.status}。`,
+          traceId: `client-http-${response.status}`,
+        },
+      };
+    }
+
+    try {
+      return JSON.parse(text) as ApiResult<T>;
+    } catch {
+      return {
+        success: false,
+        error: {
+          code: "INTERNAL_ERROR",
+          message: `认证服务返回了无法解析的响应，HTTP ${response.status}。`,
+          traceId: `client-http-${response.status}`,
+        },
+      };
+    }
   } catch {
     return {
       success: false,
