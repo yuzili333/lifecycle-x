@@ -1,0 +1,70 @@
+import { businessVisualizationSemantics, visualizationTypes } from "./types";
+
+export const visualizationSpecJsonSchema = {
+  $id: "https://cycle-probe.local/schemas/visualization-spec-1.0.json",
+  type: "object",
+  additionalProperties: false,
+  required: ["specVersion", "visualizationId", "type", "title", "data", "provenance"],
+  properties: {
+    specVersion: { const: "1.0" },
+    visualizationId: { type: "string", minLength: 1 },
+    type: { type: "string", enum: visualizationTypes },
+    title: { type: "string", minLength: 1 },
+    subtitle: { type: "string" },
+    description: { type: "string" },
+    businessSemantic: { type: "string", enum: businessVisualizationSemantics },
+    data: {
+      oneOf: [
+        {
+          type: "object",
+          additionalProperties: false,
+          required: ["mode", "artifactId"],
+          properties: {
+            mode: { const: "artifact" },
+            artifactId: { type: "string", minLength: 1 },
+            datasetId: { type: "string" },
+            executionId: { type: "string" },
+            dataPath: { type: "string" },
+            expectedSchema: { type: "object", additionalProperties: { type: "string" } },
+            rowCount: { type: "number", minimum: 0 },
+            checksum: { type: "string" },
+          },
+        },
+        {
+          type: "object",
+          additionalProperties: false,
+          required: ["mode", "rows", "rowCount", "trusted"],
+          properties: {
+            mode: { const: "inline" },
+            rows: { type: "array", items: { type: "object" } },
+            rowCount: { type: "number", minimum: 0 },
+            trusted: { const: true },
+          },
+        },
+      ],
+    },
+    dimensions: { type: "array", items: { type: "object" } },
+    measures: { type: "array", items: { type: "object" } },
+    series: { type: "array", items: { type: "object" } },
+    encoding: { type: "object" },
+    interaction: { type: "object" },
+    display: { type: "object" },
+    theme: { type: "object" },
+    provenance: {
+      type: "object",
+      additionalProperties: false,
+      required: ["sourceType", "generatedAt"],
+      properties: {
+        sourceType: { type: "string", enum: ["sql", "python", "workflow_dataset", "approved_inline"] },
+        sourceRequestId: { type: "string" },
+        sourceExecutionId: { type: "string" },
+        sourceDatasetId: { type: "string" },
+        generatedAt: { type: "string", minLength: 1 },
+        masked: { type: "boolean" },
+        truncated: { type: "boolean" },
+        warnings: { type: "array", items: { type: "string" } },
+      },
+    },
+    metadata: { type: "object" },
+  },
+} as const;

@@ -1,7 +1,13 @@
+import type { VisualizationStreamEvent } from "../../shared/visualization";
+
 export type ModelStreamEventType =
   | "stream-start"
   | "text-delta"
   | "markdown-delta"
+  | "visualization_start"
+  | "visualization_delta"
+  | "visualization_complete"
+  | "visualization_error"
   | "markdown-block-start"
   | "markdown-block-delta"
   | "markdown-block-end"
@@ -23,6 +29,7 @@ export type MarkdownBlockType =
   | "unordered_list"
   | "ordered_list"
   | "code_block"
+  | "visualization"
   | "mermaid"
   | "math_block"
   | "table"
@@ -58,6 +65,8 @@ export type ModelStreamEvent<TPayload = Record<string, unknown>> = {
   toolCallId?: string;
   blockId?: string;
 };
+
+export type ModelVisualizationStreamEvent = VisualizationStreamEvent;
 
 export type ConversationMessage = {
   id: string;

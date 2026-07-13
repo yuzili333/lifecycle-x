@@ -19,13 +19,14 @@ import {
   type WorkflowStateStore,
 } from "./workflowRuntime";
 import { rewriteCompoundOrderByForSqlite } from "./sqliteSqlRewrite";
+import { parseVisualizationSpecJson, type VisualizationRenderError, type VisualizationSpec } from "../shared/visualization";
 
 const require = createRequire(import.meta.url);
 const Database = require("better-sqlite3");
 
 export type AssistantApprovalMode = "full_access" | "request_approval" | "no_access";
 export type AssistantSkill = "general_analysis" | "schema_explorer";
-export type AssistantBlockType = "text" | "markdown" | "json" | "card" | "mermaid";
+export type AssistantBlockType = "text" | "markdown" | "json" | "card" | "mermaid" | "visualization";
 export type AssistantMessageRole = "system" | "user" | "assistant" | "tool";
 export type AssistantMessageStatus =
   | "draft"
@@ -50,6 +51,9 @@ export type AssistantBlock = {
   toolTarget?: string;
   toolFiles?: string[];
   toolDurationMs?: number;
+  visualizationSpec?: VisualizationSpec;
+  visualizationStatus?: "streaming" | "ready" | "error";
+  visualizationError?: VisualizationRenderError;
 };
 
 export type AssistantMessageContext = {
@@ -159,6 +163,7 @@ type CsvDatasetTableRow = {
   table_id: string;
   sqlite_table_name: string;
   display_name: string;
+  aliases_json?: string;
 };
 
 type CsvDatasetColumnRow = {
@@ -214,6 +219,18 @@ function normalizeCsvSchemaQualifiedSql(sql: string) {
   return sql.replace(/\b(from|join)\s+csv_imports\.([`"[]?[\w.-]+[`"\]]?)/gi, (_match, keyword: string, tableName: string) => {
     return `${keyword} ${tableName}`;
   });
+}
+
+function parseCsvAliasJson(value: string | undefined) {
+  if (!value) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string" && item.trim().length > 0) : [];
+  } catch {
+    return [];
+  }
 }
 
 function extractFencedCode(prompt: string, language: AssistantToolKind) {
@@ -275,8 +292,11 @@ function shouldAnalyzePriorSqlResult(prompt: string) {
   );
 }
 
-function shouldAutoStartPythonReport(prompt: string) {
-  return /(输出|生成|形成|给出|撰写).{0,12}(分析)?报告|分析报告|报告输出/i.test(prompt) || (/分析/i.test(prompt) && /(占比|比例|分布|统计|对比)/i.test(prompt));
+export function shouldAutoStartPythonReport(prompt: string) {
+  const asksForReport = /(输出|生成|形成|给出|撰写|渲染|绘制|展示|放入|放到).{0,24}(分析)?报告|分析报告|报告输出|报告中/i.test(prompt);
+  const asksForChart = /(柱状图|条形图|折线图|饼图|图表|可视化)/i.test(prompt);
+  const asksForAnalysis = /(统计|计数|总计|数量|占比|比例|分布|排序|倒序|排名|对比|分析)/i.test(prompt);
+  return asksForReport || (asksForChart && asksForAnalysis) || (/分析/i.test(prompt) && /(占比|比例|分布|统计|对比)/i.test(prompt));
 }
 
 function parseSqlToolRows(result: string | undefined) {
@@ -401,6 +421,21 @@ function parseAssistantBlocks(content: string): AssistantBlock[] {
 
     const language = (match[1] ?? "markdown").toLowerCase();
     const body = match[2].trim();
+    if (isVisualizationLanguage(language)) {
+      const parsed = parseVisualizationSpecJson(body, { allowInlineData: true, inlineDataMaxRows: 200, inlineDataMaxBytes: 64 * 1024 });
+      blocks.push({
+        id: randomUUID(),
+        type: "visualization",
+        content: "",
+        title: parsed.success ? parsed.spec.title : "可视化配置无法解析",
+        language,
+        visualizationStatus: parsed.success ? "ready" : "error",
+        visualizationSpec: parsed.success ? parsed.spec : undefined,
+        visualizationError: parsed.success ? undefined : parsed.error,
+      });
+      cursor = fencePattern.lastIndex;
+      continue;
+    }
     const isMarkdown = language === "markdown" || language === "md";
     blocks.push({
       id: randomUUID(),
@@ -419,6 +454,10 @@ function parseAssistantBlocks(content: string): AssistantBlock[] {
   }
 
   return blocks.length > 0 ? blocks : [{ id: randomUUID(), type: "text", content: "" }];
+}
+
+function isVisualizationLanguage(language: string) {
+  return ["visualization", "visualization-json", "viz", "chart-spec"].includes(language);
 }
 
 export class AssistantRuntime {
@@ -1183,8 +1222,9 @@ export class AssistantRuntime {
     const rowsJson = JSON.stringify(rows);
     const promptJson = JSON.stringify(prompt);
     return [
-      "import json",
+      "import json, re",
       "from collections import Counter, defaultdict",
+      "from datetime import datetime, timezone",
       "",
       `rows = json.loads(${JSON.stringify(rowsJson)})`,
       `question = ${promptJson}`,
@@ -1207,6 +1247,78 @@ export class AssistantRuntime {
       "if not rows:",
       "    lines.append('## 结论')",
       "    lines.append('上一轮 SQL 工具调用未返回可分析行数据。')",
+      "elif 'accounting_org_name' in rows[0] and 'latest_risk_result' in rows[0] and ('柱状图' in question or '条形图' in question or '图表' in question or '可视化' in question or '报告' in question):",
+      "    branch_field = 'accounting_org_name'",
+      "    risk_result_field = 'latest_risk_result'",
+      "    def requested_value_for(field_name):",
+      "        position = question.find(field_name)",
+      "        if position < 0:",
+      "            return None",
+      "        segment = question[position:position + 120]",
+      "        quoted = re.findall(r'[“\"「『]([^”\"」』]+)[”\"」』]', segment)",
+      "        for value in quoted:",
+      "            if value != field_name:",
+      "                return value",
+      "        match = re.search(r'为\\s*([^，,。；;\\s]+)', segment)",
+      "        return match.group(1) if match else None",
+      "    target_value = requested_value_for(risk_result_field) or ('0300--次级' if '0300--次级' in question else None)",
+      "    count_field = next((key for key in ['record_count', 'cnt', 'count', 'total_count', '总计数量'] if key in rows[0]), None)",
+      "    filtered = []",
+      "    for row in rows:",
+      "        if target_value and str(row.get(risk_result_field) or '').strip() != target_value:",
+      "            continue",
+      "        filtered.append(row)",
+      "    counter = Counter()",
+      "    for row in filtered:",
+      "        branch = row.get(branch_field) or '--'",
+      "        if count_field:",
+      "            try:",
+      "                counter[branch] += int(float(row.get(count_field) or 0))",
+      "            except (TypeError, ValueError):",
+      "                counter[branch] += 0",
+      "        else:",
+      "            counter[branch] += 1",
+      "    chart_rows = [{'accounting_org_name': branch, 'record_count': count} for branch, count in counter.most_common()]",
+      "    total_count = sum(item['record_count'] for item in chart_rows)",
+      "    lines.append('## 分行最近风险结果统计')",
+      "    lines.append(f'- 统计口径：{risk_result_field} = {target_value or \"全部\"}')",
+      "    lines.append(f'- 命中记录总数：{total_count}')",
+      "    lines.append('')",
+      "    lines.append('| 排名 | 分行 | 总计数量 | 占比 |')",
+      "    lines.append('|---:|---|---:|---:|')",
+      "    for rank, item in enumerate(chart_rows, start=1):",
+      "        lines.append(f\"| {rank} | {item['accounting_org_name']} | {item['record_count']} | {pct(item['record_count'], total_count)}% |\")",
+      "    lines.append('')",
+      "    if chart_rows:",
+      "        top_item = chart_rows[0]",
+      "        lines.append('## 分析结论')",
+      "        lines.append(f\"- {target_value or '目标风险结果'}记录主要集中在 {top_item['accounting_org_name']}，总计 {top_item['record_count']} 条，占比 {pct(top_item['record_count'], total_count)}%。\")",
+      "        lines.append('- 建议优先复核排名靠前分行的客户结构、风险迁徙原因和贷后处置进度。')",
+      "    else:",
+      "        lines.append('## 分析结论')",
+      "        lines.append('- 当前 SQL 结果中未命中指定风险结果，暂无可绘制的分行柱状图。')",
+      "    if chart_rows:",
+      "        chart_rows_for_spec = chart_rows[:200]",
+      "        spec = {",
+      "            'specVersion': '1.0',",
+      "            'visualizationId': 'viz_latest_risk_result_by_branch',",
+      "            'type': 'bar',",
+      "            'title': f\"各分行{target_value or '目标风险结果'}总计数量\",",
+      "            'subtitle': '基于已审批 SQL 工具调用结果生成',",
+      "            'businessSemantic': 'institution_risk_comparison',",
+      "            'data': {'mode': 'inline', 'rows': chart_rows_for_spec, 'rowCount': len(chart_rows_for_spec), 'trusted': True},",
+      "            'dimensions': [{'field': 'accounting_org_name', 'label': '分行', 'dataType': 'category', 'role': 'x', 'sort': 'none'}],",
+      "            'measures': [{'field': 'record_count', 'label': '总计数量', 'dataType': 'count', 'role': 'y', 'aggregation': 'sum', 'format': {'type': 'integer'}}],",
+      "            'encoding': {'x': 'accounting_org_name', 'y': ['record_count']},",
+      "            'interaction': {'tooltip': True, 'legend': False, 'exportable': True},",
+      "            'display': {'height': 320, 'responsive': True, 'showDataSource': True},",
+      "            'theme': {'mode': 'dark', 'palette': 'neutral'},",
+      "            'provenance': {'sourceType': 'python', 'sourceExecutionId': 'local-python', 'generatedAt': datetime.now(timezone.utc).isoformat(), 'truncated': len(chart_rows_for_spec) < len(chart_rows)},",
+      "        }",
+      "        lines.append('')",
+      "        lines.append('```visualization')",
+      "        lines.append(json.dumps(spec, ensure_ascii=False, indent=2))",
+      "        lines.append('```')",
       "elif {'stat_type', 'dimension', 'record_count'}.issubset(set(rows[0].keys())):",
       "    def number(row, key):",
       "        try:",
@@ -1504,9 +1616,13 @@ export class AssistantRuntime {
     if (!attached) {
       this.db.prepare(`attach database ? as ${quoteIdentifier(alias)}`).run(this.options.csvSqlitePath);
     }
+    const tableColumns = this.db
+      .prepare(`pragma ${alias}.table_info(csv_dataset_tables)`)
+      .all() as Array<{ name: string }>;
+    const hasAliasesJson = tableColumns.some((column) => column.name === "aliases_json");
     const datasets = this.db
       .prepare(
-        `select data_source_id, table_id, sqlite_table_name, display_name
+        `select data_source_id, table_id, sqlite_table_name, display_name${hasAliasesJson ? ", aliases_json" : ""}
          from ${quoteIdentifier(alias)}.csv_dataset_tables
          order by updated_at desc`,
       )
@@ -1530,7 +1646,7 @@ export class AssistantRuntime {
           : "*";
       const viewNames = Array.from(
         new Set(
-          [dataset.display_name, dataset.table_id, dataset.sqlite_table_name]
+          [dataset.display_name, ...parseCsvAliasJson(dataset.aliases_json), dataset.table_id, dataset.sqlite_table_name]
             .map(normalizeSqliteAlias)
             .filter((name) => name.length > 0),
         ),
@@ -2334,6 +2450,10 @@ export class AssistantRuntime {
           "当 Workflow Context 中存在 activeDataset 且用户提到上一轮、当前结果、这批数据或刚才的数据时，候选 SQL 必须优先查询 activeDataset 的 sqliteTableName；不要重新访问原始业务表，除非用户明确要求重新查询原始数据源。",
           "如果用户明确要求“根据 SQL 查询结果/上一轮查询结果/工具调用结果”继续统计、对比或生成报告，必须复用最近工具结果，不得重新生成 SQL；需要计算时输出单个 ```python 代码块，报告正文必须为 Markdown。",
           "Python 工具运行在受限本地沙箱中，只能使用 Python 标准库；不得 import pandas、numpy、openpyxl、matplotlib 或任何第三方库。需要读取工作流数据集时使用 sqlite3 连接 Workflow Context 中的 sqliteDatabasePath，并读取 activeDataset.sqliteTableName。",
+          "当用户需要图表或可视化时，只能生成受控 VisualizationSpec；不得生成完整 ECharts option、vis-network 配置、vis-timeline 配置、JavaScript、React、HTML、SVG 或 formatter 函数。",
+          "VisualizationSpec 只描述业务语义、图表类型、字段映射、指标格式、交互需求和数据来源。图表数据必须优先引用 SQL/Python/Workflow Artifact；只有系统已给出小型聚合结果且可信时，才允许 inline rows。",
+          "当前客户端把受控 VisualizationSpec 作为内部 visualization 节点处理。确需输出图表时，请使用单个 ```visualization JSON 代码块承载 VisualizationSpec；客户端会将其转换为内部图表节点，不会把协议作为普通 Markdown 展示。",
+          "VisualizationSpec 中不要指定 rendererId、rendererClass、dynamicImport、importPath、任意颜色、原始 HTML、本地文件路径或可执行代码。系统会根据业务语义和图表类型自动路由 renderer。",
           "仅在本地脚本调试场景才输出 /sql 或 /python 代码块，客户端会按审批权限处理。",
           `当前数据源：${dataSourceLabel || "未选择"}`,
           `当前 Skill：${skill || "未选择"}`,

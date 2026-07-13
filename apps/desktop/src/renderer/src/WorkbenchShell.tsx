@@ -1,4 +1,4 @@
-import { Activity, useCallback, useEffect, useState, type CSSProperties } from "react";
+import { Activity, useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import { AppShell } from "@astryxdesign/core/AppShell";
 import { Avatar } from "@astryxdesign/core/Avatar";
 import { Button } from "@astryxdesign/core/Button";
@@ -34,6 +34,7 @@ type WorkbenchShellProps = {
 
 type WorkbenchModule = "data-assistant" | "data-management";
 type SettingsTab = "profile" | "general" | "appearance" | "agent" | "logout";
+type SessionExpiredPromptPhase = "idle" | "prompting" | "logging-out";
 
 const DEFAULT_WORKBENCH_MODULE: WorkbenchModule = "data-assistant";
 const WORKBENCH_NAV_CACHE_KEY_PREFIX = "cycle-probe:workbench:last-module";
@@ -356,10 +357,12 @@ function NavAssetIcon({ src, size = "sm" }: { src: string; size?: "sm" | "lg" })
 
 export function WorkbenchShell({ auth }: WorkbenchShellProps) {
   const toast = useAppToast();
+  const sessionExpiredPromptPhaseRef = useRef<SessionExpiredPromptPhase>("idle");
   const [activeModule, setActiveModule] = useState<WorkbenchModule>(() => readCachedWorkbenchModule(auth.user, auth.permissions));
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isLogoutConfirmOpen, setIsLogoutConfirmOpen] = useState(false);
   const [isSessionExpiredConfirmOpen, setIsSessionExpiredConfirmOpen] = useState(false);
+  const [isSessionExpiredLogoutPending, setIsSessionExpiredLogoutPending] = useState(false);
   const [isModelConfigRequiredOpen, setIsModelConfigRequiredOpen] = useState(false);
   const [pendingDataSourceAction, setPendingDataSourceAction] = useState<DataSourceMenuAction | null>(null);
   const [activeSettingsTab, setActiveSettingsTab] = useState<SettingsTab>("profile");
@@ -371,6 +374,10 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
   const [isSavingSettings, setIsSavingSettings] = useState(false);
 
   const openSessionExpiredConfirm = useCallback(() => {
+    if (sessionExpiredPromptPhaseRef.current !== "idle") {
+      return;
+    }
+    sessionExpiredPromptPhaseRef.current = "prompting";
     setIsSessionExpiredConfirmOpen(true);
   }, []);
 
@@ -442,7 +449,9 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
     async function loadWorkbench() {
       const cachedSettings = readCachedWorkbenchSettings(auth.user);
       const profileResult = await requestWithRefresh(workbenchApi.profile);
-      const settingsResult = await requestWithRefresh(workbenchApi.settings);
+      const settingsResult = isFailure(profileResult) && profileResult.error.code === "SESSION_EXPIRED"
+        ? null
+        : await requestWithRefresh(workbenchApi.settings);
       const localModelApiKeyConfigured = await hasLocalModelApiKey(auth.user);
 
       if (!isMounted) {
@@ -457,7 +466,11 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
         setAvatarDraft(profileResult.profile.avatarUrl ?? "");
       }
 
-      if (isFailure(settingsResult)) {
+      if (settingsResult === null) {
+        if (cachedSettings) {
+          setSettings(withLocalModelApiKeyStatus(cachedSettings, localModelApiKeyConfigured));
+        }
+      } else if (isFailure(settingsResult)) {
         showError(settingsResult);
         if (cachedSettings) {
           const nextSettings = withLocalModelApiKeyStatus(cachedSettings, localModelApiKeyConfigured);
@@ -554,6 +567,11 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
   };
 
   const confirmSessionExpiredLogout = async () => {
+    if (sessionExpiredPromptPhaseRef.current === "logging-out") {
+      return;
+    }
+    sessionExpiredPromptPhaseRef.current = "logging-out";
+    setIsSessionExpiredLogoutPending(true);
     setIsSessionExpiredConfirmOpen(false);
     await auth.logout();
   };
@@ -1142,7 +1160,7 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
             </Text>
           </div>
           <HStack hAlign="end" gap={2}>
-            <Button label="退出登录" variant="destructive" onClick={confirmSessionExpiredLogout} />
+            <Button label="退出登录" variant="destructive" isDisabled={isSessionExpiredLogoutPending} onClick={confirmSessionExpiredLogout} />
           </HStack>
         </VStack>
       </Dialog>

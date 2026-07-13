@@ -149,6 +149,13 @@ type DataManagementSnapshot = {
   csvFileProfiles: Array<[string, CsvFileProfile]>;
 };
 type CsvSqliteColumn = DatabaseColumn & { sqliteColumnName: string; ordinalIndex: number };
+type CsvDatasetTableMeta = {
+  data_source_id: string;
+  table_id: string;
+  sqlite_table_name: string;
+  display_name: string;
+  aliases_json?: string;
+};
 
 const DEFAULT_POOL_CONFIG: PoolConfig = {
   min: 0,
@@ -252,6 +259,18 @@ function quoteIdentifier(value: string) {
   return `"${value.replaceAll('"', '""')}"`;
 }
 
+function parseAliasJson(value: string | undefined) {
+  if (!value) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string" && item.trim().length > 0) : [];
+  } catch {
+    return [];
+  }
+}
+
 function sqliteSafeName(value: string, fallback: string) {
   const normalized = value.trim().replace(/[^\da-z_]/gi, "_").replace(/_+/g, "_").replace(/^_+|_+$/g, "");
   const withPrefix = /^[a-z_]/i.test(normalized) ? normalized : `col_${normalized}`;
@@ -324,9 +343,9 @@ class CsvSqliteStore {
       this.db.prepare(createSql).run();
       this.db
         .prepare(
-          "INSERT INTO csv_dataset_tables (data_source_id, table_id, sqlite_table_name, display_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+          "INSERT INTO csv_dataset_tables (data_source_id, table_id, sqlite_table_name, display_name, aliases_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
-        .run(input.dataSourceId, input.tableId, sqliteTableName, input.tableName, input.importedAt, input.importedAt);
+        .run(input.dataSourceId, input.tableId, sqliteTableName, input.tableName, "[]", input.importedAt, input.importedAt);
 
       const insertColumn = this.db.prepare(
         [
@@ -409,9 +428,39 @@ class CsvSqliteStore {
     if (!this.db) {
       return;
     }
+    const current = this.db
+      .prepare("SELECT data_source_id, table_id, sqlite_table_name, display_name, aliases_json FROM csv_dataset_tables WHERE data_source_id = ?")
+      .get(dataSourceId) as CsvDatasetTableMeta | undefined;
+    const aliases = new Set(parseAliasJson(current?.aliases_json));
+    if (current?.display_name && current.display_name !== tableName) {
+      aliases.add(current.display_name);
+    }
+    aliases.delete(tableName);
     this.db
-      .prepare("UPDATE csv_dataset_tables SET display_name = ?, updated_at = ? WHERE data_source_id = ?")
-      .run(tableName, updatedAt, dataSourceId);
+      .prepare("UPDATE csv_dataset_tables SET display_name = ?, aliases_json = ?, updated_at = ? WHERE data_source_id = ?")
+      .run(tableName, JSON.stringify(Array.from(aliases)), updatedAt, dataSourceId);
+  }
+
+  mergeDatasetAliases(dataSourceId: string, aliasesToAdd: string[], updatedAt: string) {
+    if (!this.db || aliasesToAdd.length === 0) {
+      return;
+    }
+    const current = this.db
+      .prepare("SELECT data_source_id, table_id, sqlite_table_name, display_name, aliases_json FROM csv_dataset_tables WHERE data_source_id = ?")
+      .get(dataSourceId) as CsvDatasetTableMeta | undefined;
+    if (!current) {
+      return;
+    }
+    const aliases = new Set(parseAliasJson(current.aliases_json));
+    for (const alias of aliasesToAdd) {
+      const nextAlias = alias.trim();
+      if (nextAlias && nextAlias !== current.display_name && nextAlias !== current.table_id && nextAlias !== current.sqlite_table_name) {
+        aliases.add(nextAlias);
+      }
+    }
+    this.db
+      .prepare("UPDATE csv_dataset_tables SET aliases_json = ?, updated_at = ? WHERE data_source_id = ?")
+      .run(JSON.stringify(Array.from(aliases)), updatedAt, dataSourceId);
   }
 
   private ensureSchema() {
@@ -421,6 +470,7 @@ class CsvSqliteStore {
         table_id TEXT NOT NULL,
         sqlite_table_name TEXT NOT NULL UNIQUE,
         display_name TEXT NOT NULL,
+        aliases_json TEXT NOT NULL DEFAULT '[]',
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
@@ -441,6 +491,15 @@ class CsvSqliteStore {
         FOREIGN KEY (data_source_id) REFERENCES csv_dataset_tables(data_source_id) ON DELETE CASCADE
       );
     `);
+    this.ensureColumn("csv_dataset_tables", "aliases_json", "TEXT NOT NULL DEFAULT '[]'");
+  }
+
+  private ensureColumn(tableName: string, columnName: string, definition: string) {
+    const columns = this.db.prepare(`PRAGMA table_info(${quoteIdentifier(tableName)})`).all() as Array<{ name: string }>;
+    if (columns.some((column) => column.name === columnName)) {
+      return;
+    }
+    this.db.prepare(`ALTER TABLE ${quoteIdentifier(tableName)} ADD COLUMN ${quoteIdentifier(columnName)} ${definition}`).run();
   }
 
   private transaction(callback: () => void) {
@@ -483,6 +542,7 @@ export class DataManagementStore {
     this.csvSqliteStore = new CsvSqliteStore(csvSqlitePath);
     this.loadPersistedState();
     this.migrateSnapshotCsvRowsToSqlite();
+    this.syncCsvDatasetAliases();
   }
 
   listDataSources() {
@@ -931,6 +991,23 @@ export class DataManagementStore {
 
     if (didMigrate) {
       this.persist();
+    }
+  }
+
+  private syncCsvDatasetAliases() {
+    const updatedAt = nowIso();
+    for (const source of this.dataSources.values()) {
+      if (source.type !== "csv" || !this.csvSqliteStore.hasDataset(source.id)) {
+        continue;
+      }
+      const importedTable = (this.tables.get(source.id) ?? []).find((table) => table.type === "imported");
+      const profile = this.csvFileProfiles.get(source.id);
+      const originalFileBaseName = profile?.fileName.replace(/\.[^.]+$/, "");
+      this.csvSqliteStore.mergeDatasetAliases(
+        source.id,
+        [originalFileBaseName, importedTable?.name, source.name].filter((alias): alias is string => Boolean(alias?.trim())),
+        updatedAt,
+      );
     }
   }
 

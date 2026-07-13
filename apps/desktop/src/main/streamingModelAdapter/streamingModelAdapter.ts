@@ -17,6 +17,7 @@ import type {
 } from "./types";
 import { createId, nowIso } from "./utils";
 import { InMemoryVersionManager } from "./versionManager";
+import { parseVisualizationSpecJson } from "../../shared/visualization";
 
 export class StreamingModelAdapter {
   private readonly provider: OpenAICompatibleProvider;
@@ -266,11 +267,47 @@ export class StreamingModelAdapter {
   }
 
   private markdownParserEvent(input: StreamChatInput, parserEvent: ReturnType<StreamingMarkdownParser["flush"]>[number], traceId: string) {
+    if (parserEvent.block.type === "visualization") {
+      return this.visualizationParserEvent(input, parserEvent, traceId);
+    }
     const type =
       parserEvent.type === "start" ? "markdown-block-start" : parserEvent.type === "delta" ? "markdown-block-delta" : "markdown-block-end";
     return this.event(input, type, { block: parserEvent.block, delta: "delta" in parserEvent ? parserEvent.delta : undefined }, traceId, {
       blockId: parserEvent.block.blockId,
     });
+  }
+
+  private visualizationParserEvent(input: StreamChatInput, parserEvent: ReturnType<StreamingMarkdownParser["flush"]>[number], traceId: string) {
+    const visualizationId = parserEvent.block.blockId;
+    if (parserEvent.type === "start") {
+      return this.event(input, "visualization_start", {
+        visualizationId,
+        specVersion: "1.0",
+        language: parserEvent.block.language,
+      }, traceId, { blockId: parserEvent.block.blockId });
+    }
+    if (parserEvent.type === "delta") {
+      return this.event(input, "visualization_delta", {
+        visualizationId,
+        rawDelta: parserEvent.delta,
+        sequence: parserEvent.block.content.length,
+      }, traceId, { blockId: parserEvent.block.blockId });
+    }
+    const parsed = parseVisualizationSpecJson(parserEvent.block.content, { allowInlineData: true, inlineDataMaxRows: 200, inlineDataMaxBytes: 64 * 1024 });
+    if (!parsed.success) {
+      return this.event(input, "visualization_error", {
+        visualizationId,
+        code: parsed.error.code,
+        message: parsed.error.message,
+        details: parsed.error.details,
+        recoverable: true,
+      }, traceId, { blockId: parserEvent.block.blockId });
+    }
+    return this.event(input, "visualization_complete", {
+      visualizationId: parsed.spec.visualizationId,
+      spec: parsed.spec,
+      warnings: parsed.warnings,
+    }, traceId, { blockId: parserEvent.block.blockId });
   }
 
   private event(

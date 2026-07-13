@@ -99,7 +99,7 @@ export class StreamingMarkdownParser {
         events.push({ type: "end", block: { ...this.activeBlock } });
       }
       const language = fence[1]?.toLowerCase();
-      const type: MarkdownBlockType = language === "mermaid" ? "mermaid" : "code_block";
+      const type: MarkdownBlockType = language === "mermaid" ? "mermaid" : isVisualizationLanguage(language) ? "visualization" : "code_block";
       this.activeBlock = this.createBlock(type, "", line, language, "code");
       events.push({ type: "start", block: { ...this.activeBlock } });
       return events;
@@ -148,6 +148,10 @@ export class StreamingMarkdownParser {
       complete: false,
     };
   }
+}
+
+function isVisualizationLanguage(language: string | undefined) {
+  return Boolean(language && ["visualization", "visualization-json", "viz", "chart-spec"].includes(language));
 }
 
 export function classifyMarkdownLine(trimmedLine: string): MarkdownBlockType {

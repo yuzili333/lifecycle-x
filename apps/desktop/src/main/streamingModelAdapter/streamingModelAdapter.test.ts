@@ -34,6 +34,17 @@ describe("StreamingMarkdownParser", () => {
     expect(events.some((event) => event.type === "start" && event.block.type === "table")).toBe(true);
     expect(events.some((event) => event.type === "start" && event.block.type === "code_block" && event.block.language === "ts")).toBe(true);
   });
+
+  it("classifies visualization fences as internal visualization blocks", () => {
+    const parser = new StreamingMarkdownParser();
+    const events = [
+      ...parser.push("```visualization\n{\"specVersion\":\"1.0\"}\n```\n"),
+      ...parser.flush(),
+    ];
+
+    expect(events.some((event) => event.type === "start" && event.block.type === "visualization" && event.block.language === "visualization")).toBe(true);
+    expect(events.some((event) => event.type === "start" && event.block.type === "code_block")).toBe(false);
+  });
 });
 
 describe("ToolRegistry", () => {

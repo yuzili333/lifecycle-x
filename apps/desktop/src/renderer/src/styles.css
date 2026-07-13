@@ -768,6 +768,241 @@ button {
   white-space: pre-wrap;
 }
 
+.assistant-visualization {
+  display: grid;
+  gap: 10px;
+  box-sizing: border-box;
+  width: min(760px, 100%);
+  min-width: 0;
+  max-width: 100%;
+  border: 1px solid color-mix(in srgb, var(--workbench-foreground, #e6edf6) 14%, transparent);
+  border-radius: 8px;
+  padding: 12px;
+  overflow: hidden;
+  color: var(--workbench-foreground, #e6edf6);
+  background: color-mix(in srgb, var(--workbench-background, #0f1724) 80%, #ffffff);
+}
+
+.assistant-visualization-header {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.assistant-visualization-header > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.assistant-visualization-engine,
+.assistant-visualization-id,
+.assistant-visualization-footer span {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  border: 1px solid color-mix(in srgb, var(--workbench-foreground, #e6edf6) 12%, transparent);
+  border-radius: 999px;
+  padding: 2px 7px;
+  color: color-mix(in srgb, var(--workbench-foreground, #e6edf6) 68%, transparent);
+  background: color-mix(in srgb, var(--workbench-background, #0f1724) 74%, #ffffff);
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+.assistant-visualization-description,
+.assistant-visualization.error p {
+  margin: 0;
+  color: color-mix(in srgb, var(--workbench-foreground, #e6edf6) 70%, transparent);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.assistant-visualization-footer {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.assistant-visualization-warnings {
+  color: color-mix(in srgb, var(--workbench-foreground, #e6edf6) 70%, transparent);
+  font-size: 11px;
+}
+
+.assistant-visualization-warnings ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+}
+
+.assistant-visualization-empty {
+  display: grid;
+  min-height: 120px;
+  place-items: center;
+  color: color-mix(in srgb, var(--workbench-foreground, #e6edf6) 58%, transparent);
+  font-size: 12px;
+}
+
+.assistant-visualization-kpis {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 8px;
+}
+
+.assistant-visualization-kpi {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  border: 1px solid color-mix(in srgb, var(--workbench-foreground, #e6edf6) 12%, transparent);
+  border-radius: 7px;
+  padding: 10px;
+  background: color-mix(in srgb, var(--workbench-background, #0f1724) 74%, var(--workbench-accent, #65d6d2));
+}
+
+.assistant-visualization-kpi span {
+  overflow: hidden;
+  color: color-mix(in srgb, var(--workbench-foreground, #e6edf6) 68%, transparent);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.assistant-visualization-kpi strong {
+  overflow-wrap: anywhere;
+  color: var(--workbench-foreground, #e6edf6);
+  font-size: 22px;
+  line-height: 1.15;
+}
+
+.assistant-visualization-table-wrap {
+  max-width: 100%;
+  overflow: auto;
+}
+
+.assistant-visualization-table {
+  width: 100%;
+  min-width: 420px;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.assistant-visualization-table th,
+.assistant-visualization-table td {
+  border-bottom: 1px solid color-mix(in srgb, var(--workbench-foreground, #e6edf6) 10%, transparent);
+  padding: 6px 8px;
+  color: color-mix(in srgb, var(--workbench-foreground, #e6edf6) 82%, transparent);
+  text-align: left;
+  vertical-align: top;
+}
+
+.assistant-visualization-table th {
+  color: color-mix(in srgb, var(--workbench-foreground, #e6edf6) 64%, transparent);
+  font-weight: 600;
+}
+
+.assistant-visualization-svg-wrap {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.assistant-visualization-svg-wrap svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  min-height: 180px;
+}
+
+.assistant-visualization-svg-wrap rect {
+  fill: color-mix(in srgb, var(--workbench-accent, #65d6d2) 82%, #7aa2ff);
+}
+
+.assistant-visualization-svg-wrap line {
+  stroke: color-mix(in srgb, var(--workbench-foreground, #e6edf6) 20%, transparent);
+}
+
+.assistant-visualization-svg-wrap .line {
+  fill: none;
+  stroke: var(--workbench-accent, #65d6d2);
+  stroke-width: 3;
+}
+
+.assistant-visualization-svg-wrap .area {
+  fill: color-mix(in srgb, var(--workbench-accent, #65d6d2) 18%, transparent);
+}
+
+.assistant-visualization-svg-wrap circle {
+  fill: var(--workbench-accent, #65d6d2);
+}
+
+.assistant-visualization-network,
+.assistant-visualization-timeline {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.assistant-visualization-edge,
+.assistant-visualization-timeline-item {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+  border: 1px solid color-mix(in srgb, var(--workbench-foreground, #e6edf6) 10%, transparent);
+  border-radius: 6px;
+  padding: 7px 8px;
+  color: color-mix(in srgb, var(--workbench-foreground, #e6edf6) 80%, transparent);
+  background: color-mix(in srgb, var(--workbench-background, #0f1724) 84%, #ffffff);
+  font-size: 12px;
+}
+
+.assistant-visualization-edge span,
+.assistant-visualization-timeline-item span,
+.assistant-visualization-timeline-item strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.assistant-visualization.skeleton .assistant-skeleton-line,
+.assistant-visualization.skeleton .assistant-skeleton-chart {
+  border-radius: 999px;
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--workbench-foreground, #e6edf6) 8%, transparent),
+    color-mix(in srgb, var(--workbench-foreground, #e6edf6) 16%, transparent),
+    color-mix(in srgb, var(--workbench-foreground, #e6edf6) 8%, transparent)
+  );
+  background-size: 200% 100%;
+  animation: assistant-visualization-skeleton 1.4s ease-in-out infinite;
+}
+
+.assistant-skeleton-line.short {
+  width: 160px;
+  height: 16px;
+}
+
+.assistant-skeleton-line.chip {
+  width: 72px;
+  height: 18px;
+}
+
+.assistant-skeleton-chart {
+  height: 180px;
+  border-radius: 8px !important;
+}
+
+@keyframes assistant-visualization-skeleton {
+  from {
+    background-position: 100% 0;
+  }
+
+  to {
+    background-position: -100% 0;
+  }
+}
+
 .assistant-message-block pre {
   max-width: 100%;
   margin: 0;

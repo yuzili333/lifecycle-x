@@ -14,6 +14,7 @@ export type {
   ModelAdapterErrorCode,
   ModelStreamEvent,
   ModelStreamEventType,
+  ModelVisualizationStreamEvent,
   SerializedModelAdapterError,
   StreamChatInput,
   StreamingModelAdapterConfig,

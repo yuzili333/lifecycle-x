@@ -30,6 +30,8 @@ import { ChevronRight, CircleAlert, Clock, Copy, FileText, LoaderCircle, Maximiz
 import type { AuthFailure, AuthUser } from "./auth";
 import { useAppToast } from "./useAppToast";
 import { workbenchApi, type ApiResult, type DataSourceSummary } from "./workbenchApi";
+import { VisualizationRenderer } from "./components/VisualizationRenderer";
+import { parseVisualizationSpecJson } from "../../shared/visualization";
 import approveIcon from "./assets/approve.svg";
 import attachIcon from "./assets/attach.svg";
 import mentionIcon from "./assets/mention.svg";
@@ -188,7 +190,7 @@ function isAssistantArtifactMessage(message: AssistantMessage) {
     message.role === "assistant" &&
     message.content.trim().length > 0 &&
     message.blocks.some((block) => block.type === "markdown" && !isRenderableCodeLanguage(block.language)) &&
-    !message.blocks.some((block) => block.toolCallId)
+    !message.blocks.some((block) => block.toolCallId || block.type === "visualization")
   );
 }
 
@@ -528,6 +530,10 @@ function toolCallsFromMessage(message: AssistantMessage): ChatToolCallItem[] {
           </Text>
         ),
     }));
+}
+
+function shouldHideInlineToolResult(block: AssistantBlock) {
+  return block.toolName === "sql" && block.toolStatus === "completed";
 }
 
 export function DataAssistantWorkspace({
@@ -1200,26 +1206,39 @@ export function DataAssistantWorkspace({
 
   const markdownComponents = useMemo<MarkdownComponents>(
     () => ({
-      code: ({ code, language }: { code: string; language?: string }) => (
-        <CodeBlock
-          code={code}
-          language={normalizeCodeLanguage(language)}
-          hasCopyButton
-          hasLanguageLabel
-          isWrapped
-          width="100%"
-          size="sm"
-          className="assistant-code-block"
-          onCopy={() =>
-            toast({
-              type: "info",
-              body: "代码已复制。",
-              uniqueID: "assistant-code-copy",
-              collisionBehavior: "overwrite",
-            })
-          }
-        />
-      ),
+      code: ({ code, language }: { code: string; language?: string }) => {
+        const normalizedLanguage = (language ?? "").toLowerCase();
+        if (["visualization", "visualization-json", "viz", "chart-spec"].includes(normalizedLanguage)) {
+          const parsed = parseVisualizationSpecJson(code, { allowInlineData: true, inlineDataMaxRows: 200, inlineDataMaxBytes: 64 * 1024 });
+          return (
+            <VisualizationRenderer
+              spec={parsed.success ? parsed.spec : undefined}
+              error={parsed.success ? undefined : parsed.error}
+            />
+          );
+        }
+
+        return (
+          <CodeBlock
+            code={code}
+            language={normalizeCodeLanguage(language)}
+            hasCopyButton
+            hasLanguageLabel
+            isWrapped
+            width="100%"
+            size="sm"
+            className="assistant-code-block"
+            onCopy={() =>
+              toast({
+                type: "info",
+                body: "代码已复制。",
+                uniqueID: "assistant-code-copy",
+                collisionBehavior: "overwrite",
+              })
+            }
+          />
+        );
+      },
     }),
     [toast],
   );
@@ -1292,6 +1311,10 @@ export function DataAssistantWorkspace({
   };
 
   const renderBlock = (block: AssistantBlock, role: AssistantMessage["role"], status: AssistantMessageStatus) => {
+    if (role === "assistant" && shouldHideInlineToolResult(block)) {
+      return null;
+    }
+
     if (role === "assistant" && block.type === "markdown") {
       if (isRenderableCodeLanguage(block.language)) {
         return (
@@ -1351,6 +1374,17 @@ export function DataAssistantWorkspace({
             className="assistant-code-block"
           />
         </div>
+      );
+    }
+
+    if (role === "assistant" && block.type === "visualization") {
+      return (
+        <VisualizationRenderer
+          key={block.id}
+          spec={block.visualizationSpec}
+          error={block.visualizationError}
+          isStreaming={block.visualizationStatus === "streaming" || status === "processing"}
+        />
       );
     }
 
@@ -1544,7 +1578,6 @@ export function DataAssistantWorkspace({
                       </ChatMessageBubble>
                       {toolCalls.length > 0 && (
                         <ChatToolCalls
-                          defaultIsExpanded
                           label={`${toolCalls.length} tool calls`}
                           calls={toolCalls}
                           className="assistant-tool-call-list"

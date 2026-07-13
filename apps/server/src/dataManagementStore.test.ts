@@ -100,6 +100,67 @@ describe("DataManagementStore", () => {
     expect(renamed?.table?.name).toBe("贷后补充数据");
   });
 
+  it("keeps previous CSV table names as SQL aliases after rename", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lifecycle-x-csv-alias-"));
+    const storePath = join(tempDir, "data-management-store.json");
+    const sqlitePath = join(tempDir, "csv-data.sqlite");
+
+    try {
+      const store = new DataManagementStore(storePath, sqlitePath);
+      const upload = store.uploadCsv("loan_contracts_1000.csv", "customer_id,remark\nC01,ok\n");
+      const imported = store.importCsv(upload.file.id, "usr_admin");
+      expect(imported?.job.importedRows).toBe(1);
+
+      const renamed = imported ? store.renameCsvDataSource(imported.job.dataSourceId, "切片测试数据") : null;
+      expect(renamed?.dataSource?.name).toBe("切片测试数据");
+
+      const sqlite = new DatabaseSync(sqlitePath, { readOnly: true });
+      const meta = sqlite
+        .prepare("SELECT display_name, aliases_json FROM csv_dataset_tables WHERE data_source_id = ?")
+        .get(imported?.job.dataSourceId) as { display_name: string; aliases_json: string };
+      sqlite.close();
+
+      expect(meta.display_name).toBe("切片测试数据");
+      expect(JSON.parse(meta.aliases_json)).toContain("loan_contracts_1000");
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("backfills CSV aliases from original file name for already-renamed local data", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lifecycle-x-csv-alias-migration-"));
+    const storePath = join(tempDir, "data-management-store.json");
+    const sqlitePath = join(tempDir, "csv-data.sqlite");
+
+    try {
+      const store = new DataManagementStore(storePath, sqlitePath);
+      const upload = store.uploadCsv("loan_contracts_1000.csv", "customer_id,remark\nC01,ok\n");
+      const imported = store.importCsv(upload.file.id, "usr_admin");
+      const renamed = imported ? store.renameCsvDataSource(imported.job.dataSourceId, "切片数据文件") : null;
+      expect(renamed?.dataSource?.name).toBe("切片数据文件");
+
+      const sqlite = new DatabaseSync(sqlitePath);
+      sqlite
+        .prepare("UPDATE csv_dataset_tables SET aliases_json = '[]' WHERE data_source_id = ?")
+        .run(imported?.job.dataSourceId);
+      sqlite.close();
+
+      const restored = new DataManagementStore(storePath, sqlitePath);
+      const restoredSource = restored.listDataSources().find((source) => source.type === "csv");
+      expect(restoredSource?.name).toBe("切片数据文件");
+
+      const readonlySqlite = new DatabaseSync(sqlitePath, { readOnly: true });
+      const meta = readonlySqlite
+        .prepare("SELECT aliases_json FROM csv_dataset_tables WHERE data_source_id = ?")
+        .get(imported?.job.dataSourceId) as { aliases_json: string };
+      readonlySqlite.close();
+
+      expect(JSON.parse(meta.aliases_json)).toContain("loan_contracts_1000");
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it("restores imported CSV data from the local persistence snapshot", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lifecycle-x-data-store-"));
     const storePath = join(tempDir, "data-management-store.json");
