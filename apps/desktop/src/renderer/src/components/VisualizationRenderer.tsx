@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, type CSSProperties } from "react";
 import { Button } from "@astryxdesign/core/Button";
 import { HStack } from "@astryxdesign/core/Layout";
 import { Text } from "@astryxdesign/core/Text";
@@ -147,25 +147,71 @@ function SvgChartView({ spec, data }: { spec: VisualizationSpec; data: ResolvedV
   const xField = spec.encoding?.x ?? spec.encoding?.category ?? data.columns[0]?.name;
   const yField = spec.encoding?.y?.[0] ?? spec.encoding?.value ?? spec.measures?.[0]?.field ?? data.columns.find((column) => column.type === "number")?.name;
   const values = rows.map((row) => Number(row[yField ?? ""] ?? 0));
-  const max = Math.max(1, ...values.map((value) => Math.abs(value)));
-  const width = 640;
-  const height = Math.max(180, spec.display?.height ?? 220);
-  const plotHeight = height - 50;
-  const gap = 8;
-  const barWidth = Math.max(8, (width - gap * (rows.length + 1)) / Math.max(1, rows.length));
+  const tickValues = buildNumericTicks(values);
+  const min = tickValues[0] ?? 0;
+  const max = tickValues.at(-1) ?? 1;
+  const width = 680;
+  const height = Math.max(240, spec.display?.height ?? 260);
+  const margin = { top: 22, right: 22, bottom: 66, left: 76 };
+  const plotWidth = width - margin.left - margin.right;
+  const plotHeight = height - margin.top - margin.bottom;
+  const zeroY = scaleValue(0, min, max, margin.top, plotHeight);
+  const categoryCount = Math.max(1, rows.length);
+  const categoryStep = plotWidth / categoryCount;
+  const gap = Math.min(10, Math.max(4, categoryStep * 0.24));
+  const barWidth = Math.max(6, categoryStep - gap);
+  const xTickIndexes = buildCategoryTickIndexes(rows.length);
+  const yAxisLabel = spec.measures?.find((measure) => measure.field === yField)?.label ?? yField ?? "数值";
+  const xAxisLabel = spec.dimensions?.find((dimension) => dimension.field === xField)?.label ?? xField ?? "维度";
   const points = values.map((value, index) => {
-    const x = gap + index * (barWidth + gap) + barWidth / 2;
-    const y = 20 + plotHeight - (value / max) * plotHeight;
+    const x = margin.left + categoryStep * index + categoryStep / 2;
+    const y = scaleValue(value, min, max, margin.top, plotHeight);
     return `${round(x)},${round(y)}`;
   }).join(" ");
+  const chartStyle = {
+    "--viz-series-0": neutralDarkVisualizationTheme.colors.primary[0],
+    "--viz-series-1": neutralDarkVisualizationTheme.colors.primary[1],
+    "--viz-axis": neutralDarkVisualizationTheme.colors.textSecondary,
+    "--viz-grid": neutralDarkVisualizationTheme.colors.border,
+    "--viz-text": neutralDarkVisualizationTheme.colors.textPrimary,
+  } as CSSProperties;
 
   return (
-    <div className="assistant-visualization-svg-wrap">
+    <div className="assistant-visualization-svg-wrap" style={chartStyle}>
       <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={spec.title}>
-        <line x1="24" y1={height - 30} x2={width - 12} y2={height - 30} />
+        <g className="axis-grid">
+          {tickValues.map((tick) => {
+            const y = scaleValue(tick, min, max, margin.top, plotHeight);
+            return (
+              <g key={tick}>
+                <line x1={margin.left} y1={round(y)} x2={width - margin.right} y2={round(y)} className="grid-line" />
+                <text x={margin.left - 10} y={round(y)} textAnchor="end" dominantBaseline="middle" className="axis-tick-label">
+                  {formatCompactNumber(tick)}
+                </text>
+              </g>
+            );
+          })}
+        </g>
+        <line x1={margin.left} y1={margin.top} x2={margin.left} y2={height - margin.bottom} className="axis-line" />
+        <line x1={margin.left} y1={zeroY} x2={width - margin.right} y2={zeroY} className="axis-line zero-line" />
+        <line x1={margin.left} y1={height - margin.bottom} x2={width - margin.right} y2={height - margin.bottom} className="axis-line" />
+        <text x={margin.left} y={height - 14} className="axis-title">{xAxisLabel}</text>
+        <text x={16} y={margin.top} className="axis-title" transform={`rotate(-90 16 ${margin.top})`}>{yAxisLabel}</text>
+        {xTickIndexes.map((index) => {
+          const row = rows[index];
+          const x = margin.left + categoryStep * index + categoryStep / 2;
+          return (
+            <g key={index}>
+              <line x1={round(x)} y1={height - margin.bottom} x2={round(x)} y2={height - margin.bottom + 4} className="axis-line" />
+              <text x={round(x)} y={height - margin.bottom + 18} textAnchor="middle" className="axis-tick-label">
+                {truncateAxisLabel(formatCell(row?.[xField ?? ""]), rows.length)}
+              </text>
+            </g>
+          );
+        })}
         {spec.type === "line" || spec.type === "area" || spec.type === "bar_line_combo" ? (
           <>
-            {spec.type === "area" && <polygon points={`24,${height - 30} ${points} ${width - 20},${height - 30}`} className="area" />}
+            {spec.type === "area" && <polygon points={`${margin.left},${round(zeroY)} ${points} ${width - margin.right},${round(zeroY)}`} className="area" />}
             <polyline points={points} className="line" />
             {points.split(" ").map((point, index) => {
               const [x, y] = point.split(",");
@@ -175,12 +221,13 @@ function SvgChartView({ spec, data }: { spec: VisualizationSpec; data: ResolvedV
         ) : (
           rows.map((row, index) => {
             const value = values[index] ?? 0;
-            const barHeight = Math.max(2, (Math.abs(value) / max) * plotHeight);
-            const x = gap + index * (barWidth + gap);
-            const y = 20 + plotHeight - barHeight;
+            const valueY = scaleValue(value, min, max, margin.top, plotHeight);
+            const barHeight = Math.max(2, Math.abs(zeroY - valueY));
+            const x = margin.left + categoryStep * index + (categoryStep - barWidth) / 2;
+            const y = value >= 0 ? valueY : zeroY;
             return (
               <g key={index}>
-                <rect x={round(x)} y={round(y)} width={round(barWidth)} height={round(barHeight)} />
+                <rect x={round(x)} y={round(y)} width={round(barWidth)} height={round(barHeight)} style={{ "--viz-bar-index": index } as CSSProperties} />
                 <title>{`${formatCell(row[xField ?? ""])}: ${formatCell(value)}`}</title>
               </g>
             );
@@ -189,6 +236,55 @@ function SvgChartView({ spec, data }: { spec: VisualizationSpec; data: ResolvedV
       </svg>
     </div>
   );
+}
+
+function scaleValue(value: number, min: number, max: number, top: number, plotHeight: number) {
+  if (max === min) {
+    return top + plotHeight / 2;
+  }
+  return top + plotHeight - ((value - min) / (max - min)) * plotHeight;
+}
+
+function buildNumericTicks(values: number[], tickCount = 5) {
+  const finiteValues = values.filter(Number.isFinite);
+  const rawMin = Math.min(0, ...finiteValues);
+  const rawMax = Math.max(0, ...finiteValues);
+  if (!Number.isFinite(rawMin) || !Number.isFinite(rawMax) || rawMin === rawMax) {
+    return [0, 1, 2, 3, 4];
+  }
+  const span = rawMax - rawMin;
+  const step = niceStep(span / Math.max(1, tickCount - 1));
+  const min = Math.floor(rawMin / step) * step;
+  const max = Math.ceil(rawMax / step) * step;
+  const ticks: number[] = [];
+  for (let value = min; value <= max + step * 0.5; value += step) {
+    ticks.push(round(value));
+  }
+  return ticks.length >= 2 ? ticks : [min, max];
+}
+
+function niceStep(value: number) {
+  const exponent = Math.floor(Math.log10(value));
+  const magnitude = 10 ** exponent;
+  const normalized = value / magnitude;
+  const nice = normalized <= 1 ? 1 : normalized <= 2 ? 2 : normalized <= 5 ? 5 : 10;
+  return nice * magnitude;
+}
+
+function buildCategoryTickIndexes(length: number) {
+  if (length <= 0) {
+    return [];
+  }
+  const maxTicks = length <= 8 ? length : 8;
+  const step = Math.max(1, Math.ceil(length / maxTicks));
+  const indexes = Array.from({ length }, (_item, index) => index).filter((index) => index % step === 0);
+  const lastIndex = length - 1;
+  return indexes.includes(lastIndex) ? indexes : [...indexes, lastIndex];
+}
+
+function truncateAxisLabel(value: string, rowCount: number) {
+  const maxLength = rowCount > 12 ? 5 : rowCount > 8 ? 7 : 10;
+  return value.length > maxLength ? `${value.slice(0, maxLength)}...` : value;
 }
 
 function NetworkView({ spec, data }: { spec: VisualizationSpec; data: ResolvedVisualizationData }) {
@@ -285,6 +381,13 @@ function formatCell(value: unknown) {
     return new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 4 }).format(value);
   }
   return String(value);
+}
+
+function formatCompactNumber(value: number) {
+  return new Intl.NumberFormat("zh-CN", {
+    notation: Math.abs(value) >= 10_000 ? "compact" : "standard",
+    maximumFractionDigits: 2,
+  }).format(value);
 }
 
 function round(value: number) {

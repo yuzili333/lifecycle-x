@@ -16,6 +16,10 @@ type RefreshSessionOptions = {
   clearOnFailure?: boolean;
 };
 
+type LogoutOptions = {
+  remote?: boolean;
+};
+
 export function useAuthStore() {
   const [state, setState] = useState<AuthState>({
     status: "checking",
@@ -88,9 +92,7 @@ export function useAuthStore() {
     [applySuccess],
   );
 
-  const logout = useCallback(async () => {
-    const refreshToken = (await window.lifecycleX?.auth.getRefreshToken()) ?? null;
-    await authApi.logout(refreshToken ?? undefined);
+  const clearLocalAuth = useCallback(async (lastError: AuthFailure | null = null) => {
     await window.lifecycleX?.auth.clearRefreshToken();
     setState({
       status: "anonymous",
@@ -98,23 +100,25 @@ export function useAuthStore() {
       user: null,
       permissions: [],
       expiresAt: null,
-      lastError: null,
+      lastError,
     });
   }, []);
+
+  const logout = useCallback(async (options: LogoutOptions = {}) => {
+    const shouldLogoutRemote = options.remote ?? true;
+    if (shouldLogoutRemote) {
+      const refreshToken = (await window.lifecycleX?.auth.getRefreshToken()) ?? null;
+      await authApi.logout(refreshToken ?? undefined);
+    }
+    await clearLocalAuth();
+  }, [clearLocalAuth]);
 
   const refreshSession = useCallback(async (options: RefreshSessionOptions = {}): Promise<AuthSuccess | false> => {
     const clearOnFailure = options.clearOnFailure ?? true;
     const refreshToken = (await window.lifecycleX?.auth.getRefreshToken()) ?? null;
     if (!refreshToken) {
       if (clearOnFailure) {
-        setState({
-          status: "anonymous",
-          accessToken: null,
-          user: null,
-          permissions: [],
-          expiresAt: null,
-          lastError: null,
-        });
+        await clearLocalAuth();
       }
       return false;
     }
@@ -126,18 +130,10 @@ export function useAuthStore() {
     }
 
     if (clearOnFailure) {
-      await window.lifecycleX?.auth.clearRefreshToken();
-      setState({
-        status: "anonymous",
-        accessToken: null,
-        user: null,
-        permissions: [],
-        expiresAt: null,
-        lastError: result,
-      });
+      await clearLocalAuth(result);
     }
     return false;
-  }, [applySuccess]);
+  }, [applySuccess, clearLocalAuth]);
 
   const updateUser = useCallback((userPatch: Partial<AuthUser>) => {
     setState((current) => ({

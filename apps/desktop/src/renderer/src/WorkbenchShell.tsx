@@ -573,7 +573,7 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
     sessionExpiredPromptPhaseRef.current = "logging-out";
     setIsSessionExpiredLogoutPending(true);
     setIsSessionExpiredConfirmOpen(false);
-    await auth.logout();
+    await auth.logout({ remote: false });
   };
 
   const handleAvatarSave = async () => {

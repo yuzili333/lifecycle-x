@@ -916,25 +916,57 @@ button {
 }
 
 .assistant-visualization-svg-wrap rect {
-  fill: color-mix(in srgb, var(--workbench-accent, #65d6d2) 82%, #7aa2ff);
+  fill: color-mix(in srgb, var(--workbench-accent, var(--viz-series-0, #fafafa)) 82%, var(--workbench-background, #171717));
+  stroke: color-mix(in srgb, var(--workbench-accent, var(--viz-series-0, #fafafa)) 34%, transparent);
+  stroke-width: 1;
 }
 
-.assistant-visualization-svg-wrap line {
-  stroke: color-mix(in srgb, var(--workbench-foreground, #e6edf6) 20%, transparent);
+.assistant-visualization-svg-wrap .axis-line {
+  stroke: color-mix(in srgb, var(--workbench-foreground, var(--viz-axis, #a3a3a3)) 34%, transparent);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+
+.assistant-visualization-svg-wrap .zero-line {
+  stroke: color-mix(in srgb, var(--workbench-foreground, var(--viz-axis, #a3a3a3)) 48%, transparent);
+}
+
+.assistant-visualization-svg-wrap .grid-line {
+  stroke: color-mix(in srgb, var(--workbench-foreground, var(--viz-grid, rgba(250, 250, 250, 0.14))) 12%, transparent);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+
+.assistant-visualization-svg-wrap .axis-tick-label,
+.assistant-visualization-svg-wrap .axis-title {
+  fill: color-mix(in srgb, var(--workbench-foreground, var(--viz-text, #fafafa)) 62%, transparent);
+  font-family: var(--workbench-font, Inter, PingFang SC, Microsoft YaHei, system-ui, sans-serif);
+  font-size: 11px;
+  line-height: 1;
+}
+
+.assistant-visualization-svg-wrap .axis-title {
+  fill: color-mix(in srgb, var(--workbench-foreground, var(--viz-text, #fafafa)) 72%, transparent);
+  font-weight: 600;
 }
 
 .assistant-visualization-svg-wrap .line {
   fill: none;
-  stroke: var(--workbench-accent, #65d6d2);
+  stroke: var(--workbench-accent, var(--viz-series-0, #fafafa));
   stroke-width: 3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
 }
 
 .assistant-visualization-svg-wrap .area {
-  fill: color-mix(in srgb, var(--workbench-accent, #65d6d2) 18%, transparent);
+  fill: color-mix(in srgb, var(--workbench-accent, var(--viz-series-0, #fafafa)) 18%, transparent);
 }
 
 .assistant-visualization-svg-wrap circle {
-  fill: var(--workbench-accent, #65d6d2);
+  fill: var(--workbench-accent, var(--viz-series-0, #fafafa));
+  stroke: var(--workbench-background, #171717);
+  stroke-width: 1.5;
 }
 
 .assistant-visualization-network,
