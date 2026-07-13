@@ -263,6 +263,15 @@ ipcMain.handle("assistant:message:cancel", (_event, messageId: string) => {
 ipcMain.handle("assistant:tool:approve", (_event, userId: string, toolCallId: string, approved: boolean) =>
   getAssistantRuntime().approveTool(userId, toolCallId, approved),
 );
+ipcMain.handle("assistant:workflow:context", (_event, userId: string, conversationId: string) =>
+  getAssistantRuntime().getWorkflowContext(userId, conversationId),
+);
+ipcMain.handle("assistant:workflow:confirm-dataset", (_event, userId: string, conversationId: string, datasetId?: string) =>
+  getAssistantRuntime().confirmWorkflowDataset(userId, conversationId, datasetId),
+);
+ipcMain.handle("assistant:workflow:reject-dataset", (_event, userId: string, conversationId: string, datasetId: string, reason?: string) =>
+  getAssistantRuntime().rejectWorkflowDataset(userId, conversationId, datasetId, reason),
+);
 
 app.whenReady().then(() => {
   app.setAppUserModelId("com.lifecycle-x.desktop");

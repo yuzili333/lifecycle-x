@@ -595,6 +595,14 @@ button {
   background: color-mix(in srgb, var(--workbench-background, #0f1724) 88%, #ffffff);
 }
 
+.assistant-chat-main {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
 .assistant-chat-layout {
   --assistant-chat-inline-padding: 64px;
   flex: 1 1 auto;
@@ -805,8 +813,23 @@ button {
   color: color-mix(in srgb, var(--workbench-accent, #65d6d2) 78%, #ffffff);
 }
 
+.assistant-message-status svg,
+.assistant-message-action svg {
+  width: 12px;
+  height: 12px;
+}
+
 .assistant-message-status.failed {
   color: #ff8e8e;
+}
+
+.assistant-message-duration {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  color: color-mix(in srgb, var(--workbench-foreground, #e6edf6) 54%, transparent);
+  font-size: 11px;
+  line-height: 1;
 }
 
 .assistant-message-status-spinner {

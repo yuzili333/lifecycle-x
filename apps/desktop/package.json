@@ -26,7 +26,7 @@
     "dev": "ELECTRON_EXEC_PATH=./.electron/dist/electron node ./node_modules/electron-vite/bin/electron-vite.js dev",
     "native:rebuild": "node ./scripts/rebuild-native-deps.mjs",
     "preview": "ELECTRON_EXEC_PATH=./.electron/dist/electron node ./node_modules/electron-vite/bin/electron-vite.js preview",
-    "test": "node ../../node_modules/vitest/vitest.mjs run src/main/streamingModelAdapter",
+    "test": "node ../../node_modules/vitest/vitest.mjs run src/main",
     "typecheck": "tsc --noEmit",
     "xds": "node node_modules/@astryxdesign/cli/bin/astryx.mjs"
   },

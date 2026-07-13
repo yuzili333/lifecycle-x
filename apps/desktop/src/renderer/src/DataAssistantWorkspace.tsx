@@ -42,6 +42,7 @@ import type {
   AssistantSkill,
   AssistantStreamEvent,
 } from "../../main/assistantRuntime";
+import type { WorkflowContextSummary } from "../../main/workflowRuntime";
 
 type RequestWithRefresh = <T extends { success: true }>(
   call: (accessToken: string) => Promise<ApiResult<T>>,
@@ -196,6 +197,39 @@ function dataSourceButtonLabel(dataSource?: DataSourceSummary) {
     return "数据源";
   }
   return dataSource.type === "csv" ? dataSource.name : dataSource.database;
+}
+
+function isPythonApprovalPrompt(value: string) {
+  return /^(确认|批准|同意|执行|开始执行|确认执行)\s*(执行)?\s*python\s*$/i.test(value.trim());
+}
+
+function pendingPythonToolCallId(messages: AssistantMessage[]) {
+  for (const message of messages.slice().reverse()) {
+    const block = message.blocks
+      .slice()
+      .reverse()
+      .find((item) => item.toolCallId && item.toolName === "python" && item.toolStatus === "pending_approval");
+    if (block?.toolCallId) {
+      return block.toolCallId;
+    }
+  }
+  return null;
+}
+
+function formatMessageDuration(message: AssistantMessage, nowMs: number) {
+  if (message.role !== "assistant" || message.status === "draft") {
+    return null;
+  }
+  const startedAt = Date.parse(message.createdAt);
+  const endedAt = message.status === "receiving" || message.status === "processing" ? nowMs : Date.parse(message.updatedAt);
+  if (!Number.isFinite(startedAt) || !Number.isFinite(endedAt) || endedAt < startedAt) {
+    return null;
+  }
+  const totalSeconds = Math.max(0, Math.round((endedAt - startedAt) / 1000));
+  if (totalSeconds >= 60) {
+    return `${Math.floor(totalSeconds / 60)}m ${totalSeconds % 60}s`;
+  }
+  return `${totalSeconds}s`;
 }
 
 function AssistantActionIcon({ src }: { src: string }) {
@@ -507,6 +541,7 @@ export function DataAssistantWorkspace({
   const toast = useAppToast();
   const [conversations, setConversations] = useState<AssistantConversation[]>([]);
   const [messagesByConversation, setMessagesByConversation] = useState<Record<string, AssistantMessage[]>>({});
+  const [workflowContextByConversation, setWorkflowContextByConversation] = useState<Record<string, WorkflowContextSummary | null>>({});
   const [activeConversationId, setActiveConversationId] = useState("");
   const [composerValue, setComposerValue] = useState("");
   const [dataSources, setDataSources] = useState<DataSourceSummary[]>([]);
@@ -515,6 +550,7 @@ export function DataAssistantWorkspace({
   const [approvalMode, setApprovalMode] = useState<AssistantApprovalMode>("request_approval");
   const [isLoadingDataSources, setIsLoadingDataSources] = useState(false);
   const [isLoadingConversations, setIsLoadingConversations] = useState(false);
+  const [metadataNow, setMetadataNow] = useState(() => Date.now());
   const [editingConversation, setEditingConversation] = useState<AssistantConversation | null>(null);
   const [editTitleDraft, setEditTitleDraft] = useState("");
   const [deletingConversation, setDeletingConversation] = useState<AssistantConversation | null>(null);
@@ -532,6 +568,7 @@ export function DataAssistantWorkspace({
   );
 
   const activeMessages = activeConversation ? messagesByConversation[activeConversation.id] ?? [] : [];
+  const activePendingPythonToolCallId = useMemo(() => pendingPythonToolCallId(activeMessages), [activeMessages]);
   const landingUserName = user?.displayName?.trim() || user?.username || "Yuzili";
   const activeArtifactMessage = useMemo(
     () =>
@@ -593,6 +630,8 @@ export function DataAssistantWorkspace({
       }
       const messages = await window.lifecycleX.assistant.listMessages(user.id, conversationId);
       setMessagesByConversation((current) => ({ ...current, [conversationId]: messages }));
+      const context = await window.lifecycleX.assistant.getWorkflowContext(user.id, conversationId);
+      setWorkflowContextByConversation((current) => ({ ...current, [conversationId]: context }));
     },
     [user?.id],
   );
@@ -665,6 +704,10 @@ export function DataAssistantWorkspace({
         upsertMessage(event.conversationId, event.message);
         return;
       }
+      if (event.type === "workflow") {
+        setWorkflowContextByConversation((current) => ({ ...current, [event.conversationId]: event.context }));
+        return;
+      }
       if (event.type === "error") {
         toast({
           type: "error",
@@ -722,6 +765,14 @@ export function DataAssistantWorkspace({
     writeArtifactWindowState(artifactWindow);
   }, [artifactWindow]);
 
+  useEffect(() => {
+    if (!isStreaming) {
+      return undefined;
+    }
+    const timer = window.setInterval(() => setMetadataNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [isStreaming]);
+
   const startConversation = async () => {
     if (!user?.id || !window.lifecycleX?.assistant) {
       return;
@@ -732,6 +783,7 @@ export function DataAssistantWorkspace({
     const conversation = await window.lifecycleX.assistant.createConversation(user.id);
     setConversations((current) => mergeConversation(current, conversation));
     setMessagesByConversation((current) => ({ ...current, [conversation.id]: [] }));
+    setWorkflowContextByConversation((current) => ({ ...current, [conversation.id]: null }));
     setActiveConversationId(conversation.id);
     setComposerValue("");
   };
@@ -801,6 +853,11 @@ export function DataAssistantWorkspace({
         return remaining;
       });
       setMessagesByConversation((current) => {
+        const next = { ...current };
+        delete next[deletingConversation.id];
+        return next;
+      });
+      setWorkflowContextByConversation((current) => {
         const next = { ...current };
         delete next[deletingConversation.id];
         return next;
@@ -966,6 +1023,7 @@ export function DataAssistantWorkspace({
       const showFailed = message.status === "error";
       const showStatus = isThinking || showFailed || message.status === "sending" || message.status === "awaiting_approval" || message.status === "stopped";
       const showCopy = !(message.role === "assistant" && isThinking);
+      const duration = formatMessageDuration(message, metadataNow);
 
       return (
         <ChatMessageMetadata
@@ -974,6 +1032,11 @@ export function DataAssistantWorkspace({
             <div className="assistant-message-metadata-footer">
               {showStatus && (
                 <MetadataStatusIcon status={message.status} isThinking={isThinking} />
+              )}
+              {duration && (
+                <span className="assistant-message-duration" title="大模型推理耗时">
+                  {duration}
+                </span>
               )}
               <div className="assistant-message-actions">
                 {showCopy && (
@@ -991,13 +1054,58 @@ export function DataAssistantWorkspace({
         />
       );
     },
-    [copyMessage, editUserMessage, retryAssistantMessage],
+    [copyMessage, editUserMessage, metadataNow, retryAssistantMessage],
+  );
+
+  const approveTool = useCallback(
+    async (toolCallId: string, approved: boolean) => {
+      if (!user?.id || !window.lifecycleX?.assistant) {
+        return;
+      }
+      try {
+        const result = await window.lifecycleX.assistant.approveTool(user.id, toolCallId, approved);
+        upsertMessage(result.message.conversationId, result.message);
+        if (activeConversation?.id && window.lifecycleX.assistant) {
+          const context = await window.lifecycleX.assistant.getWorkflowContext(user.id, activeConversation.id);
+          setWorkflowContextByConversation((current) => ({ ...current, [activeConversation.id]: context }));
+        }
+      } catch (error) {
+        toast({
+          type: "error",
+          body: error instanceof Error ? error.message : "工具审批失败。",
+          uniqueID: "assistant-tool-approval-error",
+          collisionBehavior: "overwrite",
+        });
+      }
+    },
+    [activeConversation?.id, toast, upsertMessage, user?.id],
+  );
+
+  const approvePendingPython = useCallback(
+    async (approved: boolean) => {
+      if (!activePendingPythonToolCallId) {
+        toast({
+          type: "error",
+          body: "当前没有待审批的 Python 工具调用。",
+          uniqueID: "assistant-python-approval-missing",
+          collisionBehavior: "overwrite",
+        });
+        return;
+      }
+      await approveTool(activePendingPythonToolCallId, approved);
+    },
+    [activePendingPythonToolCallId, approveTool, toast],
   );
 
   const handleSubmit = useCallback(
     async (value: string) => {
       const prompt = value.trim();
       if (!prompt || isStreaming || !user?.id) {
+        return;
+      }
+      if (activePendingPythonToolCallId && isPythonApprovalPrompt(prompt)) {
+        setComposerValue("");
+        await approvePendingPython(true);
         return;
       }
       let optimisticConversationId: string | null = null;
@@ -1072,7 +1180,9 @@ export function DataAssistantWorkspace({
     },
     [
       activeConversation,
+      activePendingPythonToolCallId,
       approvalMode,
+      approvePendingPython,
       isModelConfigured,
       isStreaming,
       loadSchemaContextMarkdown,
@@ -1086,26 +1196,6 @@ export function DataAssistantWorkspace({
       upsertMessage,
       user?.id,
     ],
-  );
-
-  const approveTool = useCallback(
-    async (toolCallId: string, approved: boolean) => {
-      if (!user?.id || !window.lifecycleX?.assistant) {
-        return;
-      }
-      try {
-        const result = await window.lifecycleX.assistant.approveTool(user.id, toolCallId, approved);
-        upsertMessage(result.message.conversationId, result.message);
-      } catch (error) {
-        toast({
-          type: "error",
-          body: error instanceof Error ? error.message : "工具审批失败。",
-          uniqueID: "assistant-tool-approval-error",
-          collisionBehavior: "overwrite",
-        });
-      }
-    },
-    [toast, upsertMessage, user?.id],
   );
 
   const markdownComponents = useMemo<MarkdownComponents>(
@@ -1314,6 +1404,10 @@ export function DataAssistantWorkspace({
                   setActiveConversationId(conversation.id);
                   if (!messagesByConversation[conversation.id]) {
                     void loadConversationMessages(conversation.id);
+                  } else if (!(conversation.id in workflowContextByConversation) && user?.id && window.lifecycleX?.assistant) {
+                    void window.lifecycleX.assistant.getWorkflowContext(user.id, conversation.id).then((context) => {
+                      setWorkflowContextByConversation((current) => ({ ...current, [conversation.id]: context }));
+                    });
                   }
                 }}
               >
@@ -1344,123 +1438,125 @@ export function DataAssistantWorkspace({
       </aside>
 
       <div className={`assistant-chat-shell ${activeArtifactMessage ? "with-artifact" : ""}`}>
-        <ChatLayout
-          density="compact"
-          className="assistant-chat-layout"
-          emptyState={<AssistantLanding userName={landingUserName} />}
-          composer={
-            <div className="assistant-composer-shell">
-              <ChatComposer
-                value={composerValue}
-                onChange={setComposerValue}
-                onSubmit={handleSubmit}
-                onStop={stopStreaming}
-                isStopShown={isStreaming}
-                placeholder="问问数据助手"
-                density="compact"
-                footerActions={
-                  <div className="assistant-composer-actions" aria-label="数据助手工具栏">
-                    <DropdownMenu
-                      hasChevron={false}
-                      placement="above"
-                      menuWidth={240}
-                      button={{
-                        label: dataSourceButtonLabel(selectedDataSource),
-                        variant: "ghost",
-                        size: "sm",
-                        className: "assistant-composer-action-button",
-                        icon: <AssistantActionIcon src={attachIcon} />,
-                        tooltip: "数据库",
-                        isLoading: isLoadingDataSources,
-                      }}
-                      items={dataSourceMenuItems}
-                    />
-                    <DropdownMenu
-                      hasChevron={false}
-                      placement="above"
-                      menuWidth={190}
-                      button={{
-                        label: skillOptions.find((item) => item.value === selectedSkill)?.label ?? "Skill",
-                        variant: "ghost",
-                        size: "sm",
-                        className: "assistant-composer-action-button",
-                        icon: <AssistantActionIcon src={mentionIcon} />,
-                        tooltip: "Skill",
-                      }}
-                      items={skillMenuItems}
-                    />
-                    <DropdownMenu
-                      hasChevron={false}
-                      placement="above"
-                      menuWidth={190}
-                      button={{
-                        label: approvalOptions.find((item) => item.value === approvalMode)?.label ?? "请求批准",
-                        variant: "ghost",
-                        size: "sm",
-                        className: "assistant-composer-action-button",
-                        icon: <AssistantActionIcon src={approveIcon} />,
-                        tooltip: "审批权限",
-                      }}
-                      items={approvalMenuItems}
-                    />
-                  </div>
-                }
-              />
-            </div>
-          }
-        >
-          {activeMessages.length > 0 ? (
-            <ChatMessageList isStreaming={isStreaming} density="compact">
-              {activeMessages.map((message) => {
-                const sender = message.role === "user" ? "user" : "assistant";
-                const isArtifactMessage = isAssistantArtifactMessage(message);
-                const toolCalls = sender === "assistant" ? toolCallsFromMessage(message) : [];
-                return (
-                  <ChatMessage
-                    key={message.id}
-                    sender={sender}
-                    avatar={
-                      sender === "user" ? (
-                        <Avatar src={user?.avatarUrl} name={user?.displayName ?? "用户"} size={32} />
-                      ) : (
-                        <span className="assistant-bot-avatar">AI</span>
-                      )
-                    }
-                  >
-                    {sender === "user" && renderUserContext(message)}
-                    <ChatMessageBubble
-                      variant={sender === "assistant" ? "ghost" : "filled"}
-                      metadata={renderMessageMetadata(message)}
-                    >
-                      {sender === "user" ? (
-                        renderUserMessageBody(message)
-                      ) : isArtifactMessage ? (
-                        renderArtifactCard(message)
-                      ) : message.blocks.length > 0 ? (
-                        <div className="assistant-message-blocks">
-                          {message.blocks.map((block) => renderBlock(block, message.role, message.status))}
-                        </div>
-                      ) : (
-                        <span className="assistant-stream-cursor">
-                          <Icon icon={LoaderCircle} size="xsm" color="inherit" className="assistant-message-status-spinner" />
-                          <span>思考中...</span>
-                        </span>
-                      )}
-                    </ChatMessageBubble>
-                    {toolCalls.length > 0 && (
-                      <ChatToolCalls
-                        defaultIsExpanded
-                        label={`${toolCalls.length} tool calls`}
-                        calls={toolCalls}
-                        className="assistant-tool-call-list"
+        <div className="assistant-chat-main">
+          <ChatLayout
+            density="compact"
+            className="assistant-chat-layout"
+            emptyState={<AssistantLanding userName={landingUserName} />}
+            composer={
+              <div className="assistant-composer-shell">
+                <ChatComposer
+                  value={composerValue}
+                  onChange={setComposerValue}
+                  onSubmit={handleSubmit}
+                  onStop={stopStreaming}
+                  isStopShown={isStreaming}
+                  placeholder="问问数据助手"
+                  density="compact"
+                  footerActions={
+                    <div className="assistant-composer-actions" aria-label="数据助手工具栏">
+                      <DropdownMenu
+                        hasChevron={false}
+                        placement="above"
+                        menuWidth={240}
+                        button={{
+                          label: dataSourceButtonLabel(selectedDataSource),
+                          variant: "ghost",
+                          size: "sm",
+                          className: "assistant-composer-action-button",
+                          icon: <AssistantActionIcon src={attachIcon} />,
+                          tooltip: "数据库",
+                          isLoading: isLoadingDataSources,
+                        }}
+                        items={dataSourceMenuItems}
                       />
-                    )}
-                  </ChatMessage>
-                );
-              })}
-            </ChatMessageList>
-          ) : []}
-        </ChatLayout>
+                      <DropdownMenu
+                        hasChevron={false}
+                        placement="above"
+                        menuWidth={190}
+                        button={{
+                          label: skillOptions.find((item) => item.value === selectedSkill)?.label ?? "Skill",
+                          variant: "ghost",
+                          size: "sm",
+                          className: "assistant-composer-action-button",
+                          icon: <AssistantActionIcon src={mentionIcon} />,
+                          tooltip: "Skill",
+                        }}
+                        items={skillMenuItems}
+                      />
+                      <DropdownMenu
+                        hasChevron={false}
+                        placement="above"
+                        menuWidth={190}
+                        button={{
+                          label: approvalOptions.find((item) => item.value === approvalMode)?.label ?? "请求批准",
+                          variant: "ghost",
+                          size: "sm",
+                          className: "assistant-composer-action-button",
+                          icon: <AssistantActionIcon src={approveIcon} />,
+                          tooltip: "审批权限",
+                        }}
+                        items={approvalMenuItems}
+                      />
+                    </div>
+                  }
+                />
+              </div>
+            }
+          >
+            {activeMessages.length > 0 ? (
+              <ChatMessageList isStreaming={isStreaming} density="compact">
+                {activeMessages.map((message) => {
+                  const sender = message.role === "user" ? "user" : "assistant";
+                  const isArtifactMessage = isAssistantArtifactMessage(message);
+                  const toolCalls = sender === "assistant" ? toolCallsFromMessage(message) : [];
+                  return (
+                    <ChatMessage
+                      key={message.id}
+                      sender={sender}
+                      avatar={
+                        sender === "user" ? (
+                          <Avatar src={user?.avatarUrl} name={user?.displayName ?? "用户"} size={32} />
+                        ) : (
+                          <span className="assistant-bot-avatar">AI</span>
+                        )
+                      }
+                    >
+                      {sender === "user" && renderUserContext(message)}
+                      <ChatMessageBubble
+                        variant={sender === "assistant" ? "ghost" : "filled"}
+                        metadata={renderMessageMetadata(message)}
+                      >
+                        {sender === "user" ? (
+                          renderUserMessageBody(message)
+                        ) : isArtifactMessage ? (
+                          renderArtifactCard(message)
+                        ) : message.blocks.length > 0 ? (
+                          <div className="assistant-message-blocks">
+                            {message.blocks.map((block) => renderBlock(block, message.role, message.status))}
+                          </div>
+                        ) : (
+                          <span className="assistant-stream-cursor">
+                            <Icon icon={LoaderCircle} size="xsm" color="inherit" className="assistant-message-status-spinner" />
+                            <span>思考中...</span>
+                          </span>
+                        )}
+                      </ChatMessageBubble>
+                      {toolCalls.length > 0 && (
+                        <ChatToolCalls
+                          defaultIsExpanded
+                          label={`${toolCalls.length} tool calls`}
+                          calls={toolCalls}
+                          className="assistant-tool-call-list"
+                        />
+                      )}
+                    </ChatMessage>
+                  );
+                })}
+              </ChatMessageList>
+            ) : []}
+          </ChatLayout>
+        </div>
         {activeArtifactMessage && (
           <>
             <ResizeHandle

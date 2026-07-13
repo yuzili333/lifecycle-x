@@ -4,6 +4,21 @@ import { createRequire } from "node:module";
 import { appendFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
+import {
+  AuditedWorkflowStateStore,
+  SQLiteDatasetStateManager,
+  SQLiteMaterializer,
+  SQLiteWorkflowAuditLogger,
+  SQLiteWorkflowMemoryBridge,
+  SQLiteWorkflowStateStore,
+  TempTableRegistry,
+  WorkflowContextBuilder,
+  type WorkflowContextSummary,
+  type WorkflowDatasetRef,
+  type WorkflowSession,
+  type WorkflowStateStore,
+} from "./workflowRuntime";
+import { rewriteCompoundOrderByForSqlite } from "./sqliteSqlRewrite";
 
 const require = createRequire(import.meta.url);
 const Database = require("better-sqlite3");
@@ -115,6 +130,7 @@ export type AssistantStreamEvent =
   | { type: "message"; conversationId: string; message: AssistantMessage }
   | { type: "message-delta"; conversationId: string; messageId: string; content: string; blocks: AssistantBlock[]; status: AssistantMessageStatus }
   | { type: "tool"; conversationId: string; toolCall: AssistantToolCall; message: AssistantMessage }
+  | { type: "workflow"; conversationId: string; context: WorkflowContextSummary }
   | { type: "error"; conversationId: string; messageId?: string; message: string; traceId: string };
 
 export type AssistantSendResult = {
@@ -160,6 +176,8 @@ const SILICONFLOW_CHAT_COMPLETIONS_URL = "https://api.siliconflow.cn/v1/chat/com
 const MAX_STORED_MESSAGES_FOR_CONTEXT = 12;
 const MAX_STREAM_CHARS = 120_000;
 const PYTHON_TIMEOUT_MS = 5_000;
+const MAX_TOOL_CONTEXT_CHARS = 30_000;
+const WORKFLOW_DATASET_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 function nowIso() {
   return new Date().toISOString();
@@ -250,6 +268,66 @@ function hasRenderableNonToolContent(message: AssistantMessage) {
   return message.blocks.some((block) => !block.toolCallId && block.content.trim().length > 0);
 }
 
+function shouldAnalyzePriorSqlResult(prompt: string) {
+  return (
+    /(sql\s*查询结果|查询结果数据|查询结果|上一轮|上一次|工具调用结果|结果数据)/i.test(prompt) &&
+    /(统计|占比|对比|排名|前三|top\s*3|报告|分析)/i.test(prompt)
+  );
+}
+
+function shouldAutoStartPythonReport(prompt: string) {
+  return /(输出|生成|形成|给出|撰写).{0,12}(分析)?报告|分析报告|报告输出/i.test(prompt) || (/分析/i.test(prompt) && /(占比|比例|分布|统计|对比)/i.test(prompt));
+}
+
+function parseSqlToolRows(result: string | undefined) {
+  if (!result) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(result) as { rows?: Array<Record<string, unknown>>; previewRows?: Array<Record<string, unknown>> };
+    return Array.isArray(parsed.rows) ? parsed.rows : Array.isArray(parsed.previewRows) ? parsed.previewRows : [];
+  } catch {
+    return [];
+  }
+}
+
+function parseSqlToolPreviewRows(result: string | undefined) {
+  if (!result) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(result) as { rows?: Array<Record<string, unknown>>; previewRows?: Array<Record<string, unknown>> };
+    return Array.isArray(parsed.rows) ? parsed.rows : Array.isArray(parsed.previewRows) ? parsed.previewRows : [];
+  } catch {
+    return [];
+  }
+}
+
+function parseSqlToolRowCount(result: string | undefined) {
+  if (!result) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(result) as { rowCount?: unknown; rows?: Array<Record<string, unknown>>; previewRows?: Array<Record<string, unknown>> };
+    if (typeof parsed.rowCount === "number") {
+      return parsed.rowCount;
+    }
+    if (Array.isArray(parsed.rows)) {
+      return parsed.rows.length;
+    }
+    if (Array.isArray(parsed.previewRows)) {
+      return parsed.previewRows.length;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function truncateText(value: string, maxChars: number) {
+  return value.length > maxChars ? `${value.slice(0, maxChars)}\n...[truncated ${value.length - maxChars} chars]` : value;
+}
+
 function extractSqlTarget(script: string) {
   const match = script.match(/\b(?:from|join|pragma)\s+([`"[\]\w.-]+)/i);
   if (!match?.[1]) {
@@ -286,9 +364,9 @@ function toolTarget(toolCall: AssistantToolCall) {
     return files.join(", ");
   }
   if (toolCall.kind === "sql") {
-    return extractSqlTarget(toolCall.script);
+    return "SQL Script";
   }
-  return "Python 脚本";
+  return "Python Script";
 }
 
 function isMarkdownLikeContent(content: string) {
@@ -348,6 +426,12 @@ export class AssistantRuntime {
   private integrityKey: string;
   private abortControllers = new Map<string, AbortController>();
   private readonly options: AssistantRuntimeOptions;
+  private readonly workflowStore: WorkflowStateStore;
+  private readonly datasetStateManager: SQLiteDatasetStateManager;
+  private readonly tempTableRegistry = new TempTableRegistry();
+  private readonly sqliteMaterializer: SQLiteMaterializer;
+  private readonly workflowContextBuilder: WorkflowContextBuilder;
+  private readonly workflowMemoryBridge: SQLiteWorkflowMemoryBridge;
 
   constructor(options: AssistantRuntimeOptions) {
     this.options = options;
@@ -356,6 +440,24 @@ export class AssistantRuntime {
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
     this.migrate();
+    this.workflowStore = new AuditedWorkflowStateStore(new SQLiteWorkflowStateStore(this.db), new SQLiteWorkflowAuditLogger(this.db));
+    this.datasetStateManager = new SQLiteDatasetStateManager(this.db, this.workflowStore);
+    this.sqliteMaterializer = new SQLiteMaterializer(this.db, {
+      sqliteDatabasePath: options.dbPath,
+      batchSize: 500,
+      maxDatabaseSizeBytes: 1024 * 1024 * 1024,
+      onProgress: (progress) => {
+        this.db
+          .prepare(
+            `insert into tool_call_logs
+              (id, tool_call_id, conversation_id, user_id, kind, phase, status, message, detail_json, created_at)
+             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(randomUUID(), null, progress.conversationId, null, "sql", "workflow-materialization-progress", "info", "SQL 结果物化进度更新。", JSON.stringify(progress), nowIso());
+      },
+    });
+    this.workflowContextBuilder = new WorkflowContextBuilder(this.workflowStore, this.datasetStateManager);
+    this.workflowMemoryBridge = new SQLiteWorkflowMemoryBridge(this.db);
     this.integrityKey = this.readIntegrityKey();
   }
 
@@ -470,6 +572,8 @@ export class AssistantRuntime {
     const tool = detectTool(prompt);
     if (tool) {
       void this.handleToolCall(input, conversation, assistantMessage, tool);
+    } else if (await this.routePriorSqlAnalysis(input, conversation, assistantMessage)) {
+      // Routed to a governed Python tool call.
     } else {
       void this.streamModelResponse(input, conversation, assistantMessage);
     }
@@ -500,6 +604,120 @@ export class AssistantRuntime {
     }
 
     return this.executeToolCall(toolCall);
+  }
+
+  async getWorkflowContext(userId: string, conversationId: string) {
+    const conversation = this.findConversation(userId, conversationId);
+    if (!conversation) {
+      throw new Error("对话不存在或已失效。");
+    }
+    await this.cleanupExpiredWorkflowDatasets(conversationId);
+    return this.workflowContextBuilder.build(conversationId);
+  }
+
+  async confirmWorkflowDataset(userId: string, conversationId: string, datasetId?: string) {
+    const conversation = this.findConversation(userId, conversationId);
+    if (!conversation) {
+      throw new Error("对话不存在或已失效。");
+    }
+    const dataset = datasetId ? await this.datasetStateManager.getDataset(datasetId) : await this.datasetStateManager.getActiveDataset(conversationId);
+    if (!dataset) {
+      throw new Error("当前没有可确认的数据集。");
+    }
+    const confirmed = await this.datasetStateManager.confirmDataset(dataset.datasetId);
+    await this.workflowMemoryBridge.writeWorkflowMemory({
+      conversationId,
+      userId,
+      type: "dataset_confirmed",
+      summary: `数据集 ${confirmed.name} 已确认，可用于 Python 分析和报告生成。`,
+      payload: {
+        datasetId: confirmed.datasetId,
+        rowCount: confirmed.rowCount,
+        columnCount: confirmed.columnCount,
+        sqliteTableName: confirmed.sqliteTableName,
+      },
+    });
+    const workflow = await this.workflowStore.get(confirmed.workflowId);
+    if (workflow) {
+      await this.workflowStore.update(workflow.workflowId, {
+        status: "waiting_python_approval",
+        activeDatasetId: confirmed.datasetId,
+        confirmedDatasetId: confirmed.datasetId,
+        steps: [
+          ...workflow.steps,
+          {
+            stepId: randomUUID(),
+            type: "user_confirmation",
+            status: "success",
+            input: { datasetId: confirmed.datasetId },
+            output: { canAnalyze: true, canUseForReport: true },
+            completedAt: nowIso(),
+          },
+        ],
+      });
+      await this.workflowStore.appendEvent(workflow.workflowId, {
+        eventId: randomUUID(),
+        workflowId: workflow.workflowId,
+        conversationId,
+        type: "dataset_confirmed",
+        message: "用户已确认工作流数据集。",
+        payload: { datasetId: confirmed.datasetId },
+        createdAt: nowIso(),
+      });
+    }
+    const context = await this.workflowContextBuilder.build(conversationId);
+    this.options.emit({ type: "workflow", conversationId, context });
+    return { success: true as const, dataset: confirmed, context };
+  }
+
+  async rejectWorkflowDataset(userId: string, conversationId: string, datasetId: string, reason?: string) {
+    const conversation = this.findConversation(userId, conversationId);
+    if (!conversation) {
+      throw new Error("对话不存在或已失效。");
+    }
+    const workflow = await this.workflowStore.getActiveByConversation(conversationId);
+    if (!workflow) {
+      throw new Error("当前没有可拒绝的数据集。");
+    }
+    const rejected = await this.datasetStateManager.rejectDataset(datasetId, reason);
+    await this.workflowMemoryBridge.writeWorkflowMemory({
+      conversationId,
+      userId,
+      type: "dataset_rejected",
+      summary: `数据集 ${rejected.name} 已被拒绝，后续分析不会使用该数据集。`,
+      payload: {
+        datasetId: rejected.datasetId,
+        reason,
+      },
+    });
+    await this.workflowStore.update(workflow.workflowId, {
+      status: "waiting_user_confirmation",
+      activeDatasetId: workflow.activeDatasetId === rejected.datasetId ? undefined : workflow.activeDatasetId,
+      latestSqlDatasetId: workflow.latestSqlDatasetId === rejected.datasetId ? undefined : workflow.latestSqlDatasetId,
+      confirmedDatasetId: workflow.confirmedDatasetId === rejected.datasetId ? undefined : workflow.confirmedDatasetId,
+      steps: [
+        ...workflow.steps,
+        {
+          stepId: randomUUID(),
+          type: "user_confirmation",
+          status: "failed",
+          input: { datasetId: rejected.datasetId, reason },
+          completedAt: nowIso(),
+        },
+      ],
+    });
+    await this.workflowStore.appendEvent(workflow.workflowId, {
+      eventId: randomUUID(),
+      workflowId: workflow.workflowId,
+      conversationId,
+      type: "dataset_rejected",
+      message: "用户已拒绝工作流数据集。",
+      payload: { datasetId: rejected.datasetId, reason },
+      createdAt: nowIso(),
+    });
+    const context = await this.workflowContextBuilder.build(conversationId);
+    this.options.emit({ type: "workflow", conversationId, context });
+    return { success: true as const, dataset: rejected, context };
   }
 
   cancelMessage(messageId: string) {
@@ -562,21 +780,21 @@ export class AssistantRuntime {
     this.options.emit({ type: "conversation", conversation: nextConversation });
     this.options.emit({ type: "message", conversationId: conversation.id, message: assistantMessage });
 
-    void this.streamModelResponse(
-      {
-        userId: input.userId,
-        conversationId: conversation.id,
-        clientRequestId: input.clientRequestId,
-        prompt: sourceUserMessage.content,
-        modelName,
-        dataSourceLabel: input.dataSourceLabel,
-        schemaContextMarkdown: input.schemaContextMarkdown,
-        skill: input.skill,
-        approvalMode: input.approvalMode,
-      },
-      nextConversation,
-      assistantMessage,
-    );
+    const retryInput = {
+      userId: input.userId,
+      conversationId: conversation.id,
+      clientRequestId: input.clientRequestId,
+      prompt: sourceUserMessage.content,
+      modelName,
+      dataSourceLabel: input.dataSourceLabel,
+      schemaContextMarkdown: input.schemaContextMarkdown,
+      skill: input.skill,
+      approvalMode: input.approvalMode,
+    };
+
+    if (!(await this.routePriorSqlAnalysis(retryInput, nextConversation, assistantMessage))) {
+      void this.streamModelResponse(retryInput, nextConversation, assistantMessage);
+    }
 
     return { success: true, conversation: nextConversation, assistantMessage };
   }
@@ -829,6 +1047,329 @@ export class AssistantRuntime {
     };
   }
 
+  private latestCompletedToolCall(userId: string, conversationId: string, kind?: AssistantToolKind) {
+    const row = this.db
+      .prepare(
+        `select *
+         from tool_calls
+         where conversation_id = ?
+           and user_id = ?
+           and status = 'completed'
+           ${kind ? "and kind = ?" : ""}
+         order by updated_at desc
+         limit 1`,
+      )
+      .get(...(kind ? [conversationId, userId, kind] : [conversationId, userId]));
+    return row ? this.toolCallFromRow(row) : null;
+  }
+
+  private recentCompletedToolCalls(userId: string, conversationId: string, limit = 3) {
+    return (this.db
+      .prepare(
+        `select *
+         from tool_calls
+         where conversation_id = ?
+           and user_id = ?
+           and status = 'completed'
+         order by updated_at desc
+         limit ?`,
+      )
+      .all(conversationId, userId, limit) as Array<Record<string, unknown>>).map((row) => this.toolCallFromRow(row));
+  }
+
+  private async latestSqlRowsForConversation(userId: string, conversationId: string) {
+    const latestSqlToolCall = this.latestCompletedToolCall(userId, conversationId, "sql");
+    const latestSqlDataset = await this.datasetStateManager.getLatestSqlDataset(conversationId);
+    return {
+      latestSqlToolCall,
+      rows: this.rowsForSqlAnalysis(latestSqlToolCall ?? undefined, latestSqlDataset ?? undefined),
+    };
+  }
+
+  private shouldReplacePythonScript(script: string) {
+    return /\bwf_[a-z0-9_]+\b/i.test(script) || /\bsqlite3\.connect\s*\(/i.test(script) || /\bimport\s+(pandas|numpy)\b|\bfrom\s+(pandas|numpy)\b/i.test(script);
+  }
+
+  private async normalizePythonToolScript(input: { userId: string; conversationId: string; prompt?: string; script: string }) {
+    if (!this.shouldReplacePythonScript(input.script)) {
+      return input.script;
+    }
+    const { latestSqlToolCall, rows } = await this.latestSqlRowsForConversation(input.userId, input.conversationId);
+    if (!latestSqlToolCall || rows.length === 0) {
+      return input.script;
+    }
+    return this.buildPythonAnalysisScript(input.prompt || this.sourcePromptForToolCall(latestSqlToolCall) || "基于上一轮 SQL 结果输出分析报告。", latestSqlToolCall, rows);
+  }
+
+  private recentToolContext(userId: string, conversationId: string) {
+    const toolCalls = this.recentCompletedToolCalls(userId, conversationId);
+    if (toolCalls.length === 0) {
+      return null;
+    }
+
+    return truncateText(
+      [
+        "最近已完成工具调用摘要（供后续自然语言分析复用，除非用户明确要求重新查询，否则不要重复发起 SQL；完整数据请通过工作流数据集或 Python 工具读取）：",
+        ...toolCalls.map((toolCall, index) => {
+          const rows = toolCall.kind === "sql" ? parseSqlToolPreviewRows(toolCall.result) : [];
+          const rowCount = toolCall.kind === "sql" ? parseSqlToolRowCount(toolCall.result) : null;
+          const columns = rows[0] ? Object.keys(rows[0]) : [];
+          return [
+            `## Tool Result ${index + 1}`,
+            `kind: ${toolCall.kind}`,
+            `updatedAt: ${toolCall.updatedAt}`,
+            `rowCount: ${toolCall.kind === "sql" ? rowCount ?? "--" : "--"}`,
+            `columns: ${columns.length > 0 ? columns.join(", ") : "--"}`,
+            "script:",
+            "```",
+            toolCall.script,
+            "```",
+          ].join("\n");
+        }),
+      ].join("\n\n"),
+      MAX_TOOL_CONTEXT_CHARS,
+    );
+  }
+
+  private async routePriorSqlAnalysis(input: AssistantSendInput, conversation: AssistantConversation, assistantMessage: AssistantMessage) {
+    if (!shouldAnalyzePriorSqlResult(input.prompt)) {
+      return false;
+    }
+
+    const latestSqlToolCall = this.latestCompletedToolCall(input.userId, conversation.id, "sql");
+    const latestSqlDataset = await this.datasetStateManager.getLatestSqlDataset(conversation.id);
+    const rows = this.rowsForSqlAnalysis(latestSqlToolCall ?? undefined, latestSqlDataset ?? undefined);
+    if (!latestSqlToolCall || rows.length === 0) {
+      return false;
+    }
+
+    this.appendToolLog(
+      {
+        conversationId: conversation.id,
+        userId: input.userId,
+        kind: "python",
+      },
+      "workflow-routing",
+      "info",
+      "用户要求基于上一轮 SQL 查询结果继续分析，已路由到 Python 工具调用，避免重复生成 SQL。",
+      {
+        latestSqlToolCallId: latestSqlToolCall.id,
+        latestSqlDatasetId: latestSqlDataset?.datasetId,
+        prompt: input.prompt,
+      },
+    );
+
+    void this.handleToolCall(input, conversation, assistantMessage, {
+      kind: "python",
+      script: this.buildPythonAnalysisScript(input.prompt, latestSqlToolCall, rows),
+    });
+    return true;
+  }
+
+  private rowsForSqlAnalysis(sqlToolCall?: AssistantToolCall, dataset?: WorkflowDatasetRef) {
+    if (dataset?.sqliteTableName) {
+      try {
+        const tableName = quoteIdentifier(dataset.sqliteTableName);
+        return this.db.prepare(`select * from ${tableName}`).all() as Array<Record<string, unknown>>;
+      } catch {
+        // Fall back to the tool-call preview rows below. Missing materialized tables should not block approval routing.
+      }
+    }
+    return parseSqlToolRows(sqlToolCall?.result);
+  }
+
+  private buildPythonAnalysisScript(prompt: string, sqlToolCall: AssistantToolCall, rowsOverride?: Array<Record<string, unknown>>) {
+    const rows = rowsOverride?.length ? rowsOverride : parseSqlToolRows(sqlToolCall.result);
+    const rowsJson = JSON.stringify(rows);
+    const promptJson = JSON.stringify(prompt);
+    return [
+      "import json",
+      "from collections import Counter, defaultdict",
+      "",
+      `rows = json.loads(${JSON.stringify(rowsJson)})`,
+      `question = ${promptJson}`,
+      "",
+      "def pct(value, total):",
+      "    return round(value * 100.0 / total, 2) if total else 0.0",
+      "",
+      "total_rows = len(rows)",
+      "term_field = 'loan_term_type'",
+      "branch_field = 'branch_name'",
+      "preferred_terms = ['短期', '中期', '长期']",
+      "lines = []",
+      "lines.append('# SQL查询结果统计分析报告')",
+      "lines.append('')",
+      "lines.append(f'- 分析对象：上一轮 SQL 工具调用返回结果')",
+      "lines.append(f'- 样本行数：{total_rows}')",
+      "lines.append(f'- 说明：以下结论仅基于已返回的 SQL 工具结果数据，不重新查询数据源。')",
+      "lines.append('')",
+      "",
+      "if not rows:",
+      "    lines.append('## 结论')",
+      "    lines.append('上一轮 SQL 工具调用未返回可分析行数据。')",
+      "elif {'stat_type', 'dimension', 'record_count'}.issubset(set(rows[0].keys())):",
+      "    def number(row, key):",
+      "        try:",
+      "            return float(row.get(key) or 0)",
+      "        except (TypeError, ValueError):",
+      "            return 0.0",
+      "    branch_rows = [row for row in rows if row.get('stat_type') in ('branch', '分行占比')]",
+      "    term_business_rows = [row for row in rows if row.get('stat_type') in ('term_business', '组合分布')]",
+      "    total_rows_data = [row for row in rows if row.get('stat_type') in ('total', '总计')]",
+      "    total_count = int(number(total_rows_data[0], 'record_count')) if total_rows_data else int(sum(number(row, 'record_count') for row in branch_rows))",
+      "    lines.append('## 总体概况')",
+      "    lines.append(f'- 本次 SQL 查询结果共返回 {len(rows)} 条统计记录。')",
+      "    if total_count:",
+      "        lines.append(f'- 不良数据总计：{total_count}。')",
+      "    lines.append('')",
+      "    if branch_rows:",
+      "        lines.append('## 分行占比')",
+      "        lines.append('| 排名 | 分行 | 记录数 | 占比 |')",
+      "        lines.append('|---:|---|---:|---:|')",
+      "        for rank, row in enumerate(sorted(branch_rows, key=lambda item: number(item, 'record_count'), reverse=True), start=1):",
+      "            count = int(number(row, 'record_count'))",
+      "            percentage = number(row, 'percentage') or pct(count, total_count)",
+      "            lines.append(f\"| {rank} | {row.get('dimension') or '--'} | {count} | {percentage}% |\")",
+      "        top_branch = max(branch_rows, key=lambda item: number(item, 'record_count'))",
+      "        lines.append('')",
+      "        lines.append(f\"- 分行维度最高的是 {top_branch.get('dimension') or '--'}，记录数 {int(number(top_branch, 'record_count'))}，占比 {number(top_branch, 'percentage') or pct(number(top_branch, 'record_count'), total_count)}%。\")",
+      "    if term_business_rows:",
+      "        lines.append('')",
+      "        lines.append('## 贷款类型与业务分类组合分布')",
+      "        lines.append('| 排名 | 贷款类型 + 业务分类 | 记录数 | 占比 |')",
+      "        lines.append('|---:|---|---:|---:|')",
+      "        for rank, row in enumerate(sorted(term_business_rows, key=lambda item: number(item, 'record_count'), reverse=True), start=1):",
+      "            count = int(number(row, 'record_count'))",
+      "            percentage = number(row, 'percentage') or pct(count, total_count)",
+      "            lines.append(f\"| {rank} | {row.get('dimension') or '--'} | {count} | {percentage}% |\")",
+      "        top_combo = max(term_business_rows, key=lambda item: number(item, 'record_count'))",
+      "        lines.append('')",
+      "        lines.append(f\"- 组合分布最高的是 {top_combo.get('dimension') or '--'}，记录数 {int(number(top_combo, 'record_count'))}，占比 {number(top_combo, 'percentage') or pct(number(top_combo, 'record_count'), total_count)}%。\")",
+      "    lines.append('')",
+      "    lines.append('## 分析结论')",
+      "    if branch_rows and term_business_rows:",
+      "        lines.append('- 不良样本呈现出可识别的分行集中度和产品期限/业务分类结构差异，建议优先对占比最高的分行及组合维度做穿透复核。')",
+      "    elif branch_rows:",
+      "        lines.append('- 当前结果可支撑分行集中度判断，但缺少贷款类型与业务分类组合维度。')",
+      "    else:",
+      "        lines.append('- 当前结果可支撑组合分布判断，但缺少分行维度占比。')",
+      "elif term_field in rows[0] and branch_field in rows[0] and 'cnt' in rows[0]:",
+      "    normalized = []",
+      "    for row in rows:",
+      "        try:",
+      "            count = int(float(row.get('cnt') or 0))",
+      "        except (TypeError, ValueError):",
+      "            count = 0",
+      "        normalized.append({",
+      "            'term': row.get(term_field) or '--',",
+      "            'branch': row.get(branch_field) or '--',",
+      "            'count': count,",
+      "            'term_total': int(float(row.get('term_cnt') or 0)) if str(row.get('term_cnt') or '').replace('.', '', 1).isdigit() else 0,",
+      "            'total': int(float(row.get('total_cnt') or 0)) if str(row.get('total_cnt') or '').replace('.', '', 1).isdigit() else 0,",
+      "        })",
+      "    term_counts = Counter()",
+      "    branch_by_term = defaultdict(Counter)",
+      "    for item in normalized:",
+      "        term_counts[item['term']] += item['count']",
+      "        branch_by_term[item['term']][item['branch']] += item['count']",
+      "    total_rows = max([item['total'] for item in normalized] + [sum(term_counts.values())])",
+      "    lines.append('## 期限类型总量')",
+      "    lines.append('| 期限类型 | 总计个数 | 占样本比例 |')",
+      "    lines.append('|---|---:|---:|')",
+      "    for term in preferred_terms:",
+      "        count = term_counts.get(term, 0)",
+      "        lines.append(f'| {term} | {count} | {pct(count, total_rows)}% |')",
+      "    lines.append('')",
+      "    lines.append('## 各分行占比')",
+      "    lines.append('| 期限类型 | 分行 | 个数 | 类型内占比 | 总样本占比 |')",
+      "    lines.append('|---|---|---:|---:|---:|')",
+      "    for term in preferred_terms:",
+      "        term_total = term_counts.get(term, 0)",
+      "        for branch, count in branch_by_term.get(term, Counter()).most_common():",
+      "            lines.append(f'| {term} | {branch} | {count} | {pct(count, term_total)}% | {pct(count, total_rows)}% |')",
+      "    lines.append('')",
+      "    lines.append('## 中期与长期占比最高前三分行')",
+      "    lines.append('| 期限类型 | 排名 | 分行 | 个数 | 类型内占比 | 总样本占比 |')",
+      "    lines.append('|---|---:|---|---:|---:|---:|')",
+      "    for term in ['中期', '长期']:",
+      "        term_total = term_counts.get(term, 0)",
+      "        for rank, (branch, count) in enumerate(branch_by_term.get(term, Counter()).most_common(3), start=1):",
+      "            lines.append(f'| {term} | {rank} | {branch} | {count} | {pct(count, term_total)}% | {pct(count, total_rows)}% |')",
+      "    lines.append('')",
+      "    lines.append('## 分析结论')",
+      "    mid_top = branch_by_term.get('中期', Counter()).most_common(1)",
+      "    long_top = branch_by_term.get('长期', Counter()).most_common(1)",
+      "    if mid_top:",
+      "        branch, count = mid_top[0]",
+      "        lines.append(f'- 中期占比最高分行为 {branch}，数量 {count}，类型内占比 {pct(count, term_counts.get(\"中期\", 0))}%。')",
+      "    if long_top:",
+      "        branch, count = long_top[0]",
+      "        lines.append(f'- 长期占比最高分行为 {branch}，数量 {count}，类型内占比 {pct(count, term_counts.get(\"长期\", 0))}%。')",
+      "    if mid_top and long_top and mid_top[0][0] == long_top[0][0]:",
+      "        lines.append(f'- {mid_top[0][0]}同时位于中期和长期最高分行，建议重点复核该分行风险合同期限结构。')",
+      "    else:",
+      "        lines.append('- 中期与长期头部分行不同，建议分别拆解分行客户结构、授信品类与期限配置差异。')",
+      "elif term_field in rows[0] and branch_field in rows[0]:",
+      "    term_counts = Counter((row.get(term_field) or '--') for row in rows)",
+      "    lines.append('## 期限类型总量')",
+      "    lines.append('| 期限类型 | 总计个数 | 占样本比例 |')",
+      "    lines.append('|---|---:|---:|')",
+      "    for term in preferred_terms:",
+      "        count = term_counts.get(term, 0)",
+      "        lines.append(f'| {term} | {count} | {pct(count, total_rows)}% |')",
+      "    other_count = sum(count for term, count in term_counts.items() if term not in preferred_terms)",
+      "    if other_count:",
+      "        lines.append(f'| 其他 | {other_count} | {pct(other_count, total_rows)}% |')",
+      "    lines.append('')",
+      "    branch_by_term = defaultdict(Counter)",
+      "    for row in rows:",
+      "        term = row.get(term_field) or '--'",
+      "        branch = row.get(branch_field) or '--'",
+      "        branch_by_term[term][branch] += 1",
+      "    lines.append('## 各分行占比')",
+      "    lines.append('| 期限类型 | 分行 | 个数 | 类型内占比 | 总样本占比 |')",
+      "    lines.append('|---|---|---:|---:|---:|')",
+      "    for term in preferred_terms:",
+      "        term_total = term_counts.get(term, 0)",
+      "        for branch, count in branch_by_term.get(term, Counter()).most_common():",
+      "            lines.append(f'| {term} | {branch} | {count} | {pct(count, term_total)}% | {pct(count, total_rows)}% |')",
+      "    lines.append('')",
+      "    lines.append('## 中期与长期占比最高前三分行')",
+      "    lines.append('| 期限类型 | 排名 | 分行 | 个数 | 类型内占比 | 总样本占比 |')",
+      "    lines.append('|---|---:|---|---:|---:|---:|')",
+      "    for term in ['中期', '长期']:",
+      "        term_total = term_counts.get(term, 0)",
+      "        for rank, (branch, count) in enumerate(branch_by_term.get(term, Counter()).most_common(3), start=1):",
+      "            lines.append(f'| {term} | {rank} | {branch} | {count} | {pct(count, term_total)}% | {pct(count, total_rows)}% |')",
+      "    lines.append('')",
+      "    lines.append('## 分析结论')",
+      "    mid_top = branch_by_term.get('中期', Counter()).most_common(1)",
+      "    long_top = branch_by_term.get('长期', Counter()).most_common(1)",
+      "    if mid_top:",
+      "        branch, count = mid_top[0]",
+      "        lines.append(f'- 中期样本中，{branch}数量最高，为 {count} 笔，占中期样本 {pct(count, term_counts.get(\"中期\", 0))}%。')",
+      "    if long_top:",
+      "        branch, count = long_top[0]",
+      "        lines.append(f'- 长期样本中，{branch}数量最高，为 {count} 笔，占长期样本 {pct(count, term_counts.get(\"长期\", 0))}%。')",
+      "    if mid_top and long_top and mid_top[0][0] == long_top[0][0]:",
+      "        lines.append(f'- {mid_top[0][0]}同时位于中期和长期最高分行，建议优先复核该分行相关合同风险迁徙原因。')",
+      "    else:",
+      "        lines.append('- 中期与长期高占比分行存在差异，建议分别从区域行业集中度、客户结构和授信期限配置进行对比复核。')",
+      "else:",
+      "    lines.append('## 数据概览')",
+      "    lines.append('上一轮 SQL 工具结果未同时包含 loan_term_type 与 branch_name 字段，无法按指定维度完成统计。')",
+      "    lines.append('')",
+      "    lines.append('| 字段 | 非空样本数 | 去重值数量 |')",
+      "    lines.append('|---|---:|---:|')",
+      "    keys = list(rows[0].keys()) if rows else []",
+      "    for key in keys:",
+      "        values = [row.get(key) for row in rows if row.get(key) not in (None, '')]",
+      "        lines.append(f'| {key} | {len(values)} | {len(set(map(str, values)))} |')",
+      "",
+      "print('\\n'.join(lines))",
+    ].join("\n");
+  }
+
   private insertToolCall(input: {
     conversationId: string;
     messageId: string;
@@ -889,8 +1430,22 @@ export class AssistantRuntime {
     return next;
   }
 
+  private updateToolCallScript(toolCallId: string, script: string): AssistantToolCall {
+    const current = this.toolCallFromRow(this.db.prepare("select * from tool_calls where id = ?").get(toolCallId));
+    if (current.script === script) {
+      return current;
+    }
+    const updatedAt = nowIso();
+    const next: AssistantToolCall = { ...current, script, updatedAt };
+    const integrityHash = this.hashRecord("tool_call", next);
+    this.db
+      .prepare("update tool_calls set script = ?, updated_at = ?, integrity_hash = ? where id = ?")
+      .run(next.script, next.updatedAt, integrityHash, toolCallId);
+    return next;
+  }
+
   private appendToolLog(
-    toolCall: AssistantToolCall | Pick<AssistantToolCall, "id" | "conversationId" | "userId" | "kind">,
+    toolCall: AssistantToolCall | (Pick<AssistantToolCall, "conversationId" | "userId" | "kind"> & { id?: string | null }),
     phase: string,
     status: "info" | "success" | "error",
     message: string,
@@ -898,7 +1453,7 @@ export class AssistantRuntime {
   ) {
     const log = {
       id: randomUUID(),
-      toolCallId: toolCall.id,
+      toolCallId: toolCall.id ?? null,
       conversationId: toolCall.conversationId,
       userId: toolCall.userId,
       kind: toolCall.kind,
@@ -970,8 +1525,8 @@ export class AssistantRuntime {
       const selectList =
         columns.length > 0
           ? columns
-              .map((column) => `${quoteIdentifier(column.sqlite_column_name)} as ${quoteIdentifier(column.name)}`)
-              .join(", ")
+            .map((column) => `${quoteIdentifier(column.sqlite_column_name)} as ${quoteIdentifier(column.name)}`)
+            .join(", ")
           : "*";
       const viewNames = Array.from(
         new Set(
@@ -1020,9 +1575,10 @@ export class AssistantRuntime {
 
   private toolBlock(toolCall: AssistantToolCall, body: string): AssistantBlock {
     const files = extractScriptFiles(toolCall.script);
+    const isMarkdownResult = toolCall.status === "completed" && toolCall.kind === "python" && isMarkdownLikeContent(body);
     return {
       id: randomUUID(),
-      type: toolCall.status === "completed" ? "json" : "card",
+      type: isMarkdownResult ? "markdown" : toolCall.status === "completed" ? "json" : "card",
       title: `${toolCall.kind.toUpperCase()} 工具调用：${toolCall.status}`,
       content: body,
       toolCallId: toolCall.id,
@@ -1035,18 +1591,31 @@ export class AssistantRuntime {
   }
 
   private async handleToolCall(input: AssistantSendInput, conversation: AssistantConversation, message: AssistantMessage, tool: ToolDetection, options: { appendToMessage?: boolean } = {}) {
-    if (tool.kind === "sql" && !isReadonlySql(tool.script)) {
+    const normalizedTool: ToolDetection =
+      tool.kind === "python"
+        ? {
+            ...tool,
+            script: await this.normalizePythonToolScript({
+              userId: input.userId,
+              conversationId: conversation.id,
+              prompt: input.prompt,
+              script: tool.script,
+            }),
+          }
+        : tool;
+
+    if (normalizedTool.kind === "sql" && !isReadonlySql(normalizedTool.script)) {
       const toolCall = this.insertToolCall({
         conversationId: conversation.id,
         messageId: message.id,
         userId: input.userId,
-        kind: tool.kind,
-        script: tool.script,
+        kind: normalizedTool.kind,
+        script: normalizedTool.script,
         approvalMode: input.approvalMode,
         status: "blocked",
         errorMessage: "SQL 安全校验未通过。",
       });
-      this.appendToolLog(toolCall, "safety-check", "error", "SQL 安全校验未通过。", { script: tool.script });
+      this.appendToolLog(toolCall, "safety-check", "error", "SQL 安全校验未通过。", { script: normalizedTool.script });
       const toolBlock = this.toolBlock(toolCall, "SQL 安全校验未通过：仅允许单条只读 SELECT / WITH / PRAGMA 查询。");
       const current = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(message.id));
       const keepContent = options.appendToMessage && current.content.trim();
@@ -1065,8 +1634,8 @@ export class AssistantRuntime {
         conversationId: conversation.id,
         messageId: message.id,
         userId: input.userId,
-        kind: tool.kind,
-        script: tool.script,
+        kind: normalizedTool.kind,
+        script: normalizedTool.script,
         approvalMode: input.approvalMode,
         status: "blocked",
         errorMessage: "当前审批权限禁止执行脚本工具。",
@@ -1090,8 +1659,8 @@ export class AssistantRuntime {
       conversationId: conversation.id,
       messageId: message.id,
       userId: input.userId,
-      kind: tool.kind,
-      script: tool.script,
+      kind: normalizedTool.kind,
+      script: normalizedTool.script,
       approvalMode: input.approvalMode,
       status,
     });
@@ -1099,13 +1668,14 @@ export class AssistantRuntime {
     if (input.approvalMode === "request_approval") {
       this.appendToolLog(toolCall, "approval", "info", "工具调用已创建，等待用户审批。", {
         approvalMode: input.approvalMode,
-        script: tool.script,
+        script: normalizedTool.script,
+        originalScript: normalizedTool.script === tool.script ? undefined : tool.script,
       });
       const toolBlock = this.toolBlock(
         toolCall,
-        tool.kind === "sql"
+        normalizedTool.kind === "sql"
           ? "SQL 安全校验通过，已创建审批单。审批通过后执行查询。"
-          : `检测到 ${tool.kind.toUpperCase()} 脚本调用。审批通过后执行。`,
+          : `检测到 ${normalizedTool.kind.toUpperCase()} 脚本调用。审批通过后执行。`,
       );
       const current = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(message.id));
       const keepContent = options.appendToMessage && current.content.trim();
@@ -1122,21 +1692,41 @@ export class AssistantRuntime {
   }
 
   private async executeToolCall(toolCall: AssistantToolCall) {
-    const running = this.updateToolCall(toolCall.id, "running");
+    const normalizedScript =
+      toolCall.kind === "python"
+        ? await this.normalizePythonToolScript({
+            userId: toolCall.userId,
+            conversationId: toolCall.conversationId,
+            prompt: this.sourcePromptForToolCall(toolCall),
+            script: toolCall.script,
+          })
+        : toolCall.script;
+    const executableToolCall = normalizedScript === toolCall.script ? toolCall : this.updateToolCallScript(toolCall.id, normalizedScript);
+    if (executableToolCall.script !== toolCall.script) {
+      this.appendToolLog(executableToolCall, "python-script-normalize", "info", "Python 工具脚本已替换为基于 SQL 结果快照的标准库脚本。", {
+        originalScript: toolCall.script,
+        normalizedScript,
+      });
+    }
+    const running = this.updateToolCall(executableToolCall.id, "running");
     this.appendToolLog(running, "execution-start", "info", "工具调用开始执行。", { script: running.script });
-    const currentBeforeRun = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(toolCall.messageId));
+    const currentBeforeRun = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(executableToolCall.messageId));
     const preserveContent = hasRenderableNonToolContent(currentBeforeRun);
-    const runningBlock = this.toolBlock(running, toolCall.kind === "sql" ? "SQL 已通过审批，正在执行受控只读查询。" : "工具调用执行中，请稍候。");
-    let runningMessage = this.updateMessage(toolCall.messageId, {
+    const runningBlock = this.toolBlock(running, executableToolCall.kind === "sql" ? "SQL 已通过审批，正在执行受控只读查询。" : "工具调用执行中，请稍候。");
+    let runningMessage = this.updateMessage(executableToolCall.messageId, {
       status: "processing",
       content: preserveContent ? currentBeforeRun.content : "工具调用执行中。",
       blocks: preserveContent ? replaceToolBlock(currentBeforeRun.blocks, runningBlock) : [runningBlock],
     });
-    this.options.emit({ type: "tool", conversationId: toolCall.conversationId, toolCall: running, message: runningMessage });
+    this.options.emit({ type: "tool", conversationId: executableToolCall.conversationId, toolCall: running, message: runningMessage });
 
     try {
-      const result = toolCall.kind === "sql" ? this.executeReadonlySql(toolCall.script, running) : await this.executePython(toolCall.script);
+      const sqlExecution = executableToolCall.kind === "sql" ? this.executeReadonlySql(executableToolCall.script, running) : null;
+      const result = sqlExecution ? sqlExecution.result : await this.executePython(running.script);
       const completed = this.updateToolCall(toolCall.id, "completed", result);
+      if (completed.kind === "sql") {
+        await this.registerSqlToolResultDataset(completed, sqlExecution?.rows);
+      }
       this.appendToolLog(completed, "execution-complete", "success", "工具调用执行完成。", {
         resultPreview: result.slice(0, 2_000),
       });
@@ -1148,6 +1738,9 @@ export class AssistantRuntime {
         blocks: preserveContent ? replaceToolBlock(currentBeforeComplete.blocks, completedBlock) : [completedBlock],
       });
       this.options.emit({ type: "tool", conversationId: toolCall.conversationId, toolCall: completed, message });
+      if (completed.kind === "sql") {
+        await this.maybeCreateAutoPythonReportApproval(completed, message, sqlExecution?.rows);
+      }
       return { success: true as const, toolCall: completed, message };
     } catch (error) {
       const messageText = error instanceof Error ? error.message : "工具调用失败。";
@@ -1169,23 +1762,394 @@ export class AssistantRuntime {
     }
   }
 
+  private sourcePromptForToolCall(toolCall: AssistantToolCall) {
+    const messageRow = this.db.prepare("select created_at from messages where id = ?").get(toolCall.messageId) as { created_at?: string } | undefined;
+    const row = this.db
+      .prepare(
+        `select content
+         from messages
+         where conversation_id = ?
+           and user_id = ?
+           and role = 'user'
+           and created_at <= ?
+         order by created_at desc
+         limit 1`,
+      )
+      .get(toolCall.conversationId, toolCall.userId, messageRow?.created_at ?? toolCall.createdAt) as { content?: string } | undefined;
+    return row?.content?.trim() ?? "";
+  }
+
+  private async maybeCreateAutoPythonReportApproval(toolCall: AssistantToolCall, message: AssistantMessage, rows?: Array<Record<string, unknown>>) {
+    if (toolCall.approvalMode === "no_access") {
+      return;
+    }
+    const sourcePrompt = this.sourcePromptForToolCall(toolCall);
+    if (!sourcePrompt || !shouldAutoStartPythonReport(sourcePrompt)) {
+      return;
+    }
+    const existingPendingPython = this.db
+      .prepare(
+        `select id
+         from tool_calls
+         where conversation_id = ?
+           and user_id = ?
+           and kind = 'python'
+           and status in ('pending_approval', 'running')
+         order by created_at desc
+         limit 1`,
+      )
+      .get(toolCall.conversationId, toolCall.userId);
+    if (existingPendingPython) {
+      return;
+    }
+    const conversation = this.findConversation(toolCall.userId, toolCall.conversationId);
+    if (!conversation) {
+      return;
+    }
+    const analysisRows = rows?.length ? rows : parseSqlToolRows(toolCall.result);
+    this.appendToolLog(toolCall, "workflow-routing", "info", "SQL 查询完成后根据用户报告需求自动创建 Python 分析审批。", {
+      sourcePrompt,
+      rowCount: analysisRows.length,
+    });
+    await this.handleToolCall(
+      {
+        userId: toolCall.userId,
+        conversationId: toolCall.conversationId,
+        clientRequestId: `auto-python-${toolCall.id}`,
+        prompt: sourcePrompt,
+        modelName: "local-workflow",
+        approvalMode: toolCall.approvalMode,
+      },
+      conversation,
+      message,
+      {
+        kind: "python",
+        script: this.buildPythonAnalysisScript(sourcePrompt, toolCall, analysisRows),
+      },
+      { appendToMessage: true },
+    );
+  }
+
+  private async registerSqlToolResultDataset(toolCall: AssistantToolCall, materializationRows?: Array<Record<string, unknown>>) {
+    const rows = materializationRows ?? parseSqlToolRows(toolCall.result);
+    const existing = (await this.datasetStateManager.listDatasets(toolCall.conversationId)).find((dataset) => dataset.sourceSqlExecutionId === toolCall.id);
+    if (existing) {
+      this.appendToolLog(toolCall, "workflow-materialization", "info", "SQL 工具结果已存在对应工作流数据集，跳过重复物化。", {
+        datasetId: existing.datasetId,
+      });
+      return existing;
+    }
+
+    const workflow = await this.ensureWorkflowForToolCall(toolCall);
+    const activeDataset = await this.datasetStateManager.getActiveDataset(toolCall.conversationId);
+    const parentDataset = activeDataset && this.referencesDatasetTable(toolCall.script, activeDataset) ? activeDataset : null;
+    const resultColumns = this.inferResultColumns(rows);
+    if (resultColumns.length === 0) {
+      this.appendToolLog(toolCall, "workflow-materialization", "info", "SQL 工具结果为空，未创建工作流数据集。", {
+        workflowId: workflow.workflowId,
+      });
+      await this.workflowStore.update(workflow.workflowId, {
+        status: "waiting_user_confirmation",
+        steps: [
+          ...workflow.steps,
+          {
+            stepId: randomUUID(),
+            type: "sqlite_materialization",
+            status: "skipped",
+            input: { toolCallId: toolCall.id },
+            output: { reason: "empty_result" },
+            completedAt: nowIso(),
+          },
+        ],
+      });
+      return null;
+    }
+
+    const materialized = await this.sqliteMaterializer.materializeSqlResult({
+      workflowId: workflow.workflowId,
+      conversationId: toolCall.conversationId,
+      sqlRequestId: toolCall.id,
+      sqlExecutionId: toolCall.id,
+      sourceDataSourceId: toolCall.conversationId,
+      resultColumns,
+      rows,
+      targetTableName: `wf_${toolCall.id.replaceAll("-", "_")}`,
+      parentDatasetIds: parentDataset ? [parentDataset.datasetId] : undefined,
+      metadata: {
+        sourceToolCallId: toolCall.id,
+        sourceScript: toolCall.script,
+      },
+    });
+    this.tempTableRegistry.register(materialized);
+    const datasetCreatedAt = materialized.createdAt;
+    const dataset: WorkflowDatasetRef = {
+      datasetId: materialized.datasetId,
+      workflowId: workflow.workflowId,
+      conversationId: toolCall.conversationId,
+      name: `${toolTarget(toolCall)} 结果集`,
+      sourceType: parentDataset ? "refined_sql_result" : "sql_execution_result",
+      sqliteTableName: materialized.sqliteTableName,
+      sqliteDatabasePath: materialized.sqliteDatabasePath,
+      parentDatasetIds: parentDataset ? [parentDataset.datasetId] : undefined,
+      sourceSqlRequestId: toolCall.id,
+      sourceSqlExecutionId: toolCall.id,
+      rowCount: materialized.rowCount,
+      columnCount: materialized.columnCount,
+      schema: materialized.schema,
+      status: "ready",
+      canQuery: true,
+      canAnalyze: true,
+      canUseForReport: true,
+      createdAt: datasetCreatedAt,
+      updatedAt: datasetCreatedAt,
+      expiresAt: new Date(Date.parse(datasetCreatedAt) + WORKFLOW_DATASET_TTL_MS).toISOString(),
+      metadata: {
+        sourceToolCallId: toolCall.id,
+        sourceScriptHash: sha256(toolCall.script),
+        userId: toolCall.userId,
+      },
+    };
+    dataset.profile = this.sqliteMaterializer.profileDataset(dataset);
+    await this.datasetStateManager.registerDataset(dataset);
+    const latestWorkflow = (await this.workflowStore.get(workflow.workflowId)) ?? workflow;
+    const updated = await this.workflowStore.update(workflow.workflowId, {
+      status: "waiting_user_confirmation",
+      activeDatasetId: dataset.datasetId,
+      latestSqlDatasetId: dataset.datasetId,
+      steps: [
+        ...latestWorkflow.steps,
+        {
+          stepId: randomUUID(),
+          type: "sql_execution",
+          status: "success",
+          input: { toolCallId: toolCall.id, script: toolCall.script },
+          output: { rowCount: dataset.rowCount, columnCount: dataset.columnCount },
+          startedAt: toolCall.createdAt,
+          completedAt: toolCall.updatedAt,
+        },
+        {
+          stepId: randomUUID(),
+          type: "sqlite_materialization",
+          status: "success",
+          input: { toolCallId: toolCall.id },
+          output: { datasetId: dataset.datasetId, sqliteTableName: dataset.sqliteTableName },
+          startedAt: materialized.createdAt,
+          completedAt: nowIso(),
+        },
+        {
+          stepId: randomUUID(),
+          type: "dataset_profile",
+          status: "success",
+          input: { datasetId: dataset.datasetId },
+          output: {
+            rowCount: dataset.profile.rowCount,
+            columnCount: dataset.profile.columnCount,
+            previewRows: Math.min(dataset.profile.previewRows?.length ?? 0, 20),
+          },
+          completedAt: dataset.profile.generatedAt,
+        },
+      ],
+    });
+    await this.workflowStore.appendEvent(updated.workflowId, {
+      eventId: randomUUID(),
+      workflowId: updated.workflowId,
+      conversationId: toolCall.conversationId,
+      type: parentDataset ? "dataset_refined" : "dataset_materialized",
+      message: "SQL 查询结果已物化为 SQLite 工作流数据集。",
+      payload: {
+        datasetId: dataset.datasetId,
+        sqliteTableName: dataset.sqliteTableName,
+        rowCount: dataset.rowCount,
+        columnCount: dataset.columnCount,
+        parentDatasetIds: dataset.parentDatasetIds,
+      },
+      createdAt: nowIso(),
+    });
+    await this.workflowMemoryBridge.writeWorkflowMemory({
+      conversationId: toolCall.conversationId,
+      userId: toolCall.userId,
+      type: "dataset_materialized",
+      summary: `SQL 查询结果已物化为数据集 ${dataset.datasetId}，共 ${dataset.rowCount ?? 0} 行、${dataset.columnCount ?? 0} 列。`,
+      payload: {
+        workflowId: workflow.workflowId,
+        datasetId: dataset.datasetId,
+        sqliteTableName: dataset.sqliteTableName,
+        rowCount: dataset.rowCount,
+        columnCount: dataset.columnCount,
+        parentDatasetIds: dataset.parentDatasetIds,
+      },
+    });
+    this.appendToolLog(toolCall, "workflow-materialization", "success", "SQL 查询结果已物化为工作流数据集。", {
+      workflowId: workflow.workflowId,
+      datasetId: dataset.datasetId,
+      sqliteTableName: dataset.sqliteTableName,
+      rowCount: dataset.rowCount,
+      columnCount: dataset.columnCount,
+      parentDatasetIds: dataset.parentDatasetIds,
+    });
+    this.options.emit({ type: "workflow", conversationId: toolCall.conversationId, context: await this.workflowContextBuilder.build(toolCall.conversationId) });
+    return dataset;
+  }
+
+  private async cleanupExpiredWorkflowDatasets(conversationId: string) {
+    const nowTime = Date.now();
+    const datasets = await this.datasetStateManager.listDatasets(conversationId);
+    const expiredDatasetIds: string[] = [];
+    for (const dataset of datasets) {
+      if (!dataset.expiresAt || Date.parse(dataset.expiresAt) > nowTime || dataset.status === "expired") {
+        continue;
+      }
+      if (dataset.sqliteTableName) {
+        this.sqliteMaterializer.dropTable(dataset.sqliteTableName);
+      }
+      this.tempTableRegistry.unregister(dataset.datasetId);
+      await this.datasetStateManager.expireDataset(dataset.datasetId);
+      expiredDatasetIds.push(dataset.datasetId);
+      await this.workflowMemoryBridge.writeWorkflowMemory({
+        conversationId,
+        userId: dataset.metadata?.userId as string || "system",
+        type: "dataset_expired",
+        summary: `工作流数据集 ${dataset.datasetId} 已按 TTL 过期清理。`,
+        payload: {
+          workflowId: dataset.workflowId,
+          datasetId: dataset.datasetId,
+          sqliteTableName: dataset.sqliteTableName,
+        },
+      });
+    }
+    if (expiredDatasetIds.length === 0) {
+      return;
+    }
+    const workflow = await this.workflowStore.getActiveByConversation(conversationId);
+    if (!workflow) {
+      return;
+    }
+    await this.workflowStore.update(workflow.workflowId, {
+      activeDatasetId: expiredDatasetIds.includes(workflow.activeDatasetId ?? "") ? undefined : workflow.activeDatasetId,
+      latestSqlDatasetId: expiredDatasetIds.includes(workflow.latestSqlDatasetId ?? "") ? undefined : workflow.latestSqlDatasetId,
+      confirmedDatasetId: expiredDatasetIds.includes(workflow.confirmedDatasetId ?? "") ? undefined : workflow.confirmedDatasetId,
+    });
+  }
+
+  private async ensureWorkflowForToolCall(toolCall: AssistantToolCall): Promise<WorkflowSession> {
+    const active = await this.workflowStore.getActiveByConversation(toolCall.conversationId);
+    if (active) {
+      return active;
+    }
+    const createdAt = nowIso();
+    const workflow: WorkflowSession = {
+      workflowId: randomUUID(),
+      conversationId: toolCall.conversationId,
+      userId: toolCall.userId,
+      type: "data_extraction",
+      status: "materializing_dataset",
+      title: toolTarget(toolCall),
+      userGoal: toolCall.script,
+      steps: [
+        {
+          stepId: randomUUID(),
+          type: "sql_request",
+          status: "success",
+          input: { toolCallId: toolCall.id, script: toolCall.script },
+          output: { toolCallId: toolCall.id },
+          startedAt: toolCall.createdAt,
+          completedAt: toolCall.createdAt,
+        },
+      ],
+      datasets: [],
+      events: [
+        {
+          eventId: randomUUID(),
+          workflowId: randomUUID(),
+          conversationId: toolCall.conversationId,
+          type: "workflow_created",
+          message: "从已审批 SQL 工具调用创建工作流。",
+          payload: { toolCallId: toolCall.id },
+          createdAt,
+        },
+      ],
+      createdAt,
+      updatedAt: createdAt,
+    };
+    workflow.events = workflow.events.map((item) => ({ ...item, workflowId: workflow.workflowId }));
+    return this.workflowStore.create(workflow);
+  }
+
+  private inferResultColumns(rows: Array<Record<string, unknown>>) {
+    const first = rows[0];
+    if (!first) {
+      return [];
+    }
+    return Object.keys(first).map((name) => {
+      const value = first[name];
+      let type = "text";
+      if (typeof value === "number") {
+        type = Number.isInteger(value) ? "integer" : "real";
+      } else if (typeof value === "boolean") {
+        type = "integer";
+      }
+      return { name, type };
+    });
+  }
+
+  private referencesDatasetTable(script: string, dataset: WorkflowDatasetRef) {
+    if (!dataset.sqliteTableName) {
+      return false;
+    }
+    const escaped = dataset.sqliteTableName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`(^|[^\\w])["'\`]?${escaped}["'\`]?(?=$|[^\\w])`, "i").test(script);
+  }
+
   private executeReadonlySql(script: string, toolCall: AssistantToolCall) {
     if (!isReadonlySql(script)) {
       throw new Error("SQL 安全网已拦截：仅允许单条只读 SELECT / WITH / PRAGMA 查询。");
     }
     const views = this.prepareCsvSqlViews(toolCall);
-    const executableScript = normalizeCsvSchemaQualifiedSql(script);
+    let executableScript = normalizeCsvSchemaQualifiedSql(script);
     this.appendToolLog(toolCall, "sql-execute", "info", "开始执行只读 SQL。", {
       script,
       executableScript,
       mountedCsvViews: views,
     });
-    const rows = this.db.prepare(executableScript).all().slice(0, 50);
+    let rows: Array<Record<string, unknown>>;
+    try {
+      rows = this.db.prepare(executableScript).all() as Array<Record<string, unknown>>;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const rewrittenScript = /ORDER BY term does not match any column in the result set/i.test(message)
+        ? rewriteCompoundOrderByForSqlite(executableScript)
+        : null;
+      if (!rewrittenScript) {
+        throw error;
+      }
+      this.appendToolLog(toolCall, "sql-rewrite", "info", "已兼容 SQLite 复合查询 ORDER BY 规则并重试执行。", {
+        reason: message,
+        executableScript,
+        rewrittenScript,
+      });
+      executableScript = rewrittenScript;
+      rows = this.db.prepare(executableScript).all() as Array<Record<string, unknown>>;
+    }
+    const previewRows = rows.slice(0, 20);
     this.appendToolLog(toolCall, "sql-execute", "success", "只读 SQL 执行完成。", {
       rowCount: rows.length,
-      rowLimit: 50,
+      rowLimit: null,
+      previewRowCount: previewRows.length,
     });
-    return JSON.stringify({ rows, rowLimit: 50 }, null, 2);
+    return {
+      rows,
+      result: JSON.stringify(
+        {
+          rowCount: rows.length,
+          previewRows,
+          previewRowLimit: 20,
+          rowLimit: null,
+          materialization: "SQL 查询结果将物化为本地 SQLite 工作流数据集，后续分析应读取 workflow dataset，而不是重复查询数据源。",
+        },
+        null,
+        2,
+      ),
+    };
   }
 
   private executePython(script: string) {
@@ -1222,7 +2186,12 @@ export class AssistantRuntime {
           reject(new Error(stderr.trim() || `Python 退出码 ${code}`));
           return;
         }
-        resolve(JSON.stringify({ stdout: stdout.trim(), stderr: stderr.trim() || null }, null, 2));
+        const normalizedStdout = stdout.trim();
+        if (normalizedStdout && isMarkdownLikeContent(normalizedStdout)) {
+          resolve(normalizedStdout);
+          return;
+        }
+        resolve(JSON.stringify({ stdout: normalizedStdout, stderr: stderr.trim() || null }, null, 2));
       });
     });
   }
@@ -1255,7 +2224,7 @@ export class AssistantRuntime {
         body: JSON.stringify({
           model: input.modelName,
           stream: true,
-          messages: this.buildProviderMessages(input.userId, conversation.id, input.prompt, input.dataSourceLabel, input.schemaContextMarkdown, input.skill, input.approvalMode),
+          messages: await this.buildProviderMessages(input.userId, conversation.id, input.prompt, input.dataSourceLabel, input.schemaContextMarkdown, input.skill, input.approvalMode),
           temperature: 0.7,
         }),
         signal: controller.signal,
@@ -1335,7 +2304,7 @@ export class AssistantRuntime {
     }
   }
 
-  private buildProviderMessages(
+  private async buildProviderMessages(
     userId: string,
     conversationId: string,
     prompt: string,
@@ -1344,6 +2313,8 @@ export class AssistantRuntime {
     skill: AssistantSkill | null | undefined,
     approvalMode: AssistantApprovalMode,
   ) {
+    const recentToolContext = this.recentToolContext(userId, conversationId);
+    const workflowContext = await this.workflowContextBuilder.buildMarkdown(conversationId);
     const history = this.getConversationMessages(userId, conversationId)
       .filter((message) => (message.role === "user" || message.role === "assistant") && message.status === "completed" && message.content.trim())
       .slice(-MAX_STORED_MESSAGES_FOR_CONTEXT)
@@ -1360,11 +2331,16 @@ export class AssistantRuntime {
           "所有模型回复必须流式输出。默认普通问答、说明和简短结论使用流式 text；只有报告、方案、结构化分析、代码块、SQL 候选语句、工具调用执行结果和需要长期查看的产物使用流式 markdown。",
           "不要编造数据库结果；需要查询数据源时，应优先使用 request_sql_query_execution 语义生成候选只读 SQL、查询目的和结果用途，SQL 必须先经过安全校验、权限校验、风险评估和用户审批。",
           "当用户要求统计、筛选或读取数据源内容时，必须输出单个 ```sql 代码块承载候选只读 SQL；客户端会自动捕获该 SQL 并进入安全校验、审批和工具执行流程。",
+          "当 Workflow Context 中存在 activeDataset 且用户提到上一轮、当前结果、这批数据或刚才的数据时，候选 SQL 必须优先查询 activeDataset 的 sqliteTableName；不要重新访问原始业务表，除非用户明确要求重新查询原始数据源。",
+          "如果用户明确要求“根据 SQL 查询结果/上一轮查询结果/工具调用结果”继续统计、对比或生成报告，必须复用最近工具结果，不得重新生成 SQL；需要计算时输出单个 ```python 代码块，报告正文必须为 Markdown。",
+          "Python 工具运行在受限本地沙箱中，只能使用 Python 标准库；不得 import pandas、numpy、openpyxl、matplotlib 或任何第三方库。需要读取工作流数据集时使用 sqlite3 连接 Workflow Context 中的 sqliteDatabasePath，并读取 activeDataset.sqliteTableName。",
           "仅在本地脚本调试场景才输出 /sql 或 /python 代码块，客户端会按审批权限处理。",
           `当前数据源：${dataSourceLabel || "未选择"}`,
           `当前 Skill：${skill || "未选择"}`,
           `审批权限：${approvalMode}`,
           schemaContextMarkdown ? `\n以下是已授权数据源 Schema Context。请遵守其中 Usage Policy、安全约束和工具调用要求，不要基于样例行推断全量结论。\n${schemaContextMarkdown}` : undefined,
+          workflowContext ? `\n${workflowContext}` : undefined,
+          recentToolContext ? `\n${recentToolContext}` : undefined,
         ].filter(Boolean).join("\n"),
       },
       ...history,

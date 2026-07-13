@@ -8,6 +8,7 @@ import type {
   AssistantSendResult,
   AssistantStreamEvent,
 } from "../main/assistantRuntime";
+import type { WorkflowContextSummary, WorkflowDatasetRef } from "../main/workflowRuntime";
 
 export type DataSourceMenuAction = "open-database" | "open-csv" | "create-connection" | "import-csv";
 
@@ -45,6 +46,20 @@ const lifecycleXApi = {
         success: true;
         toolCall: unknown;
         message: AssistantMessage;
+      }>,
+    getWorkflowContext: (userId: string, conversationId: string) =>
+      ipcRenderer.invoke("assistant:workflow:context", userId, conversationId) as Promise<WorkflowContextSummary>,
+    confirmWorkflowDataset: (userId: string, conversationId: string, datasetId?: string) =>
+      ipcRenderer.invoke("assistant:workflow:confirm-dataset", userId, conversationId, datasetId) as Promise<{
+        success: true;
+        dataset: WorkflowDatasetRef;
+        context: WorkflowContextSummary;
+      }>,
+    rejectWorkflowDataset: (userId: string, conversationId: string, datasetId: string, reason?: string) =>
+      ipcRenderer.invoke("assistant:workflow:reject-dataset", userId, conversationId, datasetId, reason) as Promise<{
+        success: true;
+        dataset: WorkflowDatasetRef;
+        context: WorkflowContextSummary;
       }>,
     onStreamEvent: (handler: (event: AssistantStreamEvent) => void) => {
       const listener = (_event: Electron.IpcRendererEvent, event: AssistantStreamEvent) => handler(event);
