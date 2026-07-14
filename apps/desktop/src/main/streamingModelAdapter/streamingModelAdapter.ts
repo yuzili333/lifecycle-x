@@ -51,52 +51,56 @@ export class StreamingModelAdapter {
     yield this.event(input, "stream-start", { contentType: input.contentType ?? "markdown" }, traceId);
 
     try {
-      const firstRound = this.streamProviderRound({
-        input,
-        traceId,
-        messages: buildMessages(input),
-        allowTools: true,
-        parser,
-        onContent: (delta) => {
-          content += delta;
-        },
-        versionState,
-      });
-      const firstRoundToolCalls = yield* firstRound;
+      const conversationMessages = buildMessages(input);
+      const maxToolRounds = input.maxToolRounds ?? this.config.maxToolRounds ?? 4;
+      let toolRound = 0;
 
-      if (firstRoundToolCalls.length > 0) {
-        const mode = input.toolExecutionMode ?? this.config.toolExecutionMode ?? "serial";
-        for (const toolCall of firstRoundToolCalls) {
-          yield this.event(input, "tool-execution-start", { toolName: toolCall.name, mode }, traceId, { toolCallId: toolCall.toolCallId });
-        }
-        const toolResults = await this.executeTools(input, traceId, firstRoundToolCalls);
-        for (const toolResult of toolResults) {
-          yield this.toolResultEvent(input, toolResult, traceId);
-        }
-
-        const continuationMessages = [
-          ...buildMessages(input),
-          ...toolResults.map((result): ConversationMessage => ({
-            id: createId("msg"),
-            role: "tool",
-            content: JSON.stringify(result.success ? result.output : result.error),
-            toolCallId: result.toolCallId,
-            toolName: result.toolName,
-            createdAt: nowIso(),
-          })),
-        ];
-        const secondRound = this.streamProviderRound({
+      while (true) {
+        const allowTools = toolRound < maxToolRounds;
+        const round = this.streamProviderRound({
           input,
           traceId,
-          messages: continuationMessages,
-          allowTools: false,
+          messages: conversationMessages,
+          allowTools,
           parser,
           onContent: (delta) => {
             content += delta;
           },
           versionState,
         });
-        yield* secondRound;
+        const toolCalls = yield* round;
+        if (toolCalls.length === 0) {
+          break;
+        }
+
+        toolRound += 1;
+        const mode = input.toolExecutionMode ?? this.config.toolExecutionMode ?? "serial";
+        for (const toolCall of toolCalls) {
+          yield this.event(input, "tool-execution-start", { toolName: toolCall.name, mode, toolRound }, traceId, { toolCallId: toolCall.toolCallId });
+        }
+        const toolResults = await this.executeTools(input, traceId, toolCalls);
+        for (const toolResult of toolResults) {
+          yield this.toolResultEvent(input, toolResult, traceId);
+        }
+
+        conversationMessages.push(toolCallsAssistantMessage(input, toolCalls));
+        conversationMessages.push(...toolResults.map(toolResultMessage));
+
+        if (toolRound >= maxToolRounds) {
+          const finalRound = this.streamProviderRound({
+            input,
+            traceId,
+            messages: conversationMessages,
+            allowTools: false,
+            parser,
+            onContent: (delta) => {
+              content += delta;
+            },
+            versionState,
+          });
+          yield* finalRound;
+          break;
+        }
       }
 
       const flushEvents = parser.flush();
@@ -347,6 +351,36 @@ function buildMessages(input: StreamChatInput): ConversationMessage[] {
     });
   }
   return messages;
+}
+
+function toolCallsAssistantMessage(input: StreamChatInput, toolCalls: AggregatedToolCall[]): ConversationMessage {
+  return {
+    id: createId("msg"),
+    role: "assistant",
+    content: "",
+    toolCalls: toolCalls.map((toolCall) => ({
+      id: toolCall.toolCallId,
+      name: toolCall.name,
+      argumentsText: toolCall.argumentsText || "{}",
+    })),
+    createdAt: nowIso(),
+    metadata: {
+      source: "model-tool-calls",
+      conversationId: input.conversationId,
+      messageId: input.messageId,
+    },
+  };
+}
+
+function toolResultMessage(result: ToolExecutionResult): ConversationMessage {
+  return {
+    id: createId("msg"),
+    role: "tool",
+    content: JSON.stringify(result.success ? result.output ?? null : result.error ?? null) ?? "null",
+    toolCallId: result.toolCallId,
+    toolName: result.toolName,
+    createdAt: nowIso(),
+  };
 }
 
 function latestUserPrompt(messages: ConversationMessage[]) {

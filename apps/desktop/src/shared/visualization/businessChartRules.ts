@@ -23,7 +23,7 @@ export const businessChartRules: BusinessChartRule[] = [
   { semantic: "lifecycle_event_chain", recommendedTypes: ["timeline"], defaultEngine: "vis_timeline", description: "存续期事件链" },
   { semantic: "guarantee_relationship", recommendedTypes: ["network"], defaultEngine: "vis_network", description: "担保关系分析" },
   { semantic: "related_enterprise_risk", recommendedTypes: ["network"], defaultEngine: "vis_network", description: "关联企业风险" },
-  { semantic: "general_analysis", recommendedTypes: ["table", "bar", "line"], defaultEngine: "table", description: "通用分析" },
+  { semantic: "generic_analysis", recommendedTypes: ["table", "bar", "line"], defaultEngine: "table", description: "通用分析" },
 ];
 
 export function getBusinessChartRule(semantic: BusinessVisualizationSemantic | undefined) {

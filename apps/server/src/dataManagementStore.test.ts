@@ -100,6 +100,46 @@ describe("DataManagementStore", () => {
     expect(renamed?.table?.name).toBe("贷后补充数据");
   });
 
+  it("infers numeric CSV fields and keeps quoted comma values aligned", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lifecycle-x-csv-types-"));
+    const storePath = join(tempDir, "data-management-store.json");
+    const sqlitePath = join(tempDir, "csv-data.sqlite");
+
+    try {
+      const store = new DataManagementStore(storePath, sqlitePath);
+      const upload = store.uploadCsv(
+        "loan_contracts_500_v2.csv",
+        [
+          "contract_no,loan_balance_10k,contract_amount_10k,latest_risk_result",
+          '000123,"1,234.50",2800.75,0201--关注1',
+          "000124,10.25,3000,0300--次级",
+        ].join("\n"),
+      );
+      const imported = store.importCsv(upload.file.id, "usr_admin");
+      const table = imported ? store.tableDetail(imported.job.dataSourceId, imported.job.importedTableId) : null;
+
+      expect(table?.columns.find((column) => column.name === "contract_no")?.type).toBe("text");
+      expect(table?.columns.find((column) => column.name === "loan_balance_10k")?.type).toBe("decimal(18,4)");
+      expect(table?.columns.find((column) => column.name === "contract_amount_10k")?.type).toBe("decimal(18,4)");
+      expect(table?.columns.find((column) => column.name === "latest_risk_result")?.type).toBe("text");
+
+      const sample = imported ? store.sampleData(imported.job.dataSourceId, imported.job.importedTableId, "usr_admin", "trace-csv-types") : null;
+      expect(sample?.rows[0]?.contract_no).toBe("000123");
+      expect(sample?.rows[0]?.loan_balance_10k).toBe(1234.5);
+      expect(sample?.rows[0]?.contract_amount_10k).toBe(2800.75);
+      expect(sample?.rows[0]?.latest_risk_result).toBe("0201--关注1");
+
+      const sqlite = new DatabaseSync(sqlitePath, { readOnly: true });
+      const sqliteTable = sqlite.prepare("SELECT sqlite_table_name FROM csv_dataset_tables WHERE data_source_id = ?").get(imported?.job.dataSourceId);
+      const sqliteTypes = sqlite.prepare(`PRAGMA table_info("${sqliteTable.sqlite_table_name}")`).all() as Array<{ name: string; type: string }>;
+      sqlite.close();
+      expect(sqliteTypes.find((column) => column.name === "loan_balance_10k")?.type).toBe("REAL");
+      expect(sqliteTypes.find((column) => column.name === "contract_amount_10k")?.type).toBe("REAL");
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it("keeps previous CSV table names as SQL aliases after rename", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lifecycle-x-csv-alias-"));
     const storePath = join(tempDir, "data-management-store.json");
@@ -203,6 +243,38 @@ describe("DataManagementStore", () => {
     const table = imported ? store.tableDetail(imported.job.dataSourceId, imported.job.importedTableId) : null;
     expect(table?.columns).toHaveLength(100);
     expect(table?.isLarge).toBe(true);
+
+    const sample = imported ? store.sampleData(imported.job.dataSourceId, imported.job.importedTableId, "usr_admin", "trace-wide-csv") : null;
+    expect(sample?.columns).toHaveLength(100);
+    expect(sample?.policy.maxFields).toBe(100);
+    expect(sample?.rows[0]).toHaveProperty("field_100");
+  });
+
+  it("persists all CSV columns in SQLite without field-limit cropping", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lifecycle-x-wide-csv-"));
+    const storePath = join(tempDir, "data-management-store.json");
+    const sqlitePath = join(tempDir, "csv-data.sqlite");
+
+    try {
+      const store = new DataManagementStore(storePath, sqlitePath);
+      const headers = Array.from({ length: 64 }, (_, index) => `field_${index + 1}`);
+      const upload = store.uploadCsv("wide.csv", `${headers.join(",")}\n${headers.map((header) => `${header}_value`).join(",")}\n`);
+      const imported = store.importCsv(upload.file.id, "usr_admin");
+      expect(imported?.job.status).toBe("completed");
+
+      const sample = imported ? store.sampleData(imported.job.dataSourceId, imported.job.importedTableId, "usr_admin", "trace-sqlite-wide-csv") : null;
+      expect(sample?.columns.map((column) => column.name)).toEqual(headers);
+      expect(sample?.rows[0]?.field_64).toBe("field_64_value");
+
+      const sqlite = new DatabaseSync(sqlitePath, { readOnly: true });
+      const metadataCount = sqlite
+        .prepare("SELECT COUNT(*) AS count FROM csv_dataset_columns WHERE data_source_id = ?")
+        .get(imported?.job.dataSourceId);
+      sqlite.close();
+      expect(metadataCount.count).toBe(64);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   it("removes SQLite CSV rows when deleting an imported data source", () => {

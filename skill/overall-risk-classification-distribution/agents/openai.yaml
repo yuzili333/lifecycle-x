@@ -1,0 +1,6 @@
+interface:
+  display_name: "整体风险分类分布（笔数+金额）"
+  short_description: "生成信贷资产风险分类分布分析报告"
+  default_prompt: "Use $overall-risk-classification-distribution to analyze credit asset risk classification distribution and generate a Markdown report."
+policy:
+  allow_implicit_invocation: true

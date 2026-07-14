@@ -884,7 +884,7 @@ export function DataManagementWorkspace({ isActive, canManage, requestWithRefres
                   isDisabled: !canManage,
                 },
                 {
-                  label: "删除CSV数据",
+                  label: "删除数据",
                   onClick: () => {
                     void deleteCsvDataSource(source.id);
                   },
@@ -1173,19 +1173,19 @@ export function DataManagementWorkspace({ isActive, canManage, requestWithRefres
   const isCurrentPageEmpty = activePage === "database" ? databaseSources.length === 0 : csvSources.length === 0;
   const emptyStateConfig = activePage === "database"
     ? {
-        icon: databaseSourceIcon,
-        title: "新增数据库连接",
-        description: "空空如也的数据库",
-        actionLabel: "新增连接",
-        onAction: () => setIsConnectionDialogOpen(true),
-      }
+      icon: databaseSourceIcon,
+      title: "新增数据库连接",
+      description: "空空如也的数据库",
+      actionLabel: "新增连接",
+      onAction: () => setIsConnectionDialogOpen(true),
+    }
     : {
-        icon: csvIcon,
-        title: "新增CSV数据",
-        description: "空空如也的数据集",
-        actionLabel: "导入CSV",
-        onAction: () => setIsCsvDialogOpen(true),
-      };
+      icon: csvIcon,
+      title: "新增CSV数据",
+      description: "空空如也的数据集",
+      actionLabel: "导入CSV",
+      onAction: () => setIsCsvDialogOpen(true),
+    };
 
   const setActivePaginationPage = (page: number) => {
     if (!activeTab) {

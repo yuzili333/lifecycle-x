@@ -157,6 +157,20 @@ function toProviderMessage(message: ConversationMessage) {
       name: message.toolName,
     };
   }
+  if (message.role === "assistant" && message.toolCalls?.length) {
+    return {
+      role: "assistant",
+      content: message.content || null,
+      tool_calls: message.toolCalls.map((toolCall) => ({
+        id: toolCall.id,
+        type: "function",
+        function: {
+          name: toolCall.name,
+          arguments: toolCall.argumentsText,
+        },
+      })),
+    };
+  }
   return {
     role: message.role,
     content: message.content,

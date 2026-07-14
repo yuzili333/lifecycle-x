@@ -34,7 +34,7 @@ type WorkbenchShellProps = {
 
 type WorkbenchModule = "data-assistant" | "data-management";
 type SettingsTab = "profile" | "general" | "appearance" | "agent" | "logout";
-type SessionExpiredPromptPhase = "idle" | "prompting" | "logging-out";
+type SessionExpiredPromptPhase = "idle" | "prompting" | "logging-out" | "handled";
 
 const DEFAULT_WORKBENCH_MODULE: WorkbenchModule = "data-assistant";
 const WORKBENCH_NAV_CACHE_KEY_PREFIX = "cycle-probe:workbench:last-module";
@@ -383,6 +383,17 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
 
   const requestWithRefresh = useCallback(
     async <T extends { success: true }>(call: (accessToken: string) => Promise<ApiResult<T>>): Promise<ApiResult<T>> => {
+      if (sessionExpiredPromptPhaseRef.current === "logging-out" || sessionExpiredPromptPhaseRef.current === "handled") {
+        return {
+          success: false,
+          error: {
+            code: "SESSION_EXPIRED",
+            message: "登录态已过期，请重新登录。",
+            traceId: "client-session-expired-handled",
+          },
+        };
+      }
+
       if (!auth.accessToken) {
         openSessionExpiredConfirm();
         return {
@@ -563,17 +574,24 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
 
   const confirmLogout = async () => {
     setIsLogoutConfirmOpen(false);
+    sessionExpiredPromptPhaseRef.current = "handled";
+    setIsSessionExpiredConfirmOpen(false);
     await auth.logout();
   };
 
   const confirmSessionExpiredLogout = async () => {
-    if (sessionExpiredPromptPhaseRef.current === "logging-out") {
+    if (sessionExpiredPromptPhaseRef.current === "logging-out" || sessionExpiredPromptPhaseRef.current === "handled") {
       return;
     }
     sessionExpiredPromptPhaseRef.current = "logging-out";
     setIsSessionExpiredLogoutPending(true);
     setIsSessionExpiredConfirmOpen(false);
-    await auth.logout({ remote: false });
+    try {
+      await auth.logout({ remote: false });
+    } finally {
+      sessionExpiredPromptPhaseRef.current = "handled";
+      setIsSessionExpiredLogoutPending(false);
+    }
   };
 
   const handleAvatarSave = async () => {
@@ -1140,9 +1158,10 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
       </Dialog>
 
       <Dialog
-        isOpen={isSessionExpiredConfirmOpen}
+        isOpen={isSessionExpiredConfirmOpen && sessionExpiredPromptPhaseRef.current === "prompting"}
         onOpenChange={(open) => {
-          if (open) {
+          if (open && sessionExpiredPromptPhaseRef.current === "idle") {
+            sessionExpiredPromptPhaseRef.current = "prompting";
             setIsSessionExpiredConfirmOpen(true);
           }
         }}

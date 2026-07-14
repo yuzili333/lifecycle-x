@@ -74,6 +74,11 @@ export type ConversationMessage = {
   content: string;
   toolCallId?: string;
   toolName?: string;
+  toolCalls?: Array<{
+    id: string;
+    name: string;
+    argumentsText: string;
+  }>;
   createdAt: string;
   metadata?: Record<string, unknown>;
 };
@@ -171,6 +176,7 @@ export type StreamChatInput = {
   traceId?: string;
   contentType?: "text" | "markdown";
   toolExecutionMode?: ToolExecutionMode;
+  maxToolRounds?: number;
   signal?: AbortSignal;
   timeoutMs?: number;
   metadata?: Record<string, unknown>;
@@ -185,6 +191,7 @@ export type StreamingModelAdapterConfig = {
   timeoutMs?: number;
   fetch?: typeof fetch;
   toolExecutionMode?: ToolExecutionMode;
+  maxToolRounds?: number;
 };
 
 export type CreateVersionInput = Omit<ContentVersion, "versionId" | "createdAt" | "updatedAt" | "status"> & {

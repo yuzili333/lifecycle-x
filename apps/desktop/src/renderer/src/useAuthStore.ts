@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { authApi, isAuthSuccess, type AuthFailure, type AuthSuccess, type AuthUser } from "./auth";
 
 export type AuthStatus = "checking" | "anonymous" | "authenticated";
@@ -21,6 +21,7 @@ type LogoutOptions = {
 };
 
 export function useAuthStore() {
+  const logoutPromiseRef = useRef<Promise<void> | null>(null);
   const [state, setState] = useState<AuthState>({
     status: "checking",
     accessToken: null,
@@ -93,24 +94,61 @@ export function useAuthStore() {
   );
 
   const clearLocalAuth = useCallback(async (lastError: AuthFailure | null = null) => {
-    await window.lifecycleX?.auth.clearRefreshToken();
-    setState({
-      status: "anonymous",
-      accessToken: null,
-      user: null,
-      permissions: [],
-      expiresAt: null,
-      lastError,
+    setState((current) => {
+      const next: AuthState = {
+        status: "anonymous",
+        accessToken: null,
+        user: null,
+        permissions: [],
+        expiresAt: null,
+        lastError,
+      };
+      if (
+        current.status === next.status &&
+        current.accessToken === next.accessToken &&
+        current.user === next.user &&
+        current.expiresAt === next.expiresAt &&
+        current.lastError === next.lastError &&
+        current.permissions.length === 0
+      ) {
+        return current;
+      }
+      return next;
     });
+
+    try {
+      await window.lifecycleX?.auth.clearRefreshToken();
+    } catch {
+      // The renderer must leave the authenticated route even if token storage cleanup fails.
+    }
   }, []);
 
   const logout = useCallback(async (options: LogoutOptions = {}) => {
-    const shouldLogoutRemote = options.remote ?? true;
-    if (shouldLogoutRemote) {
-      const refreshToken = (await window.lifecycleX?.auth.getRefreshToken()) ?? null;
-      await authApi.logout(refreshToken ?? undefined);
+    if (logoutPromiseRef.current) {
+      return logoutPromiseRef.current;
     }
-    await clearLocalAuth();
+
+    const shouldLogoutRemote = options.remote ?? true;
+    const logoutPromise = (async () => {
+      let refreshToken: string | null = null;
+      if (shouldLogoutRemote) {
+        try {
+          refreshToken = (await window.lifecycleX?.auth.getRefreshToken()) ?? null;
+        } catch {
+          refreshToken = null;
+        }
+      }
+
+      await clearLocalAuth();
+      if (shouldLogoutRemote && refreshToken) {
+        await authApi.logout(refreshToken);
+      }
+    })().finally(() => {
+      logoutPromiseRef.current = null;
+    });
+
+    logoutPromiseRef.current = logoutPromise;
+    return logoutPromise;
   }, [clearLocalAuth]);
 
   const refreshSession = useCallback(async (options: RefreshSessionOptions = {}): Promise<AuthSuccess | false> => {

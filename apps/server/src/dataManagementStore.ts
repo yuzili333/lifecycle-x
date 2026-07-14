@@ -107,6 +107,8 @@ export type DatabaseTable = {
   sampleRows: Record<string, string | number | boolean | null>[];
 };
 
+type CsvCellValue = string | number | null;
+
 export type ConnectionInput = {
   name?: string;
   type?: DataSourceType;
@@ -231,21 +233,93 @@ function maskValue(value: unknown) {
 
 function parseCsv(content: string) {
   const normalizedContent = content.replace(/^\uFEFF/, "");
-  const lines = normalizedContent
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-  if (lines.length === 0) {
+  const records = parseCsvRecords(normalizedContent);
+  if (records.length === 0) {
     return { headers: [] as string[], rows: [] as Record<string, string>[], delimiter: ",", encoding: content.startsWith("\uFEFF") ? "utf-8-bom" : "utf-8" };
   }
 
-  const delimiter = detectDelimiter(lines[0]);
-  const headers = lines[0].split(delimiter).map((item) => item.trim() || "column");
-  const rows = lines.slice(1).map((line) => {
-    const values = line.split(delimiter);
+  const delimiter = detectDelimiter(records[0] ?? "");
+  const parsedRecords = records.map((line) => parseCsvRecord(line, delimiter));
+  const headers = uniqueCsvHeaders((parsedRecords[0] ?? []).map((item) => item.trim() || "column"));
+  const rows = parsedRecords.slice(1).map((values) => {
     return Object.fromEntries(headers.map((header, index) => [header, values[index]?.trim() ?? ""]));
   });
   return { headers, rows, delimiter, encoding: content.startsWith("\uFEFF") ? "utf-8-bom" : "utf-8" };
+}
+
+function parseCsvRecords(content: string) {
+  const records: string[] = [];
+  let current = "";
+  let inQuotes = false;
+
+  for (let index = 0; index < content.length; index += 1) {
+    const char = content[index];
+    const next = content[index + 1];
+    if (char === '"' && inQuotes && next === '"') {
+      current += char;
+      index += 1;
+      continue;
+    }
+    if (char === '"') {
+      inQuotes = !inQuotes;
+      current += char;
+      continue;
+    }
+    if ((char === "\n" || char === "\r") && !inQuotes) {
+      if (current.trim()) {
+        records.push(current);
+      }
+      current = "";
+      if (char === "\r" && next === "\n") {
+        index += 1;
+      }
+      continue;
+    }
+    current += char;
+  }
+
+  if (current.trim()) {
+    records.push(current);
+  }
+  return records;
+}
+
+function parseCsvRecord(line: string, delimiter: string) {
+  const values: string[] = [];
+  let current = "";
+  let inQuotes = false;
+
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index];
+    const next = line[index + 1];
+    if (char === '"' && inQuotes && next === '"') {
+      current += char;
+      index += 1;
+      continue;
+    }
+    if (char === '"') {
+      inQuotes = !inQuotes;
+      continue;
+    }
+    if (char === delimiter && !inQuotes) {
+      values.push(current);
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  values.push(current);
+  return values;
+}
+
+function uniqueCsvHeaders(headers: string[]) {
+  const used = new Map<string, number>();
+  return headers.map((header, index) => {
+    const baseName = header || `column_${index + 1}`;
+    const count = used.get(baseName) ?? 0;
+    used.set(baseName, count + 1);
+    return count === 0 ? baseName : `${baseName}_${count + 1}`;
+  });
 }
 
 function detectDelimiter(headerLine: string) {
@@ -287,6 +361,88 @@ function uniqueSqliteColumnNames(headers: string[]) {
   });
 }
 
+function isIntegerType(type: string) {
+  return /int|bigint|smallint|tinyint/i.test(type);
+}
+
+function isNumberType(type: string) {
+  return isIntegerType(type) || /decimal|numeric|float|double|real|number/i.test(type);
+}
+
+function sqliteTypeForColumn(column: DatabaseColumn) {
+  if (isIntegerType(column.type)) {
+    return "INTEGER";
+  }
+  if (isNumberType(column.type)) {
+    return "REAL";
+  }
+  return "TEXT";
+}
+
+function parseCsvNumber(value: unknown) {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : null;
+  }
+  const text = String(value ?? "").trim();
+  if (!text) {
+    return null;
+  }
+  const normalized = text.replaceAll(",", "");
+  const number = Number(normalized);
+  return Number.isFinite(number) ? number : null;
+}
+
+function csvValueForColumn(column: DatabaseColumn, value: unknown): CsvCellValue {
+  const text = String(value ?? "").trim();
+  if (!text) {
+    return null;
+  }
+  return isNumberType(column.type) ? parseCsvNumber(text) : text;
+}
+
+function isCsvIntegerLiteral(value: string) {
+  return /^[-+]?(?:0|[1-9]\d*)$/.test(value);
+}
+
+function isCsvDecimalLiteral(value: string) {
+  return /^[-+]?(?:(?:0|[1-9]\d*)\.\d+|\.\d+)$/.test(value);
+}
+
+function isCsvThousandsNumberLiteral(value: string) {
+  return /^[-+]?(?:\d{1,3}(?:,\d{3})+)(?:\.\d+)?$/.test(value);
+}
+
+function inferCsvColumnType(values: unknown[]) {
+  const nonEmpty = values.map((value) => String(value ?? "").trim()).filter(Boolean);
+  if (nonEmpty.length === 0) {
+    return "text";
+  }
+  if (nonEmpty.every((value) => isCsvIntegerLiteral(value))) {
+    return "bigint";
+  }
+  if (nonEmpty.every((value) => isCsvIntegerLiteral(value) || isCsvDecimalLiteral(value) || isCsvThousandsNumberLiteral(value))) {
+    return "decimal(18,4)";
+  }
+  if (nonEmpty.every((value) => /^\d{4}-\d{1,2}-\d{1,2}$/.test(value))) {
+    return "date";
+  }
+  return "text";
+}
+
+function inferCsvColumns(headers: string[], rows: Record<string, string>[], tableId: string): DatabaseColumn[] {
+  return headers.map((header) => ({
+    id: `${tableId}:col:${header}`,
+    name: header,
+    type: inferCsvColumnType(rows.map((row) => row[header])),
+    nullable: rows.some((row) => !String(row[header] ?? "").trim()),
+    primaryKey: false,
+    indexed: false,
+    sensitive: isSensitiveName(header),
+    largeField: false,
+    comment: "CSV 推断字段",
+  }));
+}
+
 class CsvSqliteStore {
   private db: any | null = null;
 
@@ -319,7 +475,7 @@ class CsvSqliteStore {
     tableId: string;
     tableName: string;
     columns: DatabaseColumn[];
-    rows: Record<string, string>[];
+    rows: Record<string, CsvCellValue>[];
     importedAt: string;
   }) {
     if (!this.db) {
@@ -335,7 +491,9 @@ class CsvSqliteStore {
     }));
     const sqliteDataColumns = sqliteColumns.map((column) => quoteIdentifier(column.sqliteColumnName));
     const createSql = `CREATE TABLE ${quoteIdentifier(sqliteTableName)} ("__row_index" INTEGER PRIMARY KEY${
-      sqliteDataColumns.length > 0 ? `, ${sqliteDataColumns.map((columnName) => `${columnName} TEXT`).join(", ")}` : ""
+      sqliteColumns.length > 0
+        ? `, ${sqliteColumns.map((column) => `${quoteIdentifier(column.sqliteColumnName)} ${sqliteTypeForColumn(column)}`).join(", ")}`
+        : ""
     })`;
 
     this.transaction(() => {
@@ -380,7 +538,7 @@ class CsvSqliteStore {
         `INSERT INTO ${quoteIdentifier(sqliteTableName)} (${insertColumns}) VALUES (${placeholders})`,
       );
       for (const [rowIndex, row] of input.rows.entries()) {
-        insertRow.run(rowIndex + 1, ...input.columns.map((column) => row[column.name] ?? null));
+        insertRow.run(rowIndex + 1, ...input.columns.map((column) => csvValueForColumn(column, row[column.name])));
       }
     });
   }
@@ -397,7 +555,17 @@ class CsvSqliteStore {
     const selectColumns = columns
       .map((column) => {
         const sqliteColumn = sqliteColumns.find((candidate) => candidate.name === column.name);
-        return sqliteColumn ? `${quoteIdentifier(sqliteColumn.sqlite_column_name)} AS ${quoteIdentifier(column.name)}` : null;
+        if (!sqliteColumn) {
+          return null;
+        }
+        const quotedSqliteColumn = quoteIdentifier(sqliteColumn.sqlite_column_name);
+        if (isIntegerType(column.type)) {
+          return `CASE WHEN ${quotedSqliteColumn} IS NULL OR ${quotedSqliteColumn} = '' THEN NULL ELSE CAST(REPLACE(${quotedSqliteColumn}, ',', '') AS INTEGER) END AS ${quoteIdentifier(column.name)}`;
+        }
+        if (isNumberType(column.type)) {
+          return `CASE WHEN ${quotedSqliteColumn} IS NULL OR ${quotedSqliteColumn} = '' THEN NULL ELSE CAST(REPLACE(${quotedSqliteColumn}, ',', '') AS REAL) END AS ${quoteIdentifier(column.name)}`;
+        }
+        return `${quotedSqliteColumn} AS ${quoteIdentifier(column.name)}`;
       })
       .filter(Boolean);
     if (selectColumns.length === 0) {
@@ -405,7 +573,42 @@ class CsvSqliteStore {
     }
     return this.db
       .prepare(`SELECT ${selectColumns.join(", ")} FROM ${quoteIdentifier(table.sqlite_table_name)} ORDER BY "__row_index" LIMIT ?`)
-      .all(limit) as Record<string, string | null>[];
+      .all(limit) as Record<string, string | number | null>[];
+  }
+
+  inferStoredColumnTypes(dataSourceId: string, columns: DatabaseColumn[], sampleLimit = 500) {
+    if (!this.db) {
+      return new Map<string, string>();
+    }
+    const table = this.datasetTable(dataSourceId);
+    if (!table) {
+      return new Map<string, string>();
+    }
+    const sqliteColumns = this.sqliteColumns(dataSourceId);
+    const inferred = new Map<string, string>();
+    for (const column of columns) {
+      const sqliteColumn = sqliteColumns.find((candidate) => candidate.name === column.name);
+      if (!sqliteColumn) {
+        continue;
+      }
+      const rows = this.db
+        .prepare(`SELECT ${quoteIdentifier(sqliteColumn.sqlite_column_name)} AS value FROM ${quoteIdentifier(table.sqlite_table_name)} ORDER BY "__row_index" LIMIT ?`)
+        .all(sampleLimit) as Array<{ value: unknown }>;
+      inferred.set(column.name, inferCsvColumnType(rows.map((row) => row.value)));
+    }
+    return inferred;
+  }
+
+  updateColumnTypes(dataSourceId: string, columnTypes: Map<string, string>) {
+    if (!this.db || columnTypes.size === 0) {
+      return;
+    }
+    const updateColumnType = this.db.prepare("UPDATE csv_dataset_columns SET type = ? WHERE data_source_id = ? AND name = ?");
+    this.transaction(() => {
+      for (const [columnName, type] of columnTypes) {
+        updateColumnType.run(type, dataSourceId, columnName);
+      }
+    });
   }
 
   deleteDataset(dataSourceId: string) {
@@ -543,6 +746,7 @@ export class DataManagementStore {
     this.loadPersistedState();
     this.migrateSnapshotCsvRowsToSqlite();
     this.syncCsvDatasetAliases();
+    this.refreshCsvColumnTypes();
   }
 
   listDataSources() {
@@ -691,10 +895,10 @@ export class DataManagementStore {
       return null;
     }
 
-    const safeColumns = table.columns
+    const readableColumns = table.columns
       .filter((column) => !column.largeField)
-      .filter((column) => !columns || columns.length === 0 || columns.includes(column.name))
-      .slice(0, source.safety.fieldLimit);
+      .filter((column) => !columns || columns.length === 0 || columns.includes(column.name));
+    const safeColumns = table.type === "imported" ? readableColumns : readableColumns.slice(0, source.safety.fieldLimit);
     const rowLimit = table.type === "imported" && !table.isLarge ? table.estimatedRows : Math.min(limit, source.safety.sampleLimit);
     const sourceRows =
       table.type === "imported"
@@ -712,7 +916,7 @@ export class DataManagementStore {
       rows,
       policy: {
         maxRows: rowLimit,
-        maxFields: source.safety.fieldLimit,
+        maxFields: table.type === "imported" ? safeColumns.length : source.safety.fieldLimit,
         maskedFields: safeColumns.filter((column) => column.sensitive).map((column) => column.name),
         skippedLargeFields: table.columns.filter((column) => column.largeField).map((column) => column.name),
       },
@@ -773,7 +977,7 @@ export class DataManagementStore {
         rows: parsed.rows.slice(0, 10),
         inferredColumns: parsed.headers.map((header) => ({
           name: header,
-          type: /^\d+$/.test(parsed.rows[0]?.[header] ?? "") ? "number" : "text",
+          type: inferCsvColumnType(parsed.rows.map((row) => row[header])),
           sensitive: isSensitiveName(header),
           csvInjectionRisk: parsed.rows.some((row) => /^[=+\-@]/.test(row[header] ?? "")),
         })),
@@ -810,17 +1014,7 @@ export class DataManagementStore {
     source.schemaCount = 1;
     source.tableCount = 1;
     const actualSizeMb = Math.max(1, Math.round(file.content.length / 1024 / 1024));
-    const columns: DatabaseColumn[] = parsed.headers.map((header) => ({
-      id: `${tableId}:col:${header}`,
-      name: header,
-      type: "text",
-      nullable: true,
-      primaryKey: false,
-      indexed: false,
-      sensitive: isSensitiveName(header),
-      largeField: false,
-      comment: "CSV 推断字段",
-    }));
+    const columns = inferCsvColumns(parsed.headers, parsed.rows, tableId);
     this.csvSqliteStore.importDataset({
       dataSourceId,
       tableId,
@@ -839,7 +1033,10 @@ export class DataManagementStore {
       columnCount: parsed.headers.length,
     });
     this.schemas.set(dataSourceId, [{ id: `${dataSourceId}:schema:csv_imports`, dataSourceId, name: "csv_imports", tableCount: 1, viewCount: 0, lastSyncedAt: source.lastSyncedAt }]);
-    const previewRows = this.csvSqliteStore.isAvailable ? parsed.rows.slice(0, CSV_PREVIEW_ROW_LIMIT) : parsed.rows;
+    const normalizedRows = parsed.rows.map((row) =>
+      Object.fromEntries(columns.map((column) => [column.name, csvValueForColumn(column, row[column.name])])) as Record<string, string | number | boolean | null>,
+    );
+    const previewRows = this.csvSqliteStore.isAvailable ? normalizedRows.slice(0, CSV_PREVIEW_ROW_LIMIT) : normalizedRows;
     this.tables.set(dataSourceId, [
       applyLargeTableRule({
         id: tableId,
@@ -1008,6 +1205,48 @@ export class DataManagementStore {
         [originalFileBaseName, importedTable?.name, source.name].filter((alias): alias is string => Boolean(alias?.trim())),
         updatedAt,
       );
+    }
+  }
+
+  private refreshCsvColumnTypes() {
+    let didUpdate = false;
+    for (const source of this.dataSources.values()) {
+      if (source.type !== "csv") {
+        continue;
+      }
+      const sourceTables = this.tables.get(source.id) ?? [];
+      const importedTable = sourceTables.find((table) => table.type === "imported") ?? sourceTables[0];
+      if (!importedTable) {
+        continue;
+      }
+      const inferredTypes = this.csvSqliteStore.hasDataset(source.id)
+        ? this.csvSqliteStore.inferStoredColumnTypes(source.id, importedTable.columns)
+        : new Map(importedTable.columns.map((column) => [column.name, inferCsvColumnType(importedTable.sampleRows.map((row) => row[column.name]))]));
+      const changedTypes = new Map<string, string>();
+      const nextColumns = importedTable.columns.map((column) => {
+        const inferredType = inferredTypes.get(column.name);
+        if (!inferredType || inferredType === column.type) {
+          return column;
+        }
+        didUpdate = true;
+        changedTypes.set(column.name, inferredType);
+        return { ...column, type: inferredType };
+      });
+      importedTable.columns = nextColumns;
+      const nextSampleRows = importedTable.sampleRows.map((row) =>
+        Object.fromEntries(nextColumns.map((column) => [column.name, csvValueForColumn(column, row[column.name])])) as Record<string, string | number | boolean | null>,
+      );
+      if (JSON.stringify(nextSampleRows) !== JSON.stringify(importedTable.sampleRows)) {
+        didUpdate = true;
+      }
+      importedTable.sampleRows = nextSampleRows;
+      if (changedTypes.size > 0) {
+        this.csvSqliteStore.updateColumnTypes(source.id, changedTypes);
+      }
+    }
+
+    if (didUpdate) {
+      this.persist();
     }
   }
 

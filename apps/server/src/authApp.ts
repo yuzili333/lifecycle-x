@@ -1,7 +1,7 @@
 import express, { type Request, type Response } from "express";
 import { randomUUID } from "node:crypto";
 import { AuthStore, MAX_FAILED_ATTEMPTS, type WorkbenchSettings } from "./authStore.js";
-import { DataManagementStore, type ConnectionInput } from "./dataManagementStore.js";
+import { DataManagementStore, type ConnectionInput, type DatabaseColumn, type DatabaseTable } from "./dataManagementStore.js";
 import type { AuthErrorCode, AuthFailure, AuthSuccess, AuthUser, ClientInfo } from "./types.js";
 
 const DEFAULT_PORT = 4317;
@@ -70,6 +70,85 @@ function clientInfo(body: unknown): ClientInfo | undefined {
   }
   const value = (body as { clientInfo?: ClientInfo }).clientInfo;
   return value && typeof value === "object" ? value : undefined;
+}
+
+const OVERALL_RISK_CLASSIFICATION_SKILL_ID = "overall-risk-classification-distribution";
+
+const OVERALL_RISK_COLUMN_SCOPES: Array<{ semantic: string; patterns: RegExp[] }> = [
+  {
+    semantic: "contractId",
+    patterns: [/^contract_(serial|no|id)$/i, /合同.*(流水|编号|号码|号|id)/i, /借据.*(号|编号|id)/i, /业务.*(编号|号|id)/i, /^loan_?id$/i],
+  },
+  {
+    semantic: "fiveLevelClassification",
+    patterns: [/^latest_five_level_risk$/i, /five.*level.*risk/i, /五级/i, /五.*分类/i],
+  },
+  {
+    semantic: "twelveLevelClassification",
+    patterns: [/^latest_risk_result$/i, /^latest_risk$/i, /^latest_risk_class$/i, /twelve/i, /十二/i, /风险分类(结果|名称|明细)?/i],
+  },
+  {
+    semantic: "loanBalance",
+    patterns: [/^loan_balance(_\w+)?$/i, /贷款.*余额/i, /本金.*余额/i, /^balance$/i, /当前.*余额/i],
+  },
+  {
+    semantic: "contractAmount",
+    patterns: [/^contract_amount(_\w+)?$/i, /合同.*金额/i, /授信.*金额/i, /发放.*金额/i],
+  },
+  {
+    semantic: "reportDate",
+    patterns: [/^(p_date|partition_date|report_date|stat_date|statistics_date)$/i, /分区日期/i, /统计日期/i, /报告日期/i],
+  },
+  {
+    semantic: "institution",
+    patterns: [/^branch_name$/i, /^institution_(code|name)$/i, /^accounting_org_(code|name)$/i, /机构.*(编码|代码|名称)/i, /分行/i],
+  },
+  {
+    semantic: "product",
+    patterns: [/^(source_)?product_(code|name)$/i, /产品.*(编码|代码|名称)/i],
+  },
+  {
+    semantic: "currency",
+    patterns: [/^currency$/i, /币种/i],
+  },
+  {
+    semantic: "businessStatus",
+    patterns: [/^(contract_status|business_status)$/i, /业务状态/i, /合同状态/i],
+  },
+];
+
+function normalizeSkillId(value: unknown) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function columnSearchText(column: DatabaseColumn) {
+  return `${column.name}\n${column.comment ?? ""}`;
+}
+
+function matchesColumnScope(column: DatabaseColumn, patterns: RegExp[]) {
+  const searchText = columnSearchText(column);
+  return patterns.some((pattern) => pattern.test(searchText));
+}
+
+function allowedColumnsForSkill(dataStore: DataManagementStore, dataSourceId: string, skillId: string) {
+  if (skillId !== OVERALL_RISK_CLASSIFICATION_SKILL_ID) {
+    return undefined;
+  }
+  const tables = dataStore.listTables(dataSourceId);
+  const allowedByTable = Object.fromEntries(
+    tables.map((table: DatabaseTable) => {
+      const allowed = new Set<string>();
+      for (const scope of OVERALL_RISK_COLUMN_SCOPES) {
+        for (const column of table.columns) {
+          if (matchesColumnScope(column, scope.patterns)) {
+            allowed.add(column.name);
+          }
+        }
+      }
+      return [table.name, Array.from(allowed)];
+    }),
+  );
+  return { [dataSourceId]: allowedByTable };
 }
 
 function bearerToken(request: Request) {
@@ -862,14 +941,23 @@ export function createAuthApp(store = new AuthStore(), dataStore = new DataManag
       sendFailure(response, auth.status, auth.code, auth.message, traceId);
       return;
     }
+    const dataSourceId = typeof request.query.dataSourceId === "string" ? request.query.dataSourceId : undefined;
+    const skillId = normalizeSkillId(request.query.skill);
+    const allowedColumns = dataSourceId ? allowedColumnsForSkill(dataStore, dataSourceId, skillId) : undefined;
     const context = await dataStore.schemaContext({
       conversationId: typeof request.query.conversationId === "string" ? request.query.conversationId : undefined,
       userQuestion: typeof request.query.question === "string" ? request.query.question : undefined,
       purpose: typeof request.query.purpose === "string" ? (request.query.purpose as never) : undefined,
       tokenBudget: {
         maxChars: typeof request.query.maxChars === "string" ? Number(request.query.maxChars) : undefined,
+        maxColumnsPerTable: typeof request.query.maxColumnsPerTable === "string" ? Number(request.query.maxColumnsPerTable) : undefined,
       },
-      userPermissionContext: typeof request.query.dataSourceId === "string" ? { allowedDataSourceIds: [request.query.dataSourceId] } : undefined,
+      userPermissionContext: dataSourceId
+        ? {
+            allowedDataSourceIds: [dataSourceId],
+            allowedColumns,
+          }
+        : undefined,
     });
     response.json(context);
   });

@@ -1,0 +1,207 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cycle-probe.local/schemas/overall-risk-classification-skill-input.schema.json",
+  "title": "OverallRiskClassificationSkillInput",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "dataSourceId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "当前会话选择的数据源 ID；未提供时由会话上下文解析。"
+    },
+    "fieldMapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "contractId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "fiveLevelClassification": {
+          "type": "string",
+          "minLength": 1
+        },
+        "twelveLevelClassification": {
+          "type": "string",
+          "minLength": 1
+        },
+        "loanBalance": {
+          "type": "string",
+          "minLength": 1
+        },
+        "contractAmount": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "filters": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "reportDate": {
+          "type": "string",
+          "minLength": 1
+        },
+        "startDate": {
+          "type": "string",
+          "minLength": 1
+        },
+        "endDate": {
+          "type": "string",
+          "minLength": 1
+        },
+        "institutionCodes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "productCodes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "businessStatuses": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "additionalDescription": {
+          "type": "string"
+        }
+      }
+    },
+    "analysisOptions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "amountMetric": {
+          "type": "string",
+          "enum": [
+            "loan_balance",
+            "contract_amount"
+          ],
+          "default": "loan_balance"
+        },
+        "includeTwelveLevel": {
+          "type": "boolean",
+          "default": true
+        },
+        "includeBoundaryRisk": {
+          "type": "boolean",
+          "default": true
+        },
+        "boundaryRiskCategories": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "default": [
+            "正常3",
+            "关注"
+          ]
+        },
+        "amountUnit": {
+          "type": "string",
+          "enum": [
+            "yuan",
+            "ten_thousand_yuan",
+            "hundred_million_yuan"
+          ],
+          "default": "ten_thousand_yuan"
+        }
+      }
+    },
+    "outputOptions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "includeCharts": {
+          "type": "boolean",
+          "default": true
+        },
+        "includeKpiCards": {
+          "type": "boolean",
+          "default": true
+        },
+        "includeExecutiveSummary": {
+          "type": "boolean",
+          "default": false
+        },
+        "includeRecommendations": {
+          "type": "boolean",
+          "default": true
+        },
+        "reportTitle": {
+          "type": "string",
+          "minLength": 1,
+          "default": "整体风险分类分布（笔数+金额）分析报告"
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "analysisOptions": {
+            "properties": {
+              "amountMetric": {
+                "const": "contract_amount"
+              }
+            },
+            "required": [
+              "amountMetric"
+            ]
+          }
+        },
+        "required": [
+          "analysisOptions"
+        ]
+      },
+      "then": {
+        "properties": {
+          "fieldMapping": {
+            "required": [
+              "contractAmount"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "not": {
+        "anyOf": [
+          {
+            "required": [
+              "sql"
+            ]
+          },
+          {
+            "required": [
+              "connectionString"
+            ]
+          },
+          {
+            "required": [
+              "localFilePath"
+            ]
+          },
+          {
+            "required": [
+              "toolName"
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

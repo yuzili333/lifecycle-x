@@ -37,7 +37,7 @@ export const businessVisualizationSemantics = [
   "lifecycle_event_chain",
   "guarantee_relationship",
   "related_enterprise_risk",
-  "general_analysis",
+  "generic_analysis",
 ] as const;
 
 export type BusinessVisualizationSemantic = (typeof businessVisualizationSemantics)[number];

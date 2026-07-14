@@ -155,8 +155,10 @@ export type SchemaContextQuery = {
   conversationId?: string;
   question?: string;
   dataSourceId?: string;
+  skill?: string | null;
   purpose?: "data_exploration" | "sql_generation" | "risk_analysis" | "report_generation" | "chart_generation";
   maxChars?: number;
+  maxColumnsPerTable?: number;
 };
 
 export type DataSourceInput = {
@@ -372,11 +374,17 @@ export const workbenchApi = {
     if (query.dataSourceId) {
       params.set("dataSourceId", query.dataSourceId);
     }
+    if (query.skill) {
+      params.set("skill", query.skill);
+    }
     if (query.purpose) {
       params.set("purpose", query.purpose);
     }
     if (query.maxChars) {
       params.set("maxChars", String(query.maxChars));
+    }
+    if (query.maxColumnsPerTable) {
+      params.set("maxColumnsPerTable", String(query.maxColumnsPerTable));
     }
     const suffix = params.size > 0 ? `?${params.toString()}` : "";
     return request<SchemaContextResult>(`/agent/context/schema${suffix}`, {

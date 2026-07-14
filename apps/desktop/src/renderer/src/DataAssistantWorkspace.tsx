@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useState, type CSSProperties } from "react";
 import { Avatar } from "@astryxdesign/core/Avatar";
 import { Button } from "@astryxdesign/core/Button";
-import { ClickableCard } from "@astryxdesign/core/ClickableCard";
 import {
   ChatComposer,
   ChatLayout,
@@ -17,7 +16,7 @@ import { CodeBlock } from "@astryxdesign/core/CodeBlock";
 import { Dialog } from "@astryxdesign/core/Dialog";
 import { DropdownMenu, type DropdownMenuOption } from "@astryxdesign/core/DropdownMenu";
 import { Icon } from "@astryxdesign/core/Icon";
-import { Card, HStack, StackItem, VStack } from "@astryxdesign/core/Layout";
+import { Card, HStack, VStack } from "@astryxdesign/core/Layout";
 import { Markdown, type MarkdownComponents } from "@astryxdesign/core/Markdown";
 import { ResizeHandle, useResizable } from "@astryxdesign/core/Resizable";
 import { Section } from "@astryxdesign/core/Section";
@@ -26,11 +25,12 @@ import { Text } from "@astryxdesign/core/Text";
 import { Token } from "@astryxdesign/core/Token";
 import { Toolbar } from "@astryxdesign/core/Toolbar";
 import { Tooltip } from "@astryxdesign/core/Tooltip";
-import { ChevronRight, CircleAlert, Clock, Copy, FileText, LoaderCircle, Maximize2, Minimize2, Pencil, Plus, RotateCcw, Sparkles, Trash2, X, type LucideIcon } from "lucide-react";
+import { CircleAlert, Clock, Copy, FileText, LoaderCircle, Maximize2, Minimize2, Pencil, Plus, RotateCcw, Sparkles, Trash2, X, type LucideIcon } from "lucide-react";
 import type { AuthFailure, AuthUser } from "./auth";
 import { useAppToast } from "./useAppToast";
 import { workbenchApi, type ApiResult, type DataSourceSummary } from "./workbenchApi";
 import { VisualizationRenderer } from "./components/VisualizationRenderer";
+import { ReportMarkdownViewer, ReportToolCallCard, toolKindLabel, toolStatusLabel } from "./components/tool-calls";
 import { parseVisualizationSpecJson } from "../../shared/visualization";
 import approveIcon from "./assets/approve.svg";
 import attachIcon from "./assets/attach.svg";
@@ -44,6 +44,7 @@ import type {
   AssistantSkill,
   AssistantStreamEvent,
 } from "../../main/assistantRuntime";
+import type { ArtifactRecord, ConversationToolState, ToolCallRecord } from "../../main/toolOrchestration";
 import type { WorkflowContextSummary } from "../../main/workflowRuntime";
 
 type RequestWithRefresh = <T extends { success: true }>(
@@ -66,13 +67,12 @@ const approvalOptions: Array<{ label: string; value: AssistantApprovalMode }> = 
 ];
 
 const skillOptions: Array<{ label: string; value: AssistantSkill }> = [
-  { label: "通用数据分析", value: "general_analysis" },
-  { label: "Schema 浏览", value: "schema_explorer" },
+  { label: "整体风险分类分布（笔数+金额）", value: "overall-risk-classification-distribution" },
 ];
 
 const ARTIFACT_WINDOW_STATE_KEY = "cycle-probe:assistant:artifact-window";
 const ARTIFACT_PANEL_WIDTH_KEY = "cycle-probe:assistant:artifact-panel-width";
-const SKILL_TOKEN_PREFIX = "[skill:";
+const SKILL_TOKEN_PREFIX = "skill_";
 const MAX_CONVERSATION_TITLE_LENGTH = 200;
 
 type ArtifactWindowState = {
@@ -80,6 +80,14 @@ type ArtifactWindowState = {
   isOpen: boolean;
   isMinimized: boolean;
   isMaximized: boolean;
+};
+
+type ArtifactContentState = {
+  messageId: string;
+  artifactId?: string;
+  status: "loading" | "ready" | "error";
+  markdown: string;
+  error?: string;
 };
 
 const defaultArtifactWindowState: ArtifactWindowState = {
@@ -139,7 +147,7 @@ function skillLabel(skill?: AssistantSkill | null) {
 }
 
 function skillTokenValue(skill: AssistantSkill) {
-  return `${SKILL_TOKEN_PREFIX}${skill}]`;
+  return `${SKILL_TOKEN_PREFIX}${skill.replace(/[^a-zA-Z0-9_]/g, "_")}`;
 }
 
 function readArtifactWindowState(): ArtifactWindowState {
@@ -185,12 +193,13 @@ function extractMarkdownTitle(content: string, fallback: string) {
   return (firstTextLine || fallback).slice(0, 80);
 }
 
-function isAssistantArtifactMessage(message: AssistantMessage) {
+function isAssistantArtifactMessage(message: AssistantMessage, toolState?: ConversationToolState | null) {
   return (
     message.role === "assistant" &&
     message.content.trim().length > 0 &&
     message.blocks.some((block) => block.type === "markdown" && !isRenderableCodeLanguage(block.language)) &&
-    !message.blocks.some((block) => block.toolCallId || block.type === "visualization")
+    !message.blocks.some((block) => block.toolCallId) &&
+    Boolean(reportRecordForMessage(message, toolState))
   );
 }
 
@@ -272,42 +281,6 @@ function MetadataStatusIcon({ status, isThinking }: { status: AssistantMessageSt
         <Icon icon={icon} size="xsm" color="inherit" className={isThinking || status === "sending" ? "assistant-message-status-spinner" : undefined} />
       </span>
     </Tooltip>
-  );
-}
-
-function ArtifactSummaryCard({
-  title,
-  generatedAt,
-  onOpen,
-}: {
-  title: string;
-  generatedAt: string;
-  onOpen: () => void;
-}) {
-  return (
-    <ClickableCard
-      label={`打开 ${title}`}
-      onClick={onOpen}
-      variant="muted"
-      padding={3}
-      maxWidth={360}
-      className="assistant-artifact-summary-card"
-    >
-      <HStack gap={3} vAlign="center" width="100%">
-        <Icon icon={FileText} size="md" color="secondary" />
-        <StackItem size="fill">
-          <VStack gap={0}>
-            <Text type="label" weight="semibold">
-              {title}
-            </Text>
-            <Text type="supporting" color="secondary">
-              Markdown · {generatedAt}
-            </Text>
-          </VStack>
-        </StackItem>
-        <Icon icon={ChevronRight} size="sm" color="secondary" />
-      </HStack>
-    </ClickableCard>
   );
 }
 
@@ -435,6 +408,53 @@ function artifactTitle(message: AssistantMessage) {
   return extractMarkdownTitle(message.content, "数据助手生成文档");
 }
 
+function reportRecordForMessage(message: AssistantMessage, toolState?: ConversationToolState | null) {
+  return toolState?.toolCalls.find((record) => record.toolKind === "report_generation" && record.messageId === message.id && record.status === "completed");
+}
+
+function reportArtifactIdForMessage(message: AssistantMessage, toolState?: ConversationToolState | null) {
+  const reportRecord = reportRecordForMessage(message, toolState);
+  return reportRecord?.result?.primaryArtifactId ?? reportRecord?.outputArtifactIds?.find((artifactId) => artifactId.includes("report"));
+}
+
+function reportRecordsForState(toolState?: ConversationToolState | null) {
+  return (toolState?.toolCalls ?? [])
+    .filter((record) => record.toolKind === "report_generation" && record.status === "completed")
+    .sort((a, b) => b.version - a.version || Date.parse(b.createdAt) - Date.parse(a.createdAt));
+}
+
+function artifactVersion(message: AssistantMessage, toolState?: ConversationToolState | null) {
+  const reportRecord = reportRecordForMessage(message, toolState);
+  if (reportRecord) {
+    return reportRecord.version;
+  }
+  const version = message.content.match(/版本\s*(\d+)/)?.[1] ?? message.content.match(/\bv(\d+)\b/i)?.[1];
+  return version ? Number(version) : undefined;
+}
+
+function artifactSummary(content: string) {
+  return content
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#") && !line.startsWith("```") && !/^\|/.test(line))
+    .find(Boolean)
+    ?.replace(/^[-*]\s*/, "")
+    .slice(0, 120);
+}
+
+function artifactDataSourceCount(message: AssistantMessage) {
+  const sources = new Set<string>();
+  for (const block of message.blocks) {
+    if (block.toolTarget) {
+      sources.add(block.toolTarget);
+    }
+    block.toolFiles?.forEach((file) => sources.add(file));
+    const artifactMatch = block.content.match(/\b(?:artifact|dataset|workflow-dataset)[:_-][\w-]+/gi);
+    artifactMatch?.forEach((artifactId) => sources.add(artifactId));
+  }
+  return sources.size;
+}
+
 function assistantToolStatus(status?: AssistantBlock["toolStatus"]): ChatToolCallItem["status"] {
   switch (status) {
     case "completed":
@@ -446,6 +466,22 @@ function assistantToolStatus(status?: AssistantBlock["toolStatus"]): ChatToolCal
     case "blocked":
     case "declined":
     case "error":
+      return "error";
+    default:
+      return "pending";
+  }
+}
+
+function orchestrationToolStatus(status: ToolCallRecord["status"]): ChatToolCallItem["status"] {
+  switch (status) {
+    case "completed":
+      return "complete";
+    case "executing":
+      return "running";
+    case "failed":
+    case "rejected":
+    case "cancelled":
+    case "blocked":
       return "error";
     default:
       return "pending";
@@ -532,6 +568,58 @@ function toolCallsFromMessage(message: AssistantMessage): ChatToolCallItem[] {
     }));
 }
 
+function toolCallsFromToolState(
+  message: AssistantMessage,
+  toolState: ConversationToolState | null | undefined,
+  onApprove: (toolCallId: string, approved: boolean) => void,
+): ChatToolCallItem[] {
+  return (toolState?.toolCalls ?? [])
+    .filter((record) => record.messageId === message.id)
+    .map((record) => {
+      const artifactIds = record.outputArtifactIds ?? record.result?.artifactIds ?? [];
+      const requestPreview = JSON.stringify(record.request ?? {}, null, 2);
+      const errorMessage = record.error?.message;
+      return {
+        key: record.toolCallId,
+        name: toolKindLabel(record.toolKind),
+        target: typeof record.request.purpose === "string" ? record.request.purpose : record.toolName,
+        status: orchestrationToolStatus(record.status),
+        node: "agent-workflow",
+        stats: record.status === "waiting_approval" ? (
+          <HStack gap={1} vAlign="center" wrap="wrap" onClick={(event) => event.stopPropagation()}>
+            <Button label="批准" variant="primary" size="sm" onClick={() => onApprove(record.toolCallId, true)} />
+            <Button label="拒绝" variant="ghost" size="sm" onClick={() => onApprove(record.toolCallId, false)} />
+          </HStack>
+        ) : (
+          toolStatusLabel(record.status)
+        ),
+        errorMessage,
+        resultDetail: (
+          <div className="assistant-tool-call-detail">
+            <Text type="supporting" color="secondary">
+              {record.result?.summary ?? errorMessage ?? toolStatusLabel(record.status)}
+            </Text>
+            {artifactIds.length > 0 && (
+              <Text type="supporting" color="secondary">
+                Artifact：{artifactIds.join(", ")}
+              </Text>
+            )}
+            <CodeBlock
+              code={requestPreview}
+              language="json"
+              hasCopyButton
+              hasLanguageLabel
+              isWrapped
+              width="100%"
+              size="sm"
+              className="assistant-code-block"
+            />
+          </div>
+        ),
+      };
+    });
+}
+
 function shouldHideInlineToolResult(block: AssistantBlock) {
   return block.toolName === "sql" && block.toolStatus === "completed";
 }
@@ -548,6 +636,7 @@ export function DataAssistantWorkspace({
   const [conversations, setConversations] = useState<AssistantConversation[]>([]);
   const [messagesByConversation, setMessagesByConversation] = useState<Record<string, AssistantMessage[]>>({});
   const [workflowContextByConversation, setWorkflowContextByConversation] = useState<Record<string, WorkflowContextSummary | null>>({});
+  const [toolStateByConversation, setToolStateByConversation] = useState<Record<string, ConversationToolState | null>>({});
   const [activeConversationId, setActiveConversationId] = useState("");
   const [composerValue, setComposerValue] = useState("");
   const [dataSources, setDataSources] = useState<DataSourceSummary[]>([]);
@@ -561,6 +650,7 @@ export function DataAssistantWorkspace({
   const [editTitleDraft, setEditTitleDraft] = useState("");
   const [deletingConversation, setDeletingConversation] = useState<AssistantConversation | null>(null);
   const [artifactWindow, setArtifactWindow] = useState<ArtifactWindowState>(() => readArtifactWindowState());
+  const [artifactContentByMessage, setArtifactContentByMessage] = useState<Record<string, ArtifactContentState>>({});
   const artifactResize = useResizable({
     defaultSize: 440,
     minSizePx: 320,
@@ -574,15 +664,19 @@ export function DataAssistantWorkspace({
   );
 
   const activeMessages = activeConversation ? messagesByConversation[activeConversation.id] ?? [] : [];
+  const activeToolState = activeConversation ? toolStateByConversation[activeConversation.id] ?? null : null;
   const activePendingPythonToolCallId = useMemo(() => pendingPythonToolCallId(activeMessages), [activeMessages]);
   const landingUserName = user?.displayName?.trim() || user?.username || "Yuzili";
   const activeArtifactMessage = useMemo(
     () =>
       artifactWindow.isOpen && artifactWindow.messageId
-        ? activeMessages.find((message) => message.id === artifactWindow.messageId && isAssistantArtifactMessage(message)) ?? null
+        ? activeMessages.find((message) => message.id === artifactWindow.messageId && isAssistantArtifactMessage(message, activeToolState)) ?? null
         : null,
-    [activeMessages, artifactWindow.isOpen, artifactWindow.messageId],
+    [activeMessages, activeToolState, artifactWindow.isOpen, artifactWindow.messageId],
   );
+  const activeArtifactContent = activeArtifactMessage ? artifactContentByMessage[activeArtifactMessage.id] : undefined;
+  const activeReportRecords = useMemo(() => reportRecordsForState(activeToolState), [activeToolState]);
+  const activeArtifactReportRecord = activeArtifactMessage ? reportRecordForMessage(activeArtifactMessage, activeToolState) : undefined;
   const isStreaming = activeMessages.some((message) => message.role === "assistant" && (message.status === "receiving" || message.status === "processing"));
   const activeStreamingMessageId = activeMessages.find((message) => message.role === "assistant" && (message.status === "receiving" || message.status === "processing"))?.id;
 
@@ -638,6 +732,8 @@ export function DataAssistantWorkspace({
       setMessagesByConversation((current) => ({ ...current, [conversationId]: messages }));
       const context = await window.lifecycleX.assistant.getWorkflowContext(user.id, conversationId);
       setWorkflowContextByConversation((current) => ({ ...current, [conversationId]: context }));
+      const toolState = await window.lifecycleX.assistant.getToolState(user.id, conversationId);
+      setToolStateByConversation((current) => ({ ...current, [conversationId]: toolState }));
     },
     [user?.id],
   );
@@ -708,6 +804,10 @@ export function DataAssistantWorkspace({
       }
       if (event.type === "tool") {
         upsertMessage(event.conversationId, event.message);
+        return;
+      }
+      if (event.type === "tool-state") {
+        setToolStateByConversation((current) => ({ ...current, [event.conversationId]: event.state }));
         return;
       }
       if (event.type === "workflow") {
@@ -926,7 +1026,62 @@ export function DataAssistantWorkspace({
       isMinimized: false,
       isMaximized: false,
     });
-  }, []);
+    const artifactId = reportArtifactIdForMessage(message, activeToolState);
+    if (!artifactId || !user?.id || !window.lifecycleX?.assistant) {
+      setArtifactContentByMessage((current) => ({
+        ...current,
+        [message.id]: {
+          messageId: message.id,
+          artifactId,
+          status: "ready",
+          markdown: message.content,
+        },
+      }));
+      return;
+    }
+    const existing = artifactContentByMessage[message.id];
+    if (existing?.artifactId === artifactId && existing.status === "ready") {
+      return;
+    }
+    setArtifactContentByMessage((current) => ({
+      ...current,
+      [message.id]: {
+        messageId: message.id,
+        artifactId,
+        status: "loading",
+        markdown: message.content,
+      },
+    }));
+    void window.lifecycleX.assistant
+      .getToolArtifact(user.id, message.conversationId, artifactId)
+      .then((artifact: ArtifactRecord | null) => {
+        if (!artifact) {
+          throw new Error("报告 Artifact 不存在或无权访问。");
+        }
+        const markdown = typeof artifact.content === "string" ? artifact.content : JSON.stringify(artifact.content ?? "", null, 2);
+        setArtifactContentByMessage((current) => ({
+          ...current,
+          [message.id]: {
+            messageId: message.id,
+            artifactId,
+            status: "ready",
+            markdown,
+          },
+        }));
+      })
+      .catch((error) => {
+        setArtifactContentByMessage((current) => ({
+          ...current,
+          [message.id]: {
+            messageId: message.id,
+            artifactId,
+            status: "error",
+            markdown: message.content,
+            error: error instanceof Error ? error.message : "报告 Artifact 加载失败。",
+          },
+        }));
+      });
+  }, [activeToolState, artifactContentByMessage, user?.id]);
 
   const closeArtifact = useCallback(() => {
     setArtifactWindow((current) => ({ ...current, isOpen: false, messageId: null }));
@@ -943,7 +1098,7 @@ export function DataAssistantWorkspace({
   const copyArtifact = useCallback(
     async (message: AssistantMessage) => {
       try {
-        await navigator.clipboard.writeText(message.content);
+        await navigator.clipboard.writeText(artifactContentByMessage[message.id]?.markdown ?? message.content);
         toast({
           type: "info",
           body: "文档内容已复制。",
@@ -959,7 +1114,25 @@ export function DataAssistantWorkspace({
         });
       }
     },
-    [toast],
+    [artifactContentByMessage, toast],
+  );
+
+  const openReportRecord = useCallback(
+    (toolCallId: string) => {
+      const record = activeReportRecords.find((item) => item.toolCallId === toolCallId);
+      const message = record?.messageId ? activeMessages.find((item) => item.id === record.messageId && isAssistantArtifactMessage(item, activeToolState)) : undefined;
+      if (!message) {
+        toast({
+          type: "error",
+          body: "报告消息不存在，无法切换到该版本。",
+          uniqueID: `assistant-report-version-missing-${toolCallId}`,
+          collisionBehavior: "overwrite",
+        });
+        return;
+      }
+      openArtifact(message);
+    },
+    [activeMessages, activeReportRecords, activeToolState, openArtifact, toast],
   );
 
   const loadSchemaContextMarkdown = useCallback(
@@ -967,12 +1140,14 @@ export function DataAssistantWorkspace({
       if (!selectedDataSource) {
         return null;
       }
+      const isOverallRiskSkill = selectedSkill === "overall-risk-classification-distribution";
       const result = await requestWithRefresh((token) =>
         workbenchApi.schemaContext(token, {
           conversationId,
           question,
           dataSourceId: selectedDataSource.id,
-          purpose: "data_exploration",
+          skill: selectedSkill,
+          purpose: isOverallRiskSkill ? "risk_analysis" : "data_exploration",
           maxChars: 16_000,
         }),
       );
@@ -987,7 +1162,7 @@ export function DataAssistantWorkspace({
       }
       return result.context.markdown;
     },
-    [requestWithRefresh, selectedDataSource, toast],
+    [requestWithRefresh, selectedDataSource, selectedSkill, toast],
   );
 
   const retryAssistantMessage = useCallback(
@@ -1011,6 +1186,8 @@ export function DataAssistantWorkspace({
         setConversations((current) => mergeConversation(current, result.conversation));
         upsertMessage(result.conversation.id, result.assistantMessage);
         setActiveConversationId(result.conversation.id);
+        const toolState = await window.lifecycleX.assistant.getToolState(user.id, result.conversation.id);
+        setToolStateByConversation((current) => ({ ...current, [result.conversation.id]: toolState }));
       } catch (error) {
         toast({
           type: "error",
@@ -1072,8 +1249,12 @@ export function DataAssistantWorkspace({
         const result = await window.lifecycleX.assistant.approveTool(user.id, toolCallId, approved);
         upsertMessage(result.message.conversationId, result.message);
         if (activeConversation?.id && window.lifecycleX.assistant) {
-          const context = await window.lifecycleX.assistant.getWorkflowContext(user.id, activeConversation.id);
+          const [context, toolState] = await Promise.all([
+            window.lifecycleX.assistant.getWorkflowContext(user.id, activeConversation.id),
+            window.lifecycleX.assistant.getToolState(user.id, activeConversation.id),
+          ]);
           setWorkflowContextByConversation((current) => ({ ...current, [activeConversation.id]: context }));
+          setToolStateByConversation((current) => ({ ...current, [activeConversation.id]: toolState }));
         }
       } catch (error) {
         toast({
@@ -1168,6 +1349,8 @@ export function DataAssistantWorkspace({
         upsertMessage(result.conversation.id, result.userMessage);
         upsertMessage(result.conversation.id, result.assistantMessage);
         setActiveConversationId(result.conversation.id);
+        const toolState = await window.lifecycleX.assistant.getToolState(user.id, result.conversation.id);
+        setToolStateByConversation((current) => ({ ...current, [result.conversation.id]: toolState }));
       } catch (error) {
         const failedMessage = error instanceof Error ? error.message : "消息发送失败。";
         if (optimisticConversationId && optimisticMessageId) {
@@ -1257,10 +1440,12 @@ export function DataAssistantWorkspace({
 
   const skillMenuItems = useMemo<DropdownMenuOption[]>(
     () =>
-      skillOptions.map((skill) => ({
-        label: `${selectedSkill === skill.value ? "✓ " : ""}${skill.label}`,
-        onClick: () => setSelectedSkill((current) => (current === skill.value ? null : skill.value)),
-      })),
+      skillOptions.length > 0
+        ? skillOptions.map((skill) => ({
+          label: `${selectedSkill === skill.value ? "✓ " : ""}${skill.label}`,
+          onClick: () => setSelectedSkill((current) => (current === skill.value ? null : skill.value)),
+        }))
+        : [{ label: "暂无已安装 Skill", isDisabled: true }],
     [selectedSkill],
   );
 
@@ -1302,9 +1487,14 @@ export function DataAssistantWorkspace({
 
   const renderArtifactCard = (message: AssistantMessage) => {
     return (
-      <ArtifactSummaryCard
+      <ReportToolCallCard
         title={artifactTitle(message)}
+        version={artifactVersion(message, activeToolState)}
         generatedAt={formatArtifactGeneratedAt(message.createdAt)}
+        summary={artifactSummary(message.content)}
+        chartCount={message.blocks.filter((block) => block.type === "visualization").length}
+        dataSourceCount={artifactDataSourceCount(message)}
+        status={message.status}
         onOpen={() => openArtifact(message)}
       />
     );
@@ -1439,8 +1629,12 @@ export function DataAssistantWorkspace({
                   if (!messagesByConversation[conversation.id]) {
                     void loadConversationMessages(conversation.id);
                   } else if (!(conversation.id in workflowContextByConversation) && user?.id && window.lifecycleX?.assistant) {
-                    void window.lifecycleX.assistant.getWorkflowContext(user.id, conversation.id).then((context) => {
+                    void Promise.all([
+                      window.lifecycleX.assistant.getWorkflowContext(user.id, conversation.id),
+                      window.lifecycleX.assistant.getToolState(user.id, conversation.id),
+                    ]).then(([context, toolState]) => {
                       setWorkflowContextByConversation((current) => ({ ...current, [conversation.id]: context }));
+                      setToolStateByConversation((current) => ({ ...current, [conversation.id]: toolState }));
                     });
                   }
                 }}
@@ -1507,10 +1701,10 @@ export function DataAssistantWorkspace({
                       <DropdownMenu
                         hasChevron={false}
                         placement="above"
-                        menuWidth={190}
-                        button={{
-                          label: skillOptions.find((item) => item.value === selectedSkill)?.label ?? "Skill",
-                          variant: "ghost",
+	                        menuWidth={190}
+	                        button={{
+	                          label: selectedSkill ? skillLabel(selectedSkill) : "Skill",
+	                          variant: "ghost",
                           size: "sm",
                           className: "assistant-composer-action-button",
                           icon: <AssistantActionIcon src={mentionIcon} />,
@@ -1542,8 +1736,10 @@ export function DataAssistantWorkspace({
               <ChatMessageList isStreaming={isStreaming} density="compact">
                 {activeMessages.map((message) => {
                   const sender = message.role === "user" ? "user" : "assistant";
-                  const isArtifactMessage = isAssistantArtifactMessage(message);
-                  const toolCalls = sender === "assistant" ? toolCallsFromMessage(message) : [];
+                  const isArtifactMessage = isAssistantArtifactMessage(message, activeToolState);
+                  const toolCalls = sender === "assistant"
+                    ? [...toolCallsFromMessage(message), ...toolCallsFromToolState(message, activeToolState, approveTool)]
+                    : [];
                   return (
                     <ChatMessage
                       key={message.id}
@@ -1613,6 +1809,7 @@ export function DataAssistantWorkspace({
                 label="文档窗口操作"
                 size="sm"
                 dividers={["bottom"]}
+                className="assistant-artifact-toolbar"
                 startContent={
                   <HStack gap={3} vAlign="center" className="assistant-artifact-toolbar-title">
                     <Icon icon={FileText} size="sm" color="secondary" />
@@ -1624,10 +1821,26 @@ export function DataAssistantWorkspace({
                         生成于 {formatArtifactGeneratedAt(activeArtifactMessage.createdAt)}
                       </Text>
                     </VStack>
+                    {activeReportRecords.length > 1 && (
+                      <DropdownMenu
+                        hasChevron
+                        placement="above"
+                        menuWidth={260}
+                        button={{
+                          label: activeArtifactReportRecord?.version ? `版本 ${activeArtifactReportRecord.version}` : "报告版本",
+                          variant: "secondary",
+                          size: "sm",
+                        }}
+                        items={activeReportRecords.map((record) => ({
+                          label: `${record.toolCallId === activeArtifactReportRecord?.toolCallId ? "✓ " : ""}版本 ${record.version} · ${formatArtifactGeneratedAt(record.completedAt ?? record.updatedAt)}`,
+                          onClick: () => openReportRecord(record.toolCallId),
+                        }))}
+                      />
+                    )}
                   </HStack>
                 }
                 endContent={
-                  <HStack gap={1} vAlign="center">
+                  <HStack gap={1} vAlign="center" className="assistant-artifact-toolbar-actions">
                     <Button
                       label="复制内容"
                       variant="ghost"
@@ -1665,16 +1878,28 @@ export function DataAssistantWorkspace({
               />
               {!artifactWindow.isMinimized && (
                 <Section variant="transparent" className="assistant-artifact-body">
-                  <Markdown
-                    density="compact"
-                    headingLevelStart={1}
-                    contentWidth="100%"
-                    autolink="gfm"
-                    components={markdownComponents}
-                    className="assistant-artifact-markdown"
-                  >
-                    {activeArtifactMessage.content}
-                  </Markdown>
+                  {activeArtifactContent?.status === "loading" ? (
+                    <HStack gap={2} vAlign="center" className="assistant-artifact-loading">
+                      <Icon icon={LoaderCircle} size="sm" color="secondary" className="assistant-message-status-spinner" />
+                      <Text type="body" color="secondary">报告 Artifact 加载中...</Text>
+                    </HStack>
+                  ) : activeArtifactContent?.status === "error" ? (
+                    <VStack gap={2} hAlign="stretch" className="assistant-artifact-error">
+                      <Text type="label" color="primary">报告 Artifact 加载失败</Text>
+                      <Text type="body" color="secondary">{activeArtifactContent.error}</Text>
+                      <ReportMarkdownViewer
+                        markdown={activeArtifactContent.markdown}
+                        components={markdownComponents}
+                        className="assistant-artifact-markdown"
+                      />
+                    </VStack>
+                  ) : (
+                    <ReportMarkdownViewer
+                      markdown={activeArtifactContent?.markdown ?? activeArtifactMessage.content}
+                      components={markdownComponents}
+                      className="assistant-artifact-markdown"
+                    />
+                  )}
                 </Section>
               )}
             </Card>

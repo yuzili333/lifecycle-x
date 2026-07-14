@@ -6,6 +6,7 @@ import {
   createStreamingModelAdapter,
   type ConversationMessage,
 } from "./index";
+import { TOOL_NAMES, TOOL_SCHEMAS, type ToolKind } from "../toolOrchestration";
 
 describe("StreamingMarkdownParser", () => {
   it("parses common markdown blocks from chunked input and flushes unfinished fences", () => {
@@ -203,6 +204,92 @@ describe("StreamingModelAdapter", () => {
     expect(events.map((event) => event.type)).toContain("version-created");
     expect(events.map((event) => event.type)).toContain("version-updated");
     expect(events.at(-1)?.type).toBe("stream-end");
+  });
+
+  it("executes the named orchestration tools requested by the model", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(sseResponse([
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_report","function":{"name":"request_markdown_report_generation","arguments":"{\\"userRequest\\""}}]}}]}\n\n',
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":":\\"生成报告\\",\\"purpose\\":\\"报告输出\\",\\"markdown\\":\\"# 风险分析报告\\"}"}}]},"finish_reason":"tool_calls"}]}\n\n',
+        "data: [DONE]\n\n",
+      ]))
+      .mockResolvedValueOnce(sseResponse([
+        'data: {"choices":[{"delta":{"content":"报告已生成。"},"finish_reason":"stop"}]}\n\n',
+        "data: [DONE]\n\n",
+      ]));
+    const adapter = createStreamingModelAdapter({
+      baseURL: "https://example.local/v1",
+      apiKey: "secret",
+      model: "test-model",
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+    const seenTools: string[] = [];
+    for (const [toolKind, toolName] of Object.entries(TOOL_NAMES) as Array<[ToolKind, string]>) {
+      adapter.registerTool({
+        name: toolName,
+        description: `${toolName} test tool`,
+        inputSchema: TOOL_SCHEMAS[toolKind],
+        handler: async (input) => {
+          seenTools.push(toolName);
+          return { toolKind, input, status: "completed" };
+        },
+      });
+    }
+
+    const events = await collect(adapter.streamChat(baseInput()));
+
+    expect(seenTools).toEqual(["request_markdown_report_generation"]);
+    expect(events.some((event) => event.type === "tool-execution-result" && event.toolCallId === "call_report")).toBe(true);
+    expect(events.some((event) => event.type === "markdown-delta" && event.payload.delta === "报告已生成。")).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("continues allowing dependent tool calls after a tool result is returned", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(sseResponse([
+        `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_sql","function":{"name":"${TOOL_NAMES.sql_query}","arguments":"{\\"userRequest\\":\\"查询\\",\\"purpose\\":\\"查询数据\\",\\"sql\\":\\"select 1\\"}"}}]},"finish_reason":"tool_calls"}]}\n\n`,
+        "data: [DONE]\n\n",
+      ]))
+      .mockResolvedValueOnce(sseResponse([
+        `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_report","function":{"name":"${TOOL_NAMES.report_generation}","arguments":"{\\"userRequest\\":\\"生成报告\\",\\"purpose\\":\\"报告输出\\",\\"markdown\\":\\"# 报告\\\\nSQL 已完成\\"}"}}]},"finish_reason":"tool_calls"}]}\n\n`,
+        "data: [DONE]\n\n",
+      ]))
+      .mockResolvedValueOnce(sseResponse([
+        'data: {"choices":[{"delta":{"content":"报告已生成。"},"finish_reason":"stop"}]}\n\n',
+        "data: [DONE]\n\n",
+      ]));
+    const adapter = createStreamingModelAdapter({
+      baseURL: "https://example.local/v1",
+      apiKey: "secret",
+      model: "test-model",
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+    const seenTools: string[] = [];
+    for (const [toolKind, toolName] of Object.entries(TOOL_NAMES) as Array<[ToolKind, string]>) {
+      adapter.registerTool({
+        name: toolName,
+        description: `${toolName} test tool`,
+        inputSchema: TOOL_SCHEMAS[toolKind],
+        handler: async (input) => {
+          seenTools.push(toolName);
+          return { toolKind, input, status: "completed", artifactIds: [`${toolKind}-artifact`] };
+        },
+      });
+    }
+
+    const events = await collect(adapter.streamChat(baseInput()));
+    const secondRequest = JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body)) as {
+      messages: Array<{ role: string; tool_calls?: unknown[]; tool_call_id?: string }>;
+      tools?: unknown[];
+    };
+
+    expect(seenTools).toEqual([TOOL_NAMES.sql_query, TOOL_NAMES.report_generation]);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(secondRequest.tools?.length).toBe(4);
+    expect(secondRequest.messages.some((message) => message.role === "assistant" && Array.isArray(message.tool_calls))).toBe(true);
+    expect(secondRequest.messages.some((message) => message.role === "tool" && message.tool_call_id === "call_sql")).toBe(true);
+    expect(events.filter((event) => event.type === "tool-execution-result").map((event) => event.toolCallId)).toEqual(["call_sql", "call_report"]);
+    expect(events.some((event) => event.type === "markdown-delta" && event.payload.delta === "报告已生成。")).toBe(true);
   });
 
   it("emits stream errors for provider parse failures", async () => {

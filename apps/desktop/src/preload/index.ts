@@ -8,6 +8,7 @@ import type {
   AssistantSendResult,
   AssistantStreamEvent,
 } from "../main/assistantRuntime";
+import type { ArtifactRecord, ConversationToolState, ToolCallRecord, ToolKind } from "../main/toolOrchestration";
 import type { WorkflowContextSummary, WorkflowDatasetRef } from "../main/workflowRuntime";
 
 export type DataSourceMenuAction = "open-database" | "open-csv" | "create-connection" | "import-csv";
@@ -49,6 +50,16 @@ const lifecycleXApi = {
       }>,
     getWorkflowContext: (userId: string, conversationId: string) =>
       ipcRenderer.invoke("assistant:workflow:context", userId, conversationId) as Promise<WorkflowContextSummary>,
+    getToolState: (userId: string, conversationId: string) =>
+      ipcRenderer.invoke("assistant:tools:state", userId, conversationId) as Promise<ConversationToolState>,
+    listToolCalls: (userId: string, conversationId: string) =>
+      ipcRenderer.invoke("assistant:tools:list", userId, conversationId) as Promise<ToolCallRecord[]>,
+    getLatestToolResult: (userId: string, conversationId: string, toolKind: ToolKind) =>
+      ipcRenderer.invoke("assistant:tools:latest", userId, conversationId, toolKind) as Promise<ToolCallRecord | null>,
+    selectToolResult: (userId: string, conversationId: string, toolKind: ToolKind, toolCallId: string) =>
+      ipcRenderer.invoke("assistant:tools:select", userId, conversationId, toolKind, toolCallId) as Promise<ConversationToolState>,
+    getToolArtifact: (userId: string, conversationId: string, artifactId: string) =>
+      ipcRenderer.invoke("assistant:tools:artifact", userId, conversationId, artifactId) as Promise<ArtifactRecord | null>,
     confirmWorkflowDataset: (userId: string, conversationId: string, datasetId?: string) =>
       ipcRenderer.invoke("assistant:workflow:confirm-dataset", userId, conversationId, datasetId) as Promise<{
         success: true;

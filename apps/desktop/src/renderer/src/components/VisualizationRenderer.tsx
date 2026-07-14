@@ -4,17 +4,22 @@ import { HStack } from "@astryxdesign/core/Layout";
 import { Text } from "@astryxdesign/core/Text";
 import {
   createDefaultVisualizationRendererRegistry,
+  DefaultVisualizationThemeResolver,
   neutralDarkVisualizationTheme,
   validateVisualizationSpec,
   VisualizationRouter,
   type ResolvedVisualizationData,
+  type ResolvedVisualizationTheme,
   type StreamingVisualizationState,
+  type VisualizationDimension,
+  type VisualizationMeasure,
   type VisualizationRenderError,
   type VisualizationSpec,
 } from "../../../shared/visualization";
 
 const registry = createDefaultVisualizationRendererRegistry();
 const router = new VisualizationRouter(registry);
+const themeResolver = new DefaultVisualizationThemeResolver();
 
 type StreamingVisualizationNodeProps = {
   visualizationId: string;
@@ -44,6 +49,7 @@ export function VisualizationRenderer({ spec, error, isStreaming }: Visualizatio
     () => (validation?.success && data ? router.route(validation.spec, { rowCount: data.rowCount, columnCount: data.columns.length }) : undefined),
     [data, validation],
   );
+  const theme = useMemo(() => (validation?.success ? themeResolver.resolve(validation.spec) : neutralDarkVisualizationTheme), [validation]);
 
   if (isStreaming || !spec) {
     return <VisualizationSkeleton visualizationId={spec?.visualizationId} />;
@@ -69,7 +75,7 @@ export function VisualizationRenderer({ spec, error, isStreaming }: Visualizatio
         <span className="assistant-visualization-engine">{route?.engine ?? "fallback"}</span>
       </div>
       {validation.spec.description && <p className="assistant-visualization-description">{validation.spec.description}</p>}
-      <VisualizationBody spec={validation.spec} data={data} engine={route?.engine ?? "fallback"} />
+      <VisualizationBody spec={validation.spec} data={data} engine={route?.engine ?? "fallback"} theme={theme} />
       <div className="assistant-visualization-footer">
         <span>来源：{data.artifactId ? `Artifact ${data.artifactId}` : validation.spec.provenance.sourceType}</span>
         {validation.spec.provenance.truncated || data.truncated ? <span>已截断</span> : null}
@@ -87,7 +93,7 @@ export function VisualizationRenderer({ spec, error, isStreaming }: Visualizatio
   );
 }
 
-function VisualizationBody({ spec, data, engine }: { spec: VisualizationSpec; data: ResolvedVisualizationData; engine: string }) {
+function VisualizationBody({ spec, data, engine, theme }: { spec: VisualizationSpec; data: ResolvedVisualizationData; engine: string; theme: ResolvedVisualizationTheme }) {
   if (data.rows?.length === 0) {
     return <div className="assistant-visualization-empty">{spec.display?.emptyText ?? "暂无可视化数据。"}</div>;
   }
@@ -103,7 +109,7 @@ function VisualizationBody({ spec, data, engine }: { spec: VisualizationSpec; da
   if (spec.type === "timeline" || engine === "vis_timeline") {
     return <TimelineView spec={spec} data={data} />;
   }
-  return <SvgChartView spec={spec} data={data} />;
+  return <SvgChartView spec={spec} data={data} theme={theme} />;
 }
 
 function KpiView({ spec, data }: { spec: VisualizationSpec; data: ResolvedVisualizationData }) {
@@ -142,51 +148,65 @@ function TableView({ data }: { data: ResolvedVisualizationData }) {
   );
 }
 
-function SvgChartView({ spec, data }: { spec: VisualizationSpec; data: ResolvedVisualizationData }) {
+type XAxisScale =
+  | {
+      kind: "category";
+      ticks: Array<{ key: string; x: number; label: string }>;
+      position: (row: Record<string, unknown>, index: number) => number;
+    }
+  | {
+      kind: "number" | "time";
+      ticks: Array<{ key: string; x: number; label: string }>;
+      position: (row: Record<string, unknown>, index: number) => number;
+    };
+
+function SvgChartView({ spec, data, theme }: { spec: VisualizationSpec; data: ResolvedVisualizationData; theme: ResolvedVisualizationTheme }) {
   const rows = data.rows ?? [];
   const xField = spec.encoding?.x ?? spec.encoding?.category ?? data.columns[0]?.name;
-  const yField = spec.encoding?.y?.[0] ?? spec.encoding?.value ?? spec.measures?.[0]?.field ?? data.columns.find((column) => column.type === "number")?.name;
-  const values = rows.map((row) => Number(row[yField ?? ""] ?? 0));
-  const tickValues = buildNumericTicks(values);
-  const min = tickValues[0] ?? 0;
-  const max = tickValues.at(-1) ?? 1;
+  const yFields = resolveYFields(spec, data, xField);
+  const primaryYField = yFields[0];
+  const seriesValues = yFields.map((field) => rows.map((row) => normalizeNumber(row[field], Number.NaN)));
+  const yTickValues = buildNumericTicks(seriesValues.flat(), 5, {
+    fitToDataRange: !shouldIncludeYAxisZero(spec.type),
+    includeZero: shouldIncludeYAxisZero(spec.type),
+  });
+  const yDomain = domainFromTicks(yTickValues);
   const width = 680;
   const height = Math.max(240, spec.display?.height ?? 260);
   const margin = { top: 22, right: 22, bottom: 66, left: 76 };
   const plotWidth = width - margin.left - margin.right;
   const plotHeight = height - margin.top - margin.bottom;
-  const zeroY = scaleValue(0, min, max, margin.top, plotHeight);
+  const zeroY = scaleValue(clamp(0, yDomain.min, yDomain.max), yDomain.min, yDomain.max, margin.top, plotHeight);
   const categoryCount = Math.max(1, rows.length);
   const categoryStep = plotWidth / categoryCount;
   const gap = Math.min(10, Math.max(4, categoryStep * 0.24));
-  const barWidth = Math.max(6, categoryStep - gap);
-  const xTickIndexes = buildCategoryTickIndexes(rows.length);
-  const yAxisLabel = spec.measures?.find((measure) => measure.field === yField)?.label ?? yField ?? "数值";
+  const seriesCount = Math.max(1, yFields.length);
+  const barWidth = Math.max(4, (categoryStep - gap) / seriesCount);
+  const xAxis = buildXAxisScale({ spec, data, xField, rows, margin, plotWidth });
+  const yAxisLabel = yFields.length > 1 ? "数值" : spec.measures?.find((measure) => measure.field === primaryYField)?.label ?? primaryYField ?? "数值";
   const xAxisLabel = spec.dimensions?.find((dimension) => dimension.field === xField)?.label ?? xField ?? "维度";
-  const points = values.map((value, index) => {
-    const x = margin.left + categoryStep * index + categoryStep / 2;
-    const y = scaleValue(value, min, max, margin.top, plotHeight);
+  const seriesPoints = seriesValues.map((values) => values.map((value, index) => {
+    const x = xAxis.position(rows[index] ?? {}, index);
+    if (!Number.isFinite(value)) {
+      return "";
+    }
+    const y = scaleValue(value, yDomain.min, yDomain.max, margin.top, plotHeight);
     return `${round(x)},${round(y)}`;
-  }).join(" ");
-  const chartStyle = {
-    "--viz-series-0": neutralDarkVisualizationTheme.colors.primary[0],
-    "--viz-series-1": neutralDarkVisualizationTheme.colors.primary[1],
-    "--viz-axis": neutralDarkVisualizationTheme.colors.textSecondary,
-    "--viz-grid": neutralDarkVisualizationTheme.colors.border,
-    "--viz-text": neutralDarkVisualizationTheme.colors.textPrimary,
-  } as CSSProperties;
+  }).filter(Boolean));
+  const chartStyle = createChartStyle(theme);
+  const isPointChart = spec.type === "scatter" || spec.type === "bubble";
 
   return (
     <div className="assistant-visualization-svg-wrap" style={chartStyle}>
       <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={spec.title}>
         <g className="axis-grid">
-          {tickValues.map((tick) => {
-            const y = scaleValue(tick, min, max, margin.top, plotHeight);
+          {yTickValues.map((tick) => {
+            const y = scaleValue(tick, yDomain.min, yDomain.max, margin.top, plotHeight);
             return (
               <g key={tick}>
                 <line x1={margin.left} y1={round(y)} x2={width - margin.right} y2={round(y)} className="grid-line" />
                 <text x={margin.left - 10} y={round(y)} textAnchor="end" dominantBaseline="middle" className="axis-tick-label">
-                  {formatCompactNumber(tick)}
+                  {formatAxisTick(tick)}
                 </text>
               </g>
             );
@@ -197,60 +217,207 @@ function SvgChartView({ spec, data }: { spec: VisualizationSpec; data: ResolvedV
         <line x1={margin.left} y1={height - margin.bottom} x2={width - margin.right} y2={height - margin.bottom} className="axis-line" />
         <text x={margin.left} y={height - 14} className="axis-title">{xAxisLabel}</text>
         <text x={16} y={margin.top} className="axis-title" transform={`rotate(-90 16 ${margin.top})`}>{yAxisLabel}</text>
-        {xTickIndexes.map((index) => {
-          const row = rows[index];
-          const x = margin.left + categoryStep * index + categoryStep / 2;
+        {xAxis.ticks.map((tick) => {
           return (
-            <g key={index}>
-              <line x1={round(x)} y1={height - margin.bottom} x2={round(x)} y2={height - margin.bottom + 4} className="axis-line" />
-              <text x={round(x)} y={height - margin.bottom + 18} textAnchor="middle" className="axis-tick-label">
-                {truncateAxisLabel(formatCell(row?.[xField ?? ""]), rows.length)}
+            <g key={tick.key}>
+              <line x1={round(tick.x)} y1={height - margin.bottom} x2={round(tick.x)} y2={height - margin.bottom + 4} className="axis-line" />
+              <text x={round(tick.x)} y={height - margin.bottom + 18} textAnchor="middle" className="axis-tick-label">
+                {tick.label}
               </text>
             </g>
           );
         })}
-        {spec.type === "line" || spec.type === "area" || spec.type === "bar_line_combo" ? (
-          <>
-            {spec.type === "area" && <polygon points={`${margin.left},${round(zeroY)} ${points} ${width - margin.right},${round(zeroY)}`} className="area" />}
-            <polyline points={points} className="line" />
-            {points.split(" ").map((point, index) => {
-              const [x, y] = point.split(",");
-              return <circle key={index} cx={x} cy={y} r="3" />;
-            })}
-          </>
-        ) : (
-          rows.map((row, index) => {
-            const value = values[index] ?? 0;
-            const valueY = scaleValue(value, min, max, margin.top, plotHeight);
-            const barHeight = Math.max(2, Math.abs(zeroY - valueY));
-            const x = margin.left + categoryStep * index + (categoryStep - barWidth) / 2;
-            const y = value >= 0 ? valueY : zeroY;
+        {isPointChart ? (
+          rows.flatMap((row, rowIndex) => yFields.map((field, seriesIndex) => {
+            const value = seriesValues[seriesIndex]?.[rowIndex] ?? Number.NaN;
+            if (!Number.isFinite(value)) {
+              return null;
+            }
+            const x = xAxis.position(row, rowIndex);
+            const y = scaleValue(value, yDomain.min, yDomain.max, margin.top, plotHeight);
+            const radius = spec.type === "bubble" ? bubbleRadius(value, seriesValues.flat()) : 4;
             return (
-              <g key={index}>
-                <rect x={round(x)} y={round(y)} width={round(barWidth)} height={round(barHeight)} style={{ "--viz-bar-index": index } as CSSProperties} />
-                <title>{`${formatCell(row[xField ?? ""])}: ${formatCell(value)}`}</title>
+              <g key={`${rowIndex}-${field}`} style={seriesStyle(seriesIndex)}>
+                <circle cx={round(x)} cy={round(y)} r={radius} className="point" />
+                <title>{`${formatCell(row[xField ?? ""])} ${labelForMeasure(spec, field)}: ${formatCell(value)}`}</title>
               </g>
             );
-          })
+          }))
+        ) : spec.type === "line" || spec.type === "area" || spec.type === "bar_line_combo" ? (
+          <>
+            {seriesPoints.map((points, seriesIndex) => (
+              <g key={yFields[seriesIndex] ?? seriesIndex} style={seriesStyle(seriesIndex)}>
+                {spec.type === "area" && seriesIndex === 0 && points.length > 0 && <polygon points={`${margin.left},${round(zeroY)} ${points.join(" ")} ${width - margin.right},${round(zeroY)}`} className="area" />}
+                <polyline points={points.join(" ")} className="line" />
+                {points.map((point, index) => {
+                  const [x, y] = point.split(",");
+                  return <circle key={index} cx={x} cy={y} r="3" />;
+                })}
+              </g>
+            ))}
+          </>
+        ) : (
+          rows.flatMap((row, rowIndex) => yFields.map((field, seriesIndex) => {
+            const value = seriesValues[seriesIndex]?.[rowIndex] ?? 0;
+            if (!Number.isFinite(value)) {
+              return null;
+            }
+            const valueY = scaleValue(value, yDomain.min, yDomain.max, margin.top, plotHeight);
+            const barHeight = Math.max(2, Math.abs(zeroY - valueY));
+            const groupCenter = xAxis.position(row, rowIndex);
+            const groupWidth = barWidth * seriesCount;
+            const x = groupCenter - groupWidth / 2 + barWidth * seriesIndex;
+            const y = value >= 0 ? valueY : zeroY;
+            return (
+              <g key={`${rowIndex}-${field}`} style={seriesStyle(seriesIndex)}>
+                <rect x={round(x)} y={round(y)} width={round(Math.max(3, barWidth - 2))} height={round(barHeight)} />
+                <title>{`${formatCell(row[xField ?? ""])} ${labelForMeasure(spec, field)}: ${formatCell(value)}`}</title>
+              </g>
+            );
+          }))
         )}
       </svg>
     </div>
   );
 }
 
+function createChartStyle(theme: ResolvedVisualizationTheme) {
+  return {
+    "--viz-series-0": `var(--color-accent-primary, var(--color-icon-blue, ${theme.colors.primary[0]}))`,
+    "--viz-series-1": `var(--color-accent-success, var(--color-icon-teal, ${theme.colors.primary[1]}))`,
+    "--viz-series-2": `var(--color-accent-info, var(--color-icon-purple, ${theme.colors.primary[2]}))`,
+    "--viz-series-3": `var(--color-accent-warning, var(--color-icon-orange, ${theme.colors.primary[3]}))`,
+    "--viz-series-4": `var(--color-accent-danger, var(--color-icon-green, ${theme.colors.primary[4]}))`,
+    "--viz-axis": `var(--color-text-secondary, ${theme.colors.textSecondary})`,
+    "--viz-grid": `var(--color-border, ${theme.colors.border})`,
+    "--viz-text": `var(--color-text-primary, ${theme.colors.textPrimary})`,
+    "--viz-surface": `var(--color-background-surface, ${theme.colors.neutral[1]})`,
+  } as CSSProperties;
+}
+
+function resolveYFields(spec: VisualizationSpec, data: ResolvedVisualizationData, xField?: string) {
+  const explicitFields = spec.encoding?.y?.length ? spec.encoding.y : [spec.encoding?.value].filter(Boolean) as string[];
+  const measureFields = spec.measures?.map((measure) => measure.field) ?? [];
+  const numericColumns = data.columns.filter((column) => column.type === "number" && column.name !== xField).map((column) => column.name);
+  return uniqueStrings([...explicitFields, ...measureFields, ...numericColumns]).slice(0, 4);
+}
+
+function uniqueStrings(values: string[]) {
+  return Array.from(new Set(values.filter(Boolean)));
+}
+
+function buildXAxisScale(input: {
+  spec: VisualizationSpec;
+  data: ResolvedVisualizationData;
+  xField?: string;
+  rows: Record<string, unknown>[];
+  margin: { left: number };
+  plotWidth: number;
+}): XAxisScale {
+  const { spec, data, xField, rows, margin, plotWidth } = input;
+  const dimension = spec.dimensions?.find((item) => item.field === xField);
+  const column = data.columns.find((item) => item.name === xField);
+  const kind = inferXAxisKind(dimension, column?.type);
+  if (kind === "number") {
+    const values = rows.map((row) => normalizeNumber(row[xField ?? ""], Number.NaN));
+    const ticks = buildNumericTicks(values, 5, { fitToDataRange: true, includeZero: false });
+    const domain = domainFromTicks(ticks);
+    return {
+      kind,
+      ticks: ticks.map((tick) => ({ key: `x-${tick}`, x: scaleContinuous(tick, domain.min, domain.max, margin.left, plotWidth), label: formatAxisNumber(tick) })),
+      position: (row, index) => {
+        const value = normalizeNumber(row[xField ?? ""], Number.NaN);
+        return scaleContinuous(Number.isFinite(value) ? value : index, domain.min, domain.max, margin.left, plotWidth);
+      },
+    };
+  }
+  if (kind === "time") {
+    const values = rows.map((row) => normalizeTime(row[xField ?? ""], Number.NaN));
+    const ticks = buildTimeTicks(values);
+    const domain = domainFromTicks(ticks);
+    const span = domain.max - domain.min;
+    return {
+      kind,
+      ticks: ticks.map((tick) => ({ key: `x-${tick}`, x: scaleContinuous(tick, domain.min, domain.max, margin.left, plotWidth), label: formatTimeTick(tick, span) })),
+      position: (row, index) => {
+        const value = normalizeTime(row[xField ?? ""], Number.NaN);
+        return scaleContinuous(Number.isFinite(value) ? value : index, domain.min, domain.max, margin.left, plotWidth);
+      },
+    };
+  }
+
+  const categoryCount = Math.max(1, rows.length);
+  const categoryStep = plotWidth / categoryCount;
+  const tickIndexes = buildCategoryTickIndexes(rows.length);
+  return {
+    kind: "category",
+    ticks: tickIndexes.map((index) => {
+      const row = rows[index];
+      const x = margin.left + categoryStep * index + categoryStep / 2;
+      return {
+        key: `x-${index}`,
+        x,
+        label: truncateAxisLabel(formatCell(row?.[xField ?? ""]), rows.length),
+      };
+    }),
+    position: (_row, index) => margin.left + categoryStep * index + categoryStep / 2,
+  };
+}
+
+function inferXAxisKind(dimension?: VisualizationDimension, columnType?: string): XAxisScale["kind"] {
+  if (dimension?.dataType === "time" || columnType === "date" || columnType === "datetime") {
+    return "time";
+  }
+  if (dimension?.dataType === "number" || columnType === "number") {
+    return "number";
+  }
+  return "category";
+}
+
+function shouldIncludeYAxisZero(type: VisualizationSpec["type"]) {
+  return ["bar", "stacked_bar", "horizontal_bar", "waterfall", "area", "bar_line_combo"].includes(type);
+}
+
+function scaleContinuous(value: number, min: number, max: number, left: number, plotWidth: number) {
+  if (!Number.isFinite(value)) {
+    return left;
+  }
+  if (max === min) {
+    return left + plotWidth / 2;
+  }
+  return left + ((value - min) / (max - min)) * plotWidth;
+}
+
 function scaleValue(value: number, min: number, max: number, top: number, plotHeight: number) {
+  if (!Number.isFinite(value)) {
+    return top + plotHeight / 2;
+  }
   if (max === min) {
     return top + plotHeight / 2;
   }
   return top + plotHeight - ((value - min) / (max - min)) * plotHeight;
 }
 
-function buildNumericTicks(values: number[], tickCount = 5) {
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
+}
+
+export function buildNumericTicks(values: number[], tickCount = 5, options: { fitToDataRange?: boolean; includeZero?: boolean } = {}) {
   const finiteValues = values.filter(Number.isFinite);
-  const rawMin = Math.min(0, ...finiteValues);
-  const rawMax = Math.max(0, ...finiteValues);
-  if (!Number.isFinite(rawMin) || !Number.isFinite(rawMax) || rawMin === rawMax) {
-    return [0, 1, 2, 3, 4];
+  if (finiteValues.length === 0) {
+    return [0, 1];
+  }
+  const includeZero = options.includeZero ?? true;
+  let rawMin = includeZero ? Math.min(0, ...finiteValues) : Math.min(...finiteValues);
+  let rawMax = includeZero ? Math.max(0, ...finiteValues) : Math.max(...finiteValues);
+  if (rawMin === rawMax) {
+    const offset = niceStep(Math.max(Math.abs(rawMax), 1) / Math.max(2, tickCount - 1));
+    rawMin -= offset * 2;
+    rawMax += offset * 2;
+  }
+  if (options.fitToDataRange) {
+    const step = (rawMax - rawMin) / Math.max(1, tickCount - 1);
+    return Array.from({ length: tickCount }, (_item, index) => round(rawMin + step * index));
   }
   const span = rawMax - rawMin;
   const step = niceStep(span / Math.max(1, tickCount - 1));
@@ -261,6 +428,29 @@ function buildNumericTicks(values: number[], tickCount = 5) {
     ticks.push(round(value));
   }
   return ticks.length >= 2 ? ticks : [min, max];
+}
+
+function buildTimeTicks(values: number[], tickCount = 5) {
+  const finiteValues = values.filter(Number.isFinite);
+  if (finiteValues.length === 0) {
+    const now = Date.now();
+    return [now, now + 86_400_000];
+  }
+  let min = Math.min(...finiteValues);
+  let max = Math.max(...finiteValues);
+  if (min === max) {
+    min -= 86_400_000;
+    max += 86_400_000;
+  }
+  const step = (max - min) / Math.max(1, tickCount - 1);
+  return Array.from({ length: tickCount }, (_item, index) => Math.round(min + step * index));
+}
+
+function domainFromTicks(ticks: number[]) {
+  return {
+    min: ticks[0] ?? 0,
+    max: ticks.at(-1) ?? 1,
+  };
 }
 
 function niceStep(value: number) {
@@ -285,6 +475,52 @@ function buildCategoryTickIndexes(length: number) {
 function truncateAxisLabel(value: string, rowCount: number) {
   const maxLength = rowCount > 12 ? 5 : rowCount > 8 ? 7 : 10;
   return value.length > maxLength ? `${value.slice(0, maxLength)}...` : value;
+}
+
+function normalizeNumber(value: unknown, fallback = 0) {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : fallback;
+  }
+  if (typeof value === "string") {
+    const parsed = Number(value.replace(/,/g, ""));
+    return Number.isFinite(parsed) ? parsed : fallback;
+  }
+  return fallback;
+}
+
+function normalizeTime(value: unknown, fallback = 0) {
+  if (value instanceof Date) {
+    return value.getTime();
+  }
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : fallback;
+  }
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  }
+  return fallback;
+}
+
+function formatTimeTick(value: number, span: number) {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) {
+    return "--";
+  }
+  const options: Intl.DateTimeFormatOptions = span > 365 * 86_400_000
+    ? { year: "numeric", month: "2-digit" }
+    : span >= 86_400_000
+      ? { month: "2-digit", day: "2-digit" }
+      : { hour: "2-digit", minute: "2-digit" };
+  return new Intl.DateTimeFormat("zh-CN", options).format(date);
+}
+
+function labelForMeasure(spec: VisualizationSpec, field: string) {
+  return spec.measures?.find((measure: VisualizationMeasure) => measure.field === field)?.label ?? field;
+}
+
+function seriesStyle(index: number) {
+  return { "--viz-current": `var(--viz-series-${index % 5})` } as CSSProperties;
 }
 
 function NetworkView({ spec, data }: { spec: VisualizationSpec; data: ResolvedVisualizationData }) {
@@ -388,6 +624,30 @@ function formatCompactNumber(value: number) {
     notation: Math.abs(value) >= 10_000 ? "compact" : "standard",
     maximumFractionDigits: 2,
   }).format(value);
+}
+
+function formatAxisTick(value: number) {
+  return Math.abs(value) >= 10_000 ? formatCompactNumber(value) : formatAxisNumber(value);
+}
+
+function formatAxisNumber(value: number) {
+  return new Intl.NumberFormat("zh-CN", {
+    maximumFractionDigits: 2,
+    useGrouping: Math.abs(value) >= 10_000,
+  }).format(value);
+}
+
+function bubbleRadius(value: number, values: number[]) {
+  const finiteValues = values.filter(Number.isFinite).map((item) => Math.abs(item));
+  if (finiteValues.length === 0) {
+    return 5;
+  }
+  const min = Math.min(...finiteValues);
+  const max = Math.max(...finiteValues);
+  if (min === max) {
+    return 7;
+  }
+  return round(4 + ((Math.abs(value) - min) / Math.max(1, max - min)) * 10);
 }
 
 function round(value: number) {

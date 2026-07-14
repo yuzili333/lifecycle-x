@@ -20,12 +20,27 @@ import {
 } from "./workflowRuntime";
 import { rewriteCompoundOrderByForSqlite } from "./sqliteSqlRewrite";
 import { parseVisualizationSpecJson, type VisualizationRenderError, type VisualizationSpec } from "../shared/visualization";
+import {
+  SQLiteArtifactManager,
+  SQLiteToolResultRegistry,
+  TOOL_SCHEMAS,
+  TOOL_NAMES,
+  TOOL_ORCHESTRATION_SYSTEM_PROMPT,
+  type ArtifactManager,
+  type ConversationToolState,
+  type ArtifactRecord,
+  type ToolCallRecord,
+  type ToolCallStatus,
+  type ToolKind,
+  type ToolResultRegistry,
+} from "./toolOrchestration";
+import { createStreamingModelAdapter, type ConversationMessage, type ToolDefinition } from "./streamingModelAdapter";
 
 const require = createRequire(import.meta.url);
 const Database = require("better-sqlite3");
 
 export type AssistantApprovalMode = "full_access" | "request_approval" | "no_access";
-export type AssistantSkill = "general_analysis" | "schema_explorer";
+export type AssistantSkill = string;
 export type AssistantBlockType = "text" | "markdown" | "json" | "card" | "mermaid" | "visualization";
 export type AssistantMessageRole = "system" | "user" | "assistant" | "tool";
 export type AssistantMessageStatus =
@@ -134,6 +149,7 @@ export type AssistantStreamEvent =
   | { type: "message"; conversationId: string; message: AssistantMessage }
   | { type: "message-delta"; conversationId: string; messageId: string; content: string; blocks: AssistantBlock[]; status: AssistantMessageStatus }
   | { type: "tool"; conversationId: string; toolCall: AssistantToolCall; message: AssistantMessage }
+  | { type: "tool-state"; conversationId: string; state: ConversationToolState }
   | { type: "workflow"; conversationId: string; context: WorkflowContextSummary }
   | { type: "error"; conversationId: string; messageId?: string; message: string; traceId: string };
 
@@ -183,6 +199,24 @@ const MAX_STREAM_CHARS = 120_000;
 const PYTHON_TIMEOUT_MS = 5_000;
 const MAX_TOOL_CONTEXT_CHARS = 30_000;
 const WORKFLOW_DATASET_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+function selectedSkillSystemPrompt(skill: AssistantSkill | null | undefined) {
+  if (skill !== "overall-risk-classification-distribution") {
+    return undefined;
+  }
+
+  return [
+    "你正在执行本地预置 Skill：整体风险分类分布（笔数+金额）。",
+    "目标：基于用户选择的数据源，分析信贷资产五级和十二级风险分类的笔数、贷款余额、关注率、不良率、关注加不良率和正常3+关注类风险边界，并生成图表和 Markdown 报告。",
+    "执行顺序：先确认数据源和字段映射；需要真实数据时调用 request_sql_query_execution；统计计算、分类标准化、占比和数据质量校验调用 request_python_analysis_execution；需要图表时调用 request_chart_rendering；完整报告调用 request_markdown_report_generation。",
+    "SQL 和 Python 执行前必须遵守当前审批权限；不得绕过安全校验、权限校验或用户审批。",
+    "必需字段：合同唯一标识、五级分类、贷款余额。十二级分类和合同金额缺失时必须降级说明，不得伪造。",
+    "SQL 查询必须保留后续报告计算所需字段，优先读取明细样本后交由 Python 统一计算；除非用户只要求 SQL 聚合结果，否则不要只返回按风险分类聚合后的少量行。",
+    "口径：不良类=次级+可疑+损失；关注加不良=关注+次级+可疑+损失；风险边界默认=正常3+全部关注类。",
+    "报告必须区分笔数维度和金额维度，包含五级分类表、十二级分类明细、核心指标、图表引用、数据质量说明、计算口径和 Artifact 数据血缘。",
+    "禁止使用报告模板或示例中的数字作为真实分析结果；不得基于 preview rows 推断全量结论；不得将完整源表数据注入模型上下文。",
+  ].join("\n");
+}
 
 function nowIso() {
   return new Date().toISOString();
@@ -389,6 +423,10 @@ function toolTarget(toolCall: AssistantToolCall) {
   return "Python Script";
 }
 
+function assistantToolKindToOrchestrationKind(kind: AssistantToolKind): ToolKind {
+  return kind === "sql" ? "sql_query" : "python_analysis";
+}
+
 function isMarkdownLikeContent(content: string) {
   return (
     /(^|\n)\s{0,3}#{1,6}\s+\S/.test(content) ||
@@ -460,6 +498,170 @@ function isVisualizationLanguage(language: string) {
   return ["visualization", "visualization-json", "viz", "chart-spec"].includes(language);
 }
 
+export function isReportGenerationContent(userPrompt: string, content: string) {
+  const combined = `${userPrompt}\n${content}`;
+  if (!/(报告|分析报告|统计分析|分析结论|风险提示|建议|总结)/i.test(combined)) {
+    return false;
+  }
+  return isMarkdownLikeContent(content) || /^#{1,3}\s+/m.test(content) || /\|.+\|/m.test(content);
+}
+
+export function inferReportTitle(content: string) {
+  const heading = content.match(/^#{1,2}\s+(.+)$/m)?.[1]?.trim();
+  if (heading) {
+    return heading.slice(0, 120);
+  }
+  const firstLine = content.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+  return firstLine?.replace(/^#+\s*/, "").slice(0, 120);
+}
+
+function uniqueValues<T>(values: T[]) {
+  return Array.from(new Set(values.filter((value): value is NonNullable<T> => value !== null && value !== undefined)));
+}
+
+function isOverallRiskSkill(skill: AssistantSkill | null | undefined) {
+  return skill === "overall-risk-classification-distribution";
+}
+
+function parseAmountValue(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value !== "string") {
+    return 0;
+  }
+  const normalized = value.replace(/[,\s￥¥元]/g, "");
+  const number = Number(normalized);
+  return Number.isFinite(number) ? number : 0;
+}
+
+function findColumnByPattern(rows: Array<Record<string, unknown>>, patterns: RegExp[]) {
+  const columns = Object.keys(rows[0] ?? {});
+  return columns.find((column) => patterns.some((pattern) => pattern.test(column))) ?? null;
+}
+
+function riskBucket(value: unknown) {
+  const text = String(value ?? "").trim();
+  if (!text) {
+    return "未分类";
+  }
+  if (/正常\s*[1１]/i.test(text)) {
+    return "正常1";
+  }
+  if (/正常\s*[2２]/i.test(text)) {
+    return "正常2";
+  }
+  if (/正常\s*[3３]/i.test(text)) {
+    return "正常3";
+  }
+  if (/正常/i.test(text)) {
+    return "正常";
+  }
+  if (/关注/i.test(text)) {
+    return "关注";
+  }
+  if (/次级/i.test(text)) {
+    return "次级";
+  }
+  if (/可疑/i.test(text)) {
+    return "可疑";
+  }
+  if (/损失/i.test(text)) {
+    return "损失";
+  }
+  return text;
+}
+
+function amountText(value: number) {
+  return value.toLocaleString("zh-CN", { maximumFractionDigits: 2 });
+}
+
+function pctText(value: number, total: number) {
+  return total > 0 ? `${(value * 100 / total).toFixed(2)}%` : "0.00%";
+}
+
+export function buildOverallRiskDistributionMarkdown(rows: Array<Record<string, unknown>>, context: { title?: string; dataSourceLabel?: string | null; version?: number }) {
+  const totalCount = rows.length;
+  const idColumn = findColumnByPattern(rows, [/合同.*(号|编号|id)/i, /借据/i, /loan.*id/i, /contract.*id/i, /^id$/i]);
+  const fiveRiskColumn = findColumnByPattern(rows, [/五级/i, /五.*分类/i, /风险.*分类/i, /risk.*class/i, /risk_level/i, /资产.*分类/i]);
+  const twelveRiskColumn = findColumnByPattern(rows, [/十二级/i, /12\s*级/i, /十二.*分类/i, /细分.*分类/i, /risk.*12/i]);
+  const balanceColumn = findColumnByPattern(rows, [/贷款余额/i, /本金余额/i, /余额/i, /balance/i, /amount/i, /金额/i]);
+  const contractAmountColumn = findColumnByPattern(rows, [/合同金额/i, /发放金额/i, /授信金额/i, /contract.*amount/i]);
+
+  const fiveOrder = ["正常", "正常1", "正常2", "正常3", "关注", "次级", "可疑", "损失", "未分类"];
+  const fiveStats = new Map<string, { count: number; amount: number }>();
+  const twelveStats = new Map<string, { count: number; amount: number }>();
+
+  for (const row of rows) {
+    const five = riskBucket(fiveRiskColumn ? row[fiveRiskColumn] : undefined);
+    const twelve = riskBucket(twelveRiskColumn ? row[twelveRiskColumn] : undefined);
+    const amount = balanceColumn ? parseAmountValue(row[balanceColumn]) : 0;
+    const fiveCurrent = fiveStats.get(five) ?? { count: 0, amount: 0 };
+    fiveStats.set(five, { count: fiveCurrent.count + 1, amount: fiveCurrent.amount + amount });
+    if (twelveRiskColumn) {
+      const twelveCurrent = twelveStats.get(twelve) ?? { count: 0, amount: 0 };
+      twelveStats.set(twelve, { count: twelveCurrent.count + 1, amount: twelveCurrent.amount + amount });
+    }
+  }
+
+  const totalAmount = Array.from(fiveStats.values()).reduce((sum, item) => sum + item.amount, 0);
+  const attentionCount = Array.from(fiveStats.entries()).filter(([key]) => key.includes("关注")).reduce((sum, [, item]) => sum + item.count, 0);
+  const attentionAmount = Array.from(fiveStats.entries()).filter(([key]) => key.includes("关注")).reduce((sum, [, item]) => sum + item.amount, 0);
+  const nonPerformingKeys = ["次级", "可疑", "损失"];
+  const nonPerformingCount = Array.from(fiveStats.entries()).filter(([key]) => nonPerformingKeys.some((risk) => key.includes(risk))).reduce((sum, [, item]) => sum + item.count, 0);
+  const nonPerformingAmount = Array.from(fiveStats.entries()).filter(([key]) => nonPerformingKeys.some((risk) => key.includes(risk))).reduce((sum, [, item]) => sum + item.amount, 0);
+  const boundaryCount = Array.from(fiveStats.entries()).filter(([key]) => key.includes("正常3") || key.includes("关注")).reduce((sum, [, item]) => sum + item.count, 0);
+  const boundaryAmount = Array.from(fiveStats.entries()).filter(([key]) => key.includes("正常3") || key.includes("关注")).reduce((sum, [, item]) => sum + item.amount, 0);
+  const orderedFive = [...fiveOrder.filter((key) => fiveStats.has(key)), ...Array.from(fiveStats.keys()).filter((key) => !fiveOrder.includes(key))];
+  const orderedTwelve = Array.from(twelveStats.keys()).sort((a, b) => a.localeCompare(b, "zh-CN"));
+
+  const qualityNotes = [
+    idColumn ? `合同唯一标识字段：${idColumn}` : "未识别合同唯一标识字段，笔数按数据行数统计。",
+    fiveRiskColumn ? `五级分类字段：${fiveRiskColumn}` : "未识别五级分类字段，分类统计将归入“未分类”。",
+    balanceColumn ? `贷款余额/金额字段：${balanceColumn}` : "未识别贷款余额字段，金额维度按 0 处理。",
+    twelveRiskColumn ? `十二级分类字段：${twelveRiskColumn}` : "未识别十二级分类字段，十二级明细降级展示为空。",
+    contractAmountColumn ? `合同金额字段：${contractAmountColumn}` : "未识别合同金额字段，报告不展示合同金额维度。",
+  ];
+
+  return [
+    `# ${context.title ?? "整体风险分类分布报告"}${context.version ? ` v${context.version}` : ""}`,
+    "",
+    "## 一、分析范围",
+    `- 数据源：${context.dataSourceLabel || "用户选择数据源"}`,
+    `- 样本笔数：${totalCount}`,
+    `- 贷款余额合计：${amountText(totalAmount)}`,
+    `- 生成时间：${nowIso()}`,
+    "",
+    "## 二、整体风险分类分布（笔数+金额）",
+    "| 风险分类 | 笔数 | 笔数占比 | 贷款余额 | 金额占比 |",
+    "| --- | ---: | ---: | ---: | ---: |",
+    ...orderedFive.map((key) => {
+      const item = fiveStats.get(key) ?? { count: 0, amount: 0 };
+      return `| ${key} | ${item.count} | ${pctText(item.count, totalCount)} | ${amountText(item.amount)} | ${pctText(item.amount, totalAmount)} |`;
+    }),
+    `| 合计 | ${totalCount} | 100.00% | ${amountText(totalAmount)} | ${totalAmount > 0 ? "100.00%" : "0.00%"} |`,
+    "",
+    "## 三、核心风险指标",
+    `- 关注类占比：${pctText(attentionCount, totalCount)}（笔数），${pctText(attentionAmount, totalAmount)}（金额）。`,
+    `- 不良率：${pctText(nonPerformingCount, totalCount)}（笔数），${pctText(nonPerformingAmount, totalAmount)}（金额）。`,
+    `- 关注+不良占比：${pctText(attentionCount + nonPerformingCount, totalCount)}（笔数），${pctText(attentionAmount + nonPerformingAmount, totalAmount)}（金额）。`,
+    `- 正常3+关注风险边界：${pctText(boundaryCount, totalCount)}（笔数），${pctText(boundaryAmount, totalAmount)}（金额）。`,
+    "",
+    "## 四、十二级分类明细",
+    orderedTwelve.length > 0 ? "| 十二级分类 | 笔数 | 笔数占比 | 贷款余额 | 金额占比 |\n| --- | ---: | ---: | ---: | ---: |" : "未识别十二级分类字段，本节不生成明细表。",
+    ...orderedTwelve.map((key) => {
+      const item = twelveStats.get(key) ?? { count: 0, amount: 0 };
+      return `| ${key} | ${item.count} | ${pctText(item.count, totalCount)} | ${amountText(item.amount)} | ${pctText(item.amount, totalAmount)} |`;
+    }),
+    "",
+    "## 五、数据质量与口径说明",
+    ...qualityNotes.map((note) => `- ${note}`),
+    "- 不良类口径：次级、可疑、损失。",
+    "- 关注加不良口径：关注、次级、可疑、损失。",
+    "- 风险边界口径：正常3与关注类合并观察。",
+  ].join("\n");
+}
+
 export class AssistantRuntime {
   private db: any;
   private integrityKey: string;
@@ -471,6 +673,8 @@ export class AssistantRuntime {
   private readonly sqliteMaterializer: SQLiteMaterializer;
   private readonly workflowContextBuilder: WorkflowContextBuilder;
   private readonly workflowMemoryBridge: SQLiteWorkflowMemoryBridge;
+  private readonly toolResultRegistry: ToolResultRegistry;
+  private readonly toolArtifactManager: ArtifactManager;
 
   constructor(options: AssistantRuntimeOptions) {
     this.options = options;
@@ -479,6 +683,8 @@ export class AssistantRuntime {
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
     this.migrate();
+    this.toolResultRegistry = new SQLiteToolResultRegistry(this.db);
+    this.toolArtifactManager = new SQLiteArtifactManager(this.db);
     this.workflowStore = new AuditedWorkflowStateStore(new SQLiteWorkflowStateStore(this.db), new SQLiteWorkflowAuditLogger(this.db));
     this.datasetStateManager = new SQLiteDatasetStateManager(this.db, this.workflowStore);
     this.sqliteMaterializer = new SQLiteMaterializer(this.db, {
@@ -609,7 +815,9 @@ export class AssistantRuntime {
     this.options.emit({ type: "message", conversationId: conversation.id, message: assistantMessage });
 
     const tool = detectTool(prompt);
-    if (tool) {
+    if (await this.routeOverallRiskSkillWorkflow(input, conversation, assistantMessage)) {
+      // Routed to the governed multi-step skill workflow.
+    } else if (tool) {
       void this.handleToolCall(input, conversation, assistantMessage, tool);
     } else if (await this.routePriorSqlAnalysis(input, conversation, assistantMessage)) {
       // Routed to a governed Python tool call.
@@ -623,6 +831,10 @@ export class AssistantRuntime {
   async approveTool(userId: string, toolCallId: string, approved: boolean) {
     const row = this.db.prepare("select * from tool_calls where id = ? and user_id = ?").get(toolCallId, userId);
     if (!row) {
+      const orchestrationRecord = await this.toolResultRegistry.get(toolCallId);
+      if (orchestrationRecord) {
+        return this.approveOrchestrationTool(userId, orchestrationRecord, approved);
+      }
       throw new Error("工具调用不存在。");
     }
     const toolCall = this.toolCallFromRow(row);
@@ -652,6 +864,81 @@ export class AssistantRuntime {
     }
     await this.cleanupExpiredWorkflowDatasets(conversationId);
     return this.workflowContextBuilder.build(conversationId);
+  }
+
+  async getConversationToolState(userId: string, conversationId: string) {
+    const conversation = this.findConversation(userId, conversationId);
+    if (!conversation) {
+      throw new Error("对话不存在或已失效。");
+    }
+    return this.toolResultRegistry.getConversationState(conversation.id);
+  }
+
+  async listConversationToolCalls(userId: string, conversationId: string) {
+    const conversation = this.findConversation(userId, conversationId);
+    if (!conversation) {
+      throw new Error("对话不存在或已失效。");
+    }
+    return this.toolResultRegistry.listByConversation(conversation.id);
+  }
+
+  async getLatestConversationToolResult(userId: string, conversationId: string, toolKind: ToolKind) {
+    const conversation = this.findConversation(userId, conversationId);
+    if (!conversation) {
+      throw new Error("对话不存在或已失效。");
+    }
+    return this.toolResultRegistry.getLatestSuccessful(conversation.id, toolKind);
+  }
+
+  async selectConversationToolResult(userId: string, conversationId: string, toolKind: ToolKind, toolCallId: string) {
+    const conversation = this.findConversation(userId, conversationId);
+    if (!conversation) {
+      throw new Error("对话不存在或已失效。");
+    }
+    await this.toolResultRegistry.selectResult(conversation.id, toolKind, toolCallId);
+    const record = await this.toolResultRegistry.get(toolCallId);
+    if (record) {
+      await this.workflowMemoryBridge.writeWorkflowMemory({
+        conversationId: conversation.id,
+        userId,
+        type: `${toolKind}_selected`,
+        summary: `用户已选择 ${TOOL_NAMES[toolKind]} v${record.version} 作为后续默认输入。`,
+        payload: {
+          toolCallId,
+          toolKind,
+          version: record.version,
+          artifactIds: record.outputArtifactIds ?? record.result?.artifactIds ?? [],
+          parentToolCallIds: record.parentToolCallIds ?? [],
+          sourceArtifactIds: record.sourceArtifactIds ?? [],
+        },
+      });
+    }
+    const state = await this.toolResultRegistry.getConversationState(conversation.id);
+    this.options.emit({
+      type: "tool-state",
+      conversationId: conversation.id,
+      state,
+    });
+    return state;
+  }
+
+  async getConversationToolArtifact(userId: string, conversationId: string, artifactId: string): Promise<ArtifactRecord | null> {
+    const conversation = this.findConversation(userId, conversationId);
+    if (!conversation) {
+      throw new Error("对话不存在或已失效。");
+    }
+    const normalizedArtifactId = artifactId.trim();
+    if (!normalizedArtifactId) {
+      throw new Error("Artifact ID 不能为空。");
+    }
+    const toolCalls = await this.toolResultRegistry.listByConversation(conversation.id);
+    const isConversationArtifact = toolCalls.some((toolCall) =>
+      [...(toolCall.outputArtifactIds ?? []), ...(toolCall.result?.artifactIds ?? [])].includes(normalizedArtifactId),
+    );
+    if (!isConversationArtifact) {
+      return null;
+    }
+    return this.toolArtifactManager.getArtifact(normalizedArtifactId);
   }
 
   async confirmWorkflowDataset(userId: string, conversationId: string, datasetId?: string) {
@@ -831,7 +1118,9 @@ export class AssistantRuntime {
       approvalMode: input.approvalMode,
     };
 
-    if (!(await this.routePriorSqlAnalysis(retryInput, nextConversation, assistantMessage))) {
+    if (await this.routeOverallRiskSkillWorkflow(retryInput, nextConversation, assistantMessage)) {
+      // Routed to the governed multi-step skill workflow.
+    } else if (!(await this.routePriorSqlAnalysis(retryInput, nextConversation, assistantMessage))) {
       void this.streamModelResponse(retryInput, nextConversation, assistantMessage);
     }
 
@@ -1247,6 +1536,39 @@ export class AssistantRuntime {
       "if not rows:",
       "    lines.append('## 结论')",
       "    lines.append('上一轮 SQL 工具调用未返回可分析行数据。')",
+      "elif {'five_level', 'contract_count'}.issubset(set(rows[0].keys())):",
+      "    def number(row, key):",
+      "        try:",
+      "            return float(row.get(key) or 0)",
+      "        except (TypeError, ValueError):",
+      "            return 0.0",
+      "    total_count = sum(int(number(row, 'contract_count')) for row in rows)",
+      "    total_balance = sum(number(row, 'total_balance') for row in rows)",
+      "    total_amount = sum(number(row, 'total_amount') for row in rows)",
+      "    lines.append('## 整体风险分类分布（笔数+金额）')",
+      "    lines.append('| 风险分类 | 笔数 | 笔数占比 | 贷款余额 | 余额占比 | 合同金额 | 金额占比 |')",
+      "    lines.append('|---|---:|---:|---:|---:|---:|---:|')",
+      "    risk_order = {'正常': 1, '关注': 2, '次级': 3, '可疑': 4, '损失': 5}",
+      "    ordered_rows = sorted(rows, key=lambda row: risk_order.get(str(row.get('five_level') or ''), 99))",
+      "    for row in ordered_rows:",
+      "        count = int(number(row, 'contract_count'))",
+      "        balance = number(row, 'total_balance')",
+      "        amount = number(row, 'total_amount')",
+      "        lines.append(f\"| {row.get('five_level') or '--'} | {count} | {pct(count, total_count)}% | {round(balance, 2)} | {pct(balance, total_balance)}% | {round(amount, 2)} | {pct(amount, total_amount)}% |\")",
+      "    lines.append(f\"| 合计 | {total_count} | 100.0% | {round(total_balance, 2)} | {100.0 if total_balance else 0.0}% | {round(total_amount, 2)} | {100.0 if total_amount else 0.0}% |\")",
+      "    attention_count = sum(int(number(row, 'contract_count')) for row in rows if '关注' in str(row.get('five_level') or ''))",
+      "    npl_count = sum(int(number(row, 'contract_count')) for row in rows if any(key in str(row.get('five_level') or '') for key in ['次级', '可疑', '损失']))",
+      "    attention_balance = sum(number(row, 'total_balance') for row in rows if '关注' in str(row.get('five_level') or ''))",
+      "    npl_balance = sum(number(row, 'total_balance') for row in rows if any(key in str(row.get('five_level') or '') for key in ['次级', '可疑', '损失']))",
+      "    lines.append('')",
+      "    lines.append('## 核心风险指标')",
+      "    lines.append(f'- 关注类占比：{pct(attention_count, total_count)}%（笔数），{pct(attention_balance, total_balance)}%（余额）。')",
+      "    lines.append(f'- 不良率：{pct(npl_count, total_count)}%（笔数），{pct(npl_balance, total_balance)}%（余额）。')",
+      "    lines.append(f'- 关注+不良占比：{pct(attention_count + npl_count, total_count)}%（笔数），{pct(attention_balance + npl_balance, total_balance)}%（余额）。')",
+      "    lines.append('')",
+      "    lines.append('## 数据质量与口径说明')",
+      "    lines.append('- 本次 SQL 已返回风险分类聚合结果，报告基于聚合结果计算，不再要求 loan_term_type 或 branch_name 明细字段。')",
+      "    lines.append('- 不良类口径：次级、可疑、损失；关注加不良口径：关注、次级、可疑、损失。')",
       "elif 'accounting_org_name' in rows[0] and 'latest_risk_result' in rows[0] and ('柱状图' in question or '条形图' in question or '图表' in question or '可视化' in question or '报告' in question):",
       "    branch_field = 'accounting_org_name'",
       "    risk_result_field = 'latest_risk_result'",
@@ -1840,9 +2162,7 @@ export class AssistantRuntime {
       const sqlExecution = executableToolCall.kind === "sql" ? this.executeReadonlySql(executableToolCall.script, running) : null;
       const result = sqlExecution ? sqlExecution.result : await this.executePython(running.script);
       const completed = this.updateToolCall(toolCall.id, "completed", result);
-      if (completed.kind === "sql") {
-        await this.registerSqlToolResultDataset(completed, sqlExecution?.rows);
-      }
+      const sqlDataset = completed.kind === "sql" ? await this.registerSqlToolResultDataset(completed, sqlExecution?.rows) : null;
       this.appendToolLog(completed, "execution-complete", "success", "工具调用执行完成。", {
         resultPreview: result.slice(0, 2_000),
       });
@@ -1854,6 +2174,10 @@ export class AssistantRuntime {
         blocks: preserveContent ? replaceToolBlock(currentBeforeComplete.blocks, completedBlock) : [completedBlock],
       });
       this.options.emit({ type: "tool", conversationId: toolCall.conversationId, toolCall: completed, message });
+      await this.registerAssistantToolResult(completed, {
+        result,
+        sqlDataset: sqlDataset ?? undefined,
+      });
       if (completed.kind === "sql") {
         await this.maybeCreateAutoPythonReportApproval(completed, message, sqlExecution?.rows);
       }
@@ -1944,6 +2268,820 @@ export class AssistantRuntime {
       },
       { appendToMessage: true },
     );
+  }
+
+  private async routeOverallRiskSkillWorkflow(input: AssistantSendInput, conversation: AssistantConversation, assistantMessage: AssistantMessage) {
+    if (!isOverallRiskSkill(input.skill)) {
+      return false;
+    }
+
+    const planId = `skill_${randomUUID()}`;
+    const sql = this.defaultSqlForSkillWorkflow(input);
+    const started = this.updateMessage(assistantMessage.id, {
+      status: "processing",
+      content: [
+        "已识别 Skill 工作流：整体风险分类分布（笔数+金额）。",
+        "",
+        "执行计划：",
+        "1. 查询用户选择数据源，获取风险分类分析样本。",
+        "2. 计算五级/十二级分类笔数、金额及核心风险指标。",
+        "3. 按模板生成完整 Markdown 报告，并登记报告版本。",
+      ].join("\n"),
+      blocks: parseAssistantBlocks([
+        "## 智能体工作流",
+        "",
+        "- 状态：已完成意图识别，正在创建工具执行计划。",
+        "- 计划：SQL 查询 -> Python 分析 -> Markdown 报告生成。",
+        `- 审批模式：${input.approvalMode}`,
+      ].join("\n")),
+    });
+    this.options.emit({ type: "message", conversationId: conversation.id, message: started });
+
+    const sqlStatus: ToolCallStatus = input.approvalMode === "no_access" ? "blocked" : input.approvalMode === "request_approval" ? "waiting_approval" : "planned";
+    const pythonStatus: ToolCallStatus = input.approvalMode === "no_access" ? "blocked" : "planned";
+    const reportStatus: ToolCallStatus = input.approvalMode === "no_access" ? "blocked" : "planned";
+
+    const sqlRecord = await this.registerSkillWorkflowRecord({
+      planId,
+      conversation,
+      message: assistantMessage,
+      toolKind: "sql_query",
+      status: sqlStatus,
+      request: {
+        userRequest: input.prompt,
+        purpose: "读取用户选择数据源，准备整体风险分类分布分析样本。",
+        dataSourceId: input.dataSourceId ?? undefined,
+        dataSourceLabel: input.dataSourceLabel ?? undefined,
+        sql,
+        approvalMode: input.approvalMode,
+      },
+      errorMessage: input.approvalMode === "no_access" ? "当前审批权限禁止访问数据源工具。" : undefined,
+    });
+    const pythonRecord = await this.registerSkillWorkflowRecord({
+      planId,
+      conversation,
+      message: assistantMessage,
+      toolKind: "python_analysis",
+      status: pythonStatus,
+      request: {
+        userRequest: input.prompt,
+        purpose: "计算整体风险分类分布、核心指标与数据质量说明。",
+        approvalMode: input.approvalMode,
+      },
+      parentToolCallIds: [sqlRecord.toolCallId],
+      errorMessage: input.approvalMode === "no_access" ? "当前审批权限禁止执行分析工具。" : undefined,
+    });
+    await this.registerSkillWorkflowRecord({
+      planId,
+      conversation,
+      message: assistantMessage,
+      toolKind: "report_generation",
+      status: reportStatus,
+      request: {
+        userRequest: input.prompt,
+        purpose: "根据整体风险分类分布模板生成完整报告。",
+        title: "整体风险分类分布报告",
+        approvalMode: input.approvalMode,
+      },
+      parentToolCallIds: [pythonRecord.toolCallId],
+      errorMessage: input.approvalMode === "no_access" ? "当前审批权限禁止生成工具报告。" : undefined,
+    });
+    await this.emitToolState(conversation.id);
+
+    if (input.approvalMode === "no_access") {
+      const blocked = this.updateMessage(assistantMessage.id, {
+        status: "error",
+        content: "当前审批权限为“禁止访问权限”，整体风险分类分布工作流已被拦截。",
+        blocks: parseAssistantBlocks("## 工作流已阻断\n\n当前审批权限禁止执行数据查询和分析工具。"),
+        errorMessage: "工具调用被权限策略拦截。",
+      });
+      this.options.emit({ type: "message", conversationId: conversation.id, message: blocked });
+      return true;
+    }
+
+    if (input.approvalMode === "request_approval") {
+      const waiting = this.updateMessage(assistantMessage.id, {
+        status: "awaiting_approval",
+        content: "整体风险分类分布工作流已创建，SQL 查询等待审批。",
+        blocks: parseAssistantBlocks("## 工作流等待审批\n\n已创建 SQL 查询、Python 分析、报告生成三步工具计划。请先批准 SQL 查询。"),
+      });
+      this.options.emit({ type: "message", conversationId: conversation.id, message: waiting });
+      return true;
+    }
+
+    void this.executeOverallRiskWorkflowFromSql(sqlRecord);
+    return true;
+  }
+
+  private async registerSkillWorkflowRecord(input: {
+    planId: string;
+    conversation: AssistantConversation;
+    message: AssistantMessage;
+    toolKind: ToolKind;
+    status: ToolCallStatus;
+    request: Record<string, unknown>;
+    parentToolCallIds?: string[];
+    errorMessage?: string;
+  }) {
+    const createdAt = nowIso();
+    const version = (await this.toolResultRegistry.listByConversation(input.conversation.id)).filter((record) => record.toolKind === input.toolKind).length + 1;
+    const record: ToolCallRecord = {
+      toolCallId: `${input.toolKind.split("_")[0]}_${randomUUID()}`,
+      conversationId: input.conversation.id,
+      messageId: input.message.id,
+      userId: input.conversation.userId,
+      toolKind: input.toolKind,
+      toolName: TOOL_NAMES[input.toolKind],
+      status: input.status,
+      request: input.request,
+      resolvedInput: { mode: "no_input", reason: "整体风险分类分布 Skill 工作流初始化。" },
+      parentToolCallIds: input.parentToolCallIds ?? [],
+      sourceArtifactIds: [],
+      outputArtifactIds: [],
+      version,
+      isLatestSuccessful: false,
+      createdAt,
+      updatedAt: createdAt,
+      error: input.errorMessage
+        ? {
+            code: input.status === "blocked" ? "TOOL_INPUT_PERMISSION_DENIED" : "TOOL_EXECUTION_FAILED",
+            message: input.errorMessage,
+            conversationId: input.conversation.id,
+            traceId: `trace_${randomUUID()}`,
+          }
+        : undefined,
+      metadata: {
+        workflowKind: "overall-risk-classification-distribution",
+        planId: input.planId,
+        assistantMessageId: input.message.id,
+      },
+    };
+    await this.toolResultRegistry.register(record);
+    return record;
+  }
+
+  private async approveOrchestrationTool(userId: string, record: ToolCallRecord, approved: boolean) {
+    if (record.userId !== userId) {
+      throw new Error("当前用户无权审批该工具调用。");
+    }
+    if (record.status !== "waiting_approval") {
+      throw new Error("工具调用状态已变更，无法重复审批。");
+    }
+    if (!approved) {
+      const rejected = await this.toolResultRegistry.update(record.toolCallId, {
+        status: "rejected",
+        completedAt: nowIso(),
+        error: {
+          code: "TOOL_APPROVAL_REQUIRED",
+          message: "用户拒绝执行该工具调用。",
+          conversationId: record.conversationId,
+          toolCallId: record.toolCallId,
+          traceId: `trace_${randomUUID()}`,
+          recoverable: false,
+        },
+      });
+      const message = record.messageId
+        ? this.updateMessage(record.messageId, {
+            status: "stopped",
+            content: "用户已拒绝执行工具调用，工作流已停止。",
+            blocks: parseAssistantBlocks("## 工作流已停止\n\n用户拒绝执行待审批工具调用。"),
+            errorMessage: "用户拒绝",
+          })
+        : this.latestAssistantMessageForConversation(record.conversationId, userId);
+      await this.emitToolState(record.conversationId);
+      if (message) {
+        this.options.emit({ type: "message", conversationId: record.conversationId, message });
+      }
+      return { success: true as const, toolCall: rejected, message: message ?? this.fallbackAssistantMessage(record, "用户已拒绝执行工具调用。") };
+    }
+
+    if (record.toolKind === "sql_query") {
+      const completed = await this.executeOverallRiskSql(record);
+      const python = await this.nextSkillWorkflowRecord(record, "python_analysis");
+      let message = this.latestAssistantMessageForConversation(record.conversationId, userId) ?? this.fallbackAssistantMessage(record, "SQL 查询已完成。");
+      if (python) {
+        await this.toolResultRegistry.update(python.toolCallId, { status: "waiting_approval", resolvedInput: {
+          mode: "latest_result",
+          sourceToolKind: "sql_query",
+          sourceToolCallId: completed.toolCallId,
+          sourceArtifactIds: completed.outputArtifactIds,
+          reason: "SQL 查询完成后，Python 分析等待用户审批。",
+        } });
+        message = this.updateMessage(record.messageId ?? message.id, {
+          status: "awaiting_approval",
+          content: "SQL 查询已完成，Python 分析等待审批。",
+          blocks: parseAssistantBlocks("## 工作流等待审批\n\nSQL 查询已完成并生成数据集。请批准 Python 分析以继续生成报告。"),
+        });
+        this.options.emit({ type: "message", conversationId: record.conversationId, message });
+      }
+      await this.emitToolState(record.conversationId);
+      return { success: true as const, toolCall: completed, message };
+    }
+
+    if (record.toolKind === "python_analysis") {
+      const completed = await this.executeOverallRiskPython(record);
+      const report = await this.nextSkillWorkflowRecord(record, "report_generation");
+      let message = this.latestAssistantMessageForConversation(record.conversationId, userId) ?? this.fallbackAssistantMessage(record, "Python 分析已完成。");
+      if (report) {
+        message = await this.executeOverallRiskReport(report);
+      }
+      await this.emitToolState(record.conversationId);
+      return { success: true as const, toolCall: completed, message };
+    }
+
+    const completed = await this.executeOverallRiskReport(record);
+    return { success: true as const, toolCall: await this.toolResultRegistry.get(record.toolCallId), message: completed };
+  }
+
+  private async executeOverallRiskWorkflowFromSql(sqlRecord: ToolCallRecord) {
+    try {
+      await this.executeOverallRiskSql(sqlRecord);
+      const python = await this.nextSkillWorkflowRecord(sqlRecord, "python_analysis");
+      if (!python) {
+        return;
+      }
+      await this.executeOverallRiskPython(python);
+      const report = await this.nextSkillWorkflowRecord(sqlRecord, "report_generation");
+      if (report) {
+        await this.executeOverallRiskReport(report);
+      }
+    } catch (error) {
+      const messageText = error instanceof Error ? error.message : "整体风险分类分布工作流执行失败。";
+      if (sqlRecord.messageId) {
+        const failed = this.updateMessage(sqlRecord.messageId, {
+          status: "error",
+          content: messageText,
+          blocks: parseAssistantBlocks(`## 工作流执行失败\n\n${messageText}`),
+          errorMessage: messageText,
+        });
+        this.options.emit({ type: "message", conversationId: sqlRecord.conversationId, message: failed });
+      }
+      await this.emitToolState(sqlRecord.conversationId);
+    }
+  }
+
+  private async executeOverallRiskSql(record: ToolCallRecord) {
+    const sql = typeof record.request.sql === "string" ? record.request.sql : this.defaultSqlForSkillWorkflow({
+      dataSourceId: typeof record.request.dataSourceId === "string" ? record.request.dataSourceId : null,
+      dataSourceLabel: typeof record.request.dataSourceLabel === "string" ? record.request.dataSourceLabel : null,
+    });
+    const executing = await this.toolResultRegistry.update(record.toolCallId, { status: "executing" });
+    await this.emitToolState(record.conversationId);
+    const toolCall = this.orchestrationRecordAsAssistantTool(executing, "sql", sql, "running");
+    try {
+      const sqlExecution = this.executeReadonlySql(sql, toolCall);
+      const completedToolCall = { ...toolCall, status: "completed" as const, result: sqlExecution.result, updatedAt: nowIso() };
+      const dataset = await this.registerSqlToolResultDataset(completedToolCall, sqlExecution.rows);
+      const artifactIds = dataset ? [`workflow-dataset:${dataset.datasetId}`] : [`assistant-sql-result:${record.toolCallId}`];
+      if (!dataset) {
+        await this.toolArtifactManager.createArtifact({
+          artifactId: artifactIds[0],
+          artifactType: "dataset_profile",
+          title: "SQL 查询结果摘要",
+          contentType: "json",
+          content: sqlExecution.result,
+          metadata: { toolCallId: record.toolCallId },
+        });
+      }
+      const completed = await this.toolResultRegistry.update(record.toolCallId, {
+        status: "completed",
+        result: {
+          resultId: `result_${record.toolCallId}`,
+          toolKind: "sql_query",
+          artifactIds,
+          primaryArtifactId: artifactIds[0],
+          summary: `SQL 查询已完成，返回 ${sqlExecution.rows.length} 行。`,
+          createdAt: nowIso(),
+          metadata: { rowCount: sqlExecution.rows.length, sql },
+        },
+        outputArtifactIds: artifactIds,
+        completedAt: nowIso(),
+      });
+      await this.workflowMemoryBridge.writeWorkflowMemory({
+        conversationId: record.conversationId,
+        userId: record.userId,
+        type: "sql_query_completed",
+        summary: completed.result?.summary ?? "SQL 查询已完成。",
+        payload: { toolCallId: record.toolCallId, artifactIds },
+      });
+      await this.emitToolState(record.conversationId);
+      return completed;
+    } catch (error) {
+      const failed = await this.toolResultRegistry.update(record.toolCallId, {
+        status: "failed",
+        completedAt: nowIso(),
+        error: {
+          code: "TOOL_EXECUTION_FAILED",
+          message: error instanceof Error ? error.message : "SQL 查询执行失败。",
+          conversationId: record.conversationId,
+          toolCallId: record.toolCallId,
+          traceId: `trace_${randomUUID()}`,
+        },
+      });
+      await this.emitToolState(record.conversationId);
+      throw new Error(failed.error?.message ?? "SQL 查询执行失败。");
+    }
+  }
+
+  private async executeOverallRiskPython(record: ToolCallRecord) {
+    const executing = await this.toolResultRegistry.update(record.toolCallId, { status: "executing" });
+    await this.emitToolState(record.conversationId);
+    try {
+      const rows = await this.rowsForLatestSkillSqlRecord(executing.conversationId);
+      const markdown = buildOverallRiskDistributionMarkdown(rows, {
+        title: "整体风险分类分布分析结果",
+        dataSourceLabel: typeof executing.request.dataSourceLabel === "string" ? executing.request.dataSourceLabel : undefined,
+        version: executing.version,
+      });
+      const artifact = await this.toolArtifactManager.createArtifact({
+        artifactId: `assistant-risk-analysis:${executing.toolCallId}`,
+        artifactType: "analysis",
+        title: "整体风险分类分布分析结果",
+        contentType: "markdown",
+        content: markdown,
+        metadata: { toolCallId: executing.toolCallId, rowCount: rows.length },
+      });
+      const sourceSql = await this.toolResultRegistry.getLatestSuccessful(executing.conversationId, "sql_query");
+      const completed = await this.toolResultRegistry.update(executing.toolCallId, {
+        status: "completed",
+        result: {
+          resultId: `result_${executing.toolCallId}`,
+          toolKind: "python_analysis",
+          artifactIds: [artifact.artifactId],
+          primaryArtifactId: artifact.artifactId,
+          summary: `Python 分析已完成，样本 ${rows.length} 行。`,
+          createdAt: nowIso(),
+          metadata: { rowCount: rows.length },
+        },
+        parentToolCallIds: sourceSql ? [sourceSql.toolCallId] : executing.parentToolCallIds,
+        sourceArtifactIds: sourceSql?.outputArtifactIds ?? executing.sourceArtifactIds,
+        outputArtifactIds: [artifact.artifactId],
+        completedAt: nowIso(),
+      });
+      await this.workflowMemoryBridge.writeWorkflowMemory({
+        conversationId: executing.conversationId,
+        userId: executing.userId,
+        type: "python_analysis_completed",
+        summary: completed.result?.summary ?? "Python 分析已完成。",
+        payload: { toolCallId: completed.toolCallId, artifactIds: [artifact.artifactId] },
+      });
+      await this.emitToolState(executing.conversationId);
+      return completed;
+    } catch (error) {
+      const failed = await this.toolResultRegistry.update(executing.toolCallId, {
+        status: "failed",
+        completedAt: nowIso(),
+        error: {
+          code: "TOOL_EXECUTION_FAILED",
+          message: error instanceof Error ? error.message : "Python 分析执行失败。",
+          conversationId: executing.conversationId,
+          toolCallId: executing.toolCallId,
+          traceId: `trace_${randomUUID()}`,
+        },
+      });
+      await this.emitToolState(executing.conversationId);
+      throw new Error(failed.error?.message ?? "Python 分析执行失败。");
+    }
+  }
+
+  private async executeOverallRiskReport(record: ToolCallRecord) {
+    const executing = await this.toolResultRegistry.update(record.toolCallId, { status: "executing" });
+    await this.emitToolState(record.conversationId);
+    const analysis = await this.toolResultRegistry.getLatestSuccessful(executing.conversationId, "python_analysis");
+    const analysisArtifactId = analysis?.result?.primaryArtifactId ?? analysis?.outputArtifactIds?.[0];
+    const analysisArtifact = analysisArtifactId ? await this.toolArtifactManager.getArtifact(analysisArtifactId) : null;
+    const markdown = typeof analysisArtifact?.content === "string"
+      ? analysisArtifact.content.replace(/^# .+$/m, `# 整体风险分类分布报告 v${executing.version}`)
+      : buildOverallRiskDistributionMarkdown(await this.rowsForLatestSkillSqlRecord(executing.conversationId), {
+          title: "整体风险分类分布报告",
+          dataSourceLabel: typeof executing.request.dataSourceLabel === "string" ? executing.request.dataSourceLabel : undefined,
+          version: executing.version,
+        });
+    const artifact = await this.toolArtifactManager.createArtifact({
+      artifactId: `assistant-report-markdown:${executing.toolCallId}`,
+      artifactType: "report_markdown",
+      title: `整体风险分类分布报告 v${executing.version}`,
+      contentType: "markdown",
+      content: markdown,
+      metadata: { toolCallId: executing.toolCallId, sourceAnalysisArtifactId: analysisArtifactId },
+    });
+    const completed = await this.toolResultRegistry.update(executing.toolCallId, {
+      status: "completed",
+      result: {
+        resultId: `result_${executing.toolCallId}`,
+        toolKind: "report_generation",
+        artifactIds: [artifact.artifactId],
+        primaryArtifactId: artifact.artifactId,
+        summary: `整体风险分类分布报告 v${executing.version} 已生成。`,
+        createdAt: nowIso(),
+      },
+      parentToolCallIds: analysis ? [analysis.toolCallId] : executing.parentToolCallIds,
+      sourceArtifactIds: analysis?.outputArtifactIds ?? executing.sourceArtifactIds,
+      outputArtifactIds: [artifact.artifactId],
+      completedAt: nowIso(),
+    });
+    await this.workflowMemoryBridge.writeWorkflowMemory({
+      conversationId: executing.conversationId,
+      userId: executing.userId,
+      type: "report_generation_completed",
+      summary: completed.result?.summary ?? "报告已生成。",
+      payload: { toolCallId: completed.toolCallId, artifactIds: [artifact.artifactId], version: completed.version },
+    });
+    const message = executing.messageId
+      ? this.updateMessage(executing.messageId, {
+          status: "completed",
+          content: markdown,
+          blocks: parseAssistantBlocks(markdown),
+        })
+      : this.fallbackAssistantMessage(executing, markdown);
+    this.options.emit({ type: "message", conversationId: executing.conversationId, message });
+    await this.emitToolState(executing.conversationId);
+    return message;
+  }
+
+  private async nextSkillWorkflowRecord(record: ToolCallRecord, toolKind: ToolKind) {
+    const planId = record.metadata?.planId;
+    const records = await this.toolResultRegistry.listByConversation(record.conversationId);
+    return records.find((item) => item.toolKind === toolKind && item.metadata?.planId === planId) ?? null;
+  }
+
+  private orchestrationRecordAsAssistantTool(record: ToolCallRecord, kind: AssistantToolKind, script: string, status: AssistantToolStatus): AssistantToolCall {
+    return {
+      id: record.toolCallId,
+      conversationId: record.conversationId,
+      messageId: record.messageId ?? record.toolCallId,
+      userId: record.userId,
+      kind,
+      status,
+      script,
+      approvalMode: typeof record.request.approvalMode === "string" ? record.request.approvalMode as AssistantApprovalMode : "full_access",
+      createdAt: record.createdAt,
+      updatedAt: nowIso(),
+    };
+  }
+
+  private defaultSqlForSkillWorkflow(input: Pick<AssistantSendInput, "dataSourceId" | "dataSourceLabel">) {
+    const csvViewName = input.dataSourceId ? this.csvViewNameForDataSource(input.dataSourceId) : null;
+    if (csvViewName) {
+      return `select * from ${quoteIdentifier(csvViewName)}`;
+    }
+    const labelName = input.dataSourceLabel?.split("/")[0]?.trim();
+    return `select * from ${quoteIdentifier(labelName || "数据源")}`;
+  }
+
+  private csvViewNameForDataSource(dataSourceId: string) {
+    if (!existsSync(this.options.csvSqlitePath)) {
+      return null;
+    }
+    const alias = "csvdata";
+    const databases = this.db.prepare("pragma database_list").all() as Array<{ name: string; file: string }>;
+    if (!databases.some((database) => database.name === alias)) {
+      this.db.prepare(`attach database ? as ${quoteIdentifier(alias)}`).run(this.options.csvSqlitePath);
+    }
+    const row = this.db
+      .prepare(
+        `select display_name, table_id, sqlite_table_name
+         from ${quoteIdentifier(alias)}.csv_dataset_tables
+         where data_source_id = ?
+         order by updated_at desc
+         limit 1`,
+      )
+      .get(dataSourceId) as { display_name?: string; table_id?: string; sqlite_table_name?: string } | undefined;
+    return normalizeSqliteAlias(row?.display_name ?? row?.table_id ?? row?.sqlite_table_name ?? "");
+  }
+
+  private async rowsForLatestSkillSqlRecord(conversationId: string) {
+    const latestSql = await this.toolResultRegistry.getLatestSuccessful(conversationId, "sql_query");
+    const datasetId = latestSql?.outputArtifactIds?.find((artifactId) => artifactId.startsWith("workflow-dataset:"))?.split(":")[1];
+    const dataset = datasetId ? await this.datasetStateManager.getDataset(datasetId) : null;
+    if (dataset?.sqliteTableName) {
+      return this.db.prepare(`select * from ${quoteIdentifier(dataset.sqliteTableName)}`).all() as Array<Record<string, unknown>>;
+    }
+    return [];
+  }
+
+  private latestAssistantMessageForConversation(conversationId: string, userId: string) {
+    const row = this.db
+      .prepare("select * from messages where conversation_id = ? and user_id = ? and role = 'assistant' order by created_at desc limit 1")
+      .get(conversationId, userId);
+    return row ? this.messageFromRow(row) : null;
+  }
+
+  private fallbackAssistantMessage(record: ToolCallRecord, content: string): AssistantMessage {
+    return {
+      id: record.messageId ?? record.toolCallId,
+      conversationId: record.conversationId,
+      userId: record.userId,
+      role: "assistant",
+      status: "completed",
+      content,
+      blocks: parseAssistantBlocks(content),
+      createdAt: record.createdAt,
+      updatedAt: nowIso(),
+      integrityHash: "",
+    };
+  }
+
+  private async registerAssistantToolResult(
+    toolCall: AssistantToolCall,
+    input: { result: string; sqlDataset?: WorkflowDatasetRef },
+  ) {
+    const toolKind = assistantToolKindToOrchestrationKind(toolCall.kind);
+    const existing = await this.toolResultRegistry.get(toolCall.id);
+    if (existing?.status === "completed") {
+      return existing;
+    }
+    const artifactIds = await this.createAssistantToolArtifacts(toolCall, toolKind, input);
+    const parent = toolKind === "python_analysis"
+      ? await this.toolResultRegistry.getLatestSuccessful(toolCall.conversationId, "sql_query")
+      : null;
+    const version = (await this.toolResultRegistry.listByConversation(toolCall.conversationId)).filter((record) => record.toolKind === toolKind).length + 1;
+    const createdAt = toolCall.createdAt;
+    const completedAt = toolCall.updatedAt;
+    const record: ToolCallRecord = {
+      toolCallId: toolCall.id,
+      conversationId: toolCall.conversationId,
+      messageId: toolCall.messageId,
+      userId: toolCall.userId,
+      toolKind,
+      toolName: TOOL_NAMES[toolKind],
+      status: "completed",
+      request: {
+        userRequest: this.sourcePromptForToolCall(toolCall),
+        script: toolCall.script,
+        approvalMode: toolCall.approvalMode,
+      },
+      resolvedInput: parent
+        ? {
+            mode: "latest_result",
+            sourceToolKind: parent.toolKind,
+            sourceToolCallId: parent.toolCallId,
+            sourceArtifactIds: parent.outputArtifactIds ?? parent.result?.artifactIds,
+            reason: "AssistantRuntime 实际工具执行结果登记时自动关联最近成功 SQL 结果。",
+          }
+        : { mode: "no_input", reason: `${TOOL_NAMES[toolKind]} 使用当前工具请求自身输入。` },
+      result: {
+        resultId: `result_${toolCall.id}`,
+        toolKind,
+        artifactIds,
+        primaryArtifactId: artifactIds[0],
+        summary: this.assistantToolSummary(toolCall, input, artifactIds),
+        createdAt: completedAt,
+        metadata: {
+          assistantToolKind: toolCall.kind,
+          approvalMode: toolCall.approvalMode,
+        },
+      },
+      parentToolCallIds: parent ? [parent.toolCallId] : [],
+      sourceArtifactIds: parent?.outputArtifactIds ?? parent?.result?.artifactIds ?? [],
+      outputArtifactIds: artifactIds,
+      version,
+      isLatestSuccessful: false,
+      createdAt,
+      updatedAt: completedAt,
+      completedAt,
+      metadata: {
+        source: "assistant-runtime",
+        toolDurationMs: toolCallDurationMs(toolCall),
+      },
+    };
+    await this.toolResultRegistry.register(record);
+    await this.toolResultRegistry.markLatestSuccessful(toolCall.conversationId, toolCall.id);
+    await this.workflowMemoryBridge.writeWorkflowMemory({
+      conversationId: toolCall.conversationId,
+      userId: toolCall.userId,
+      type: `${toolKind}_completed`,
+      summary: record.result?.summary ?? `${TOOL_NAMES[toolKind]} v${version} 已完成。`,
+      payload: {
+        toolCallId: toolCall.id,
+        toolKind,
+        version,
+        artifactIds,
+        parentToolCallIds: record.parentToolCallIds,
+        sourceArtifactIds: record.sourceArtifactIds,
+      },
+    });
+    this.appendToolLog(toolCall, "tool-orchestration", "success", "Assistant 工具结果已登记到会话级工具编排状态。", {
+      toolKind,
+      version,
+      artifactIds,
+      parentToolCallIds: record.parentToolCallIds,
+      sourceArtifactIds: record.sourceArtifactIds,
+    });
+    this.options.emit({
+      type: "tool-state",
+      conversationId: toolCall.conversationId,
+      state: await this.toolResultRegistry.getConversationState(toolCall.conversationId),
+    });
+    return (await this.toolResultRegistry.get(toolCall.id)) ?? record;
+  }
+
+  private async createAssistantToolArtifacts(
+    toolCall: AssistantToolCall,
+    toolKind: ToolKind,
+    input: { result: string; sqlDataset?: WorkflowDatasetRef },
+  ) {
+    if (toolKind === "sql_query") {
+      const artifactIds = input.sqlDataset
+        ? [`workflow-dataset:${input.sqlDataset.datasetId}`]
+        : [`assistant-sql-result:${toolCall.id}`];
+      if (!input.sqlDataset) {
+        await this.toolArtifactManager.createArtifact({
+          artifactId: artifactIds[0],
+          artifactType: "dataset_profile",
+          title: "SQL 查询结果摘要",
+          contentType: "json",
+          content: input.result,
+          metadata: { toolCallId: toolCall.id },
+        });
+      }
+      return artifactIds;
+    }
+    const artifact = await this.toolArtifactManager.createArtifact({
+      artifactId: `assistant-python-analysis:${toolCall.id}`,
+      artifactType: isMarkdownLikeContent(input.result) ? "analysis" : "report_summary",
+      title: "Python 分析结果",
+      contentType: isMarkdownLikeContent(input.result) ? "markdown" : "json",
+      content: input.result,
+      metadata: { toolCallId: toolCall.id },
+    });
+    return [artifact.artifactId];
+  }
+
+  private assistantToolSummary(
+    toolCall: AssistantToolCall,
+    input: { result: string; sqlDataset?: WorkflowDatasetRef },
+    artifactIds: string[],
+  ) {
+    if (toolCall.kind === "sql") {
+      const rowCount = input.sqlDataset?.rowCount ?? parseSqlToolRowCount(input.result) ?? 0;
+      const columnCount = input.sqlDataset?.columnCount ?? 0;
+      return `SQL 查询已完成，输出 ${rowCount} 行、${columnCount} 列，Artifact：${artifactIds.join(", ")}。`;
+    }
+    return `Python 分析已完成，结果已保存为 Artifact：${artifactIds.join(", ")}。`;
+  }
+
+  private async registerAssistantGeneratedArtifacts(input: AssistantSendInput, message: AssistantMessage) {
+    const createdRecords: ToolCallRecord[] = [];
+    for (const block of message.blocks) {
+      if (block.type !== "visualization" || block.visualizationStatus !== "ready" || !block.visualizationSpec) {
+        continue;
+      }
+      const record = await this.registerGeneratedToolRecord({
+        toolKind: "chart_rendering",
+        toolCallId: `chart_${message.id}_${block.id}`,
+        message,
+        userRequest: input.prompt,
+        title: block.visualizationSpec.title,
+        summary: `图表「${block.visualizationSpec.title}」已生成。`,
+        artifact: {
+          artifactId: `assistant-chart-spec:${message.id}:${block.id}`,
+          artifactType: "visualization_spec",
+          title: block.visualizationSpec.title,
+          contentType: "visualization",
+          content: block.visualizationSpec,
+          metadata: {
+            messageId: message.id,
+            blockId: block.id,
+            visualizationId: block.visualizationSpec.visualizationId,
+          },
+        },
+        parentKinds: ["python_analysis", "sql_query"],
+      });
+      if (record) {
+        createdRecords.push(record);
+      }
+    }
+
+    if (isReportGenerationContent(input.prompt, message.content)) {
+      const title = inferReportTitle(message.content) ?? "分析报告";
+      const record = await this.registerGeneratedToolRecord({
+        toolKind: "report_generation",
+        toolCallId: `report_${message.id}`,
+        message,
+        userRequest: input.prompt,
+        title,
+        summary: `Markdown 报告「${title}」已生成。`,
+        artifact: {
+          artifactId: `assistant-report-markdown:${message.id}`,
+          artifactType: "report_markdown",
+          title,
+          contentType: "markdown",
+          content: message.content,
+          metadata: {
+            messageId: message.id,
+            providerTraceId: message.providerTraceId,
+          },
+        },
+        parentKinds: ["chart_rendering", "python_analysis", "sql_query"],
+      });
+      if (record) {
+        createdRecords.push(record);
+      }
+    }
+
+    if (createdRecords.length > 0) {
+      const state = await this.toolResultRegistry.getConversationState(message.conversationId);
+      this.options.emit({ type: "tool-state", conversationId: message.conversationId, state });
+    }
+  }
+
+  private async registerGeneratedToolRecord(input: {
+    toolKind: ToolKind;
+    toolCallId: string;
+    message: AssistantMessage;
+    userRequest: string;
+    title: string;
+    summary: string;
+    artifact: Parameters<ArtifactManager["createArtifact"]>[0];
+    parentKinds: ToolKind[];
+  }) {
+    const existing = await this.toolResultRegistry.get(input.toolCallId);
+    if (existing?.status === "completed") {
+      return null;
+    }
+    const parents = (await Promise.all(input.parentKinds.map((toolKind) => this.toolResultRegistry.getLatestSuccessful(input.message.conversationId, toolKind))))
+      .filter((record): record is ToolCallRecord => Boolean(record));
+    const sourceArtifactIds = uniqueValues(parents.flatMap((record) => record.outputArtifactIds ?? record.result?.artifactIds ?? []));
+    const parentToolCallIds = uniqueValues(parents.map((record) => record.toolCallId));
+    const primaryParent = parents[0];
+    const artifact = await this.toolArtifactManager.createArtifact(input.artifact);
+    const version = (await this.toolResultRegistry.listByConversation(input.message.conversationId)).filter((record) => record.toolKind === input.toolKind).length + 1;
+    const record: ToolCallRecord = {
+      toolCallId: input.toolCallId,
+      conversationId: input.message.conversationId,
+      messageId: input.message.id,
+      userId: input.message.userId,
+      toolKind: input.toolKind,
+      toolName: TOOL_NAMES[input.toolKind],
+      status: "completed",
+      request: {
+        userRequest: input.userRequest,
+        title: input.title,
+        source: "assistant-generated-message",
+      },
+      resolvedInput: primaryParent
+        ? {
+            mode: "latest_result",
+            sourceToolKind: primaryParent.toolKind,
+            sourceToolCallId: primaryParent.toolCallId,
+            sourceArtifactIds,
+            reason: `${TOOL_NAMES[input.toolKind]} 使用会话最近成功工具结果作为默认输入。`,
+          }
+        : {
+            mode: "no_input",
+            reason: `${TOOL_NAMES[input.toolKind]} 基于当前模型响应内容生成。`,
+          },
+      result: {
+        resultId: `result_${input.toolCallId}`,
+        toolKind: input.toolKind,
+        artifactIds: [artifact.artifactId],
+        primaryArtifactId: artifact.artifactId,
+        summary: input.summary,
+        createdAt: input.message.updatedAt,
+        metadata: {
+          messageId: input.message.id,
+          artifactType: artifact.artifactType,
+        },
+      },
+      parentToolCallIds,
+      sourceArtifactIds,
+      outputArtifactIds: [artifact.artifactId],
+      version,
+      isLatestSuccessful: false,
+      createdAt: input.message.createdAt,
+      updatedAt: input.message.updatedAt,
+      completedAt: input.message.updatedAt,
+      metadata: {
+        source: "assistant-generated-message",
+        title: input.title,
+      },
+    };
+    await this.toolResultRegistry.register(record);
+    await this.toolResultRegistry.markLatestSuccessful(input.message.conversationId, input.toolCallId);
+    await this.workflowMemoryBridge.writeWorkflowMemory({
+      conversationId: input.message.conversationId,
+      userId: input.message.userId,
+      type: `${input.toolKind}_completed`,
+      summary: input.summary,
+      payload: {
+        toolCallId: input.toolCallId,
+        toolKind: input.toolKind,
+        version,
+        artifactIds: [artifact.artifactId],
+        parentToolCallIds,
+        sourceArtifactIds,
+      },
+    });
+    return (await this.toolResultRegistry.get(input.toolCallId)) ?? record;
+  }
+
+  private async emitToolState(conversationId: string) {
+    this.options.emit({
+      type: "tool-state",
+      conversationId,
+      state: await this.toolResultRegistry.getConversationState(conversationId),
+    });
   }
 
   private async registerSqlToolResultDataset(toolCall: AssistantToolCall, materializationRows?: Array<Record<string, unknown>>) {
@@ -2328,49 +3466,38 @@ export class AssistantRuntime {
     const controller = new AbortController();
     this.abortControllers.set(assistantMessage.id, controller);
     let content = "";
-    let providerTraceId: string | undefined;
+    let providerTraceId = `trace_${assistantMessage.id}`;
 
     try {
-      const response = await fetch(SILICONFLOW_CHAT_COMPLETIONS_URL, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model: input.modelName,
-          stream: true,
-          messages: await this.buildProviderMessages(input.userId, conversation.id, input.prompt, input.dataSourceLabel, input.schemaContextMarkdown, input.skill, input.approvalMode),
-          temperature: 0.7,
-        }),
-        signal: controller.signal,
+      const adapter = createStreamingModelAdapter({
+        providerName: "siliconflow",
+        baseURL: "https://api.siliconflow.cn/v1",
+        apiKey,
+        model: input.modelName,
+        toolExecutionMode: "serial",
       });
-      providerTraceId = response.headers.get("x-siliconcloud-trace-id") ?? undefined;
-      if (!response.ok || !response.body) {
-        throw new Error(`模型服务返回 ${response.status}。Trace: ${providerTraceId ?? "unknown"}`);
+      for (const tool of this.createAssistantRuntimeToolDefinitions(input, conversation, assistantMessage)) {
+        adapter.registerTool(tool);
       }
+      const providerMessages = await this.buildProviderMessages(input.userId, conversation.id, input.prompt, input.dataSourceLabel, input.schemaContextMarkdown, input.skill, input.approvalMode);
+      const messages = providerMessages.map((message, index): ConversationMessage => ({
+        id: `provider-${assistantMessage.id}-${index}`,
+        role: message.role as ConversationMessage["role"],
+        content: message.content,
+        createdAt: assistantMessage.createdAt,
+      }));
 
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) {
-          break;
-        }
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split(/\r?\n/);
-        buffer = lines.pop() ?? "";
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed.startsWith("data:")) {
-            continue;
-          }
-          const payload = trimmed.slice("data:".length).trim();
-          if (payload === "[DONE]") {
-            break;
-          }
-          const delta = this.readSiliconFlowDelta(payload);
+      for await (const event of adapter.streamChat({
+        conversationId: conversation.id,
+        messageId: assistantMessage.id,
+        messages,
+        model: input.modelName,
+        contentType: "markdown",
+        signal: controller.signal,
+      })) {
+        providerTraceId = event.traceId ?? providerTraceId;
+        if (event.type === "markdown-delta" || event.type === "text-delta") {
+          const delta = typeof event.payload.delta === "string" ? event.payload.delta : "";
           if (!delta) {
             continue;
           }
@@ -2386,6 +3513,22 @@ export class AssistantRuntime {
             providerTraceId,
           });
           this.options.emit({ type: "message-delta", conversationId: conversation.id, messageId: assistantMessage.id, content, blocks: updated.blocks, status: updated.status });
+          continue;
+        }
+        if (event.type === "tool-call-start" || event.type === "tool-execution-start") {
+          const current = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(assistantMessage.id));
+          const updated = this.updateMessage(assistantMessage.id, {
+            status: "processing",
+            content: current.content,
+            blocks: current.blocks,
+            providerTraceId,
+          });
+          this.options.emit({ type: "message", conversationId: conversation.id, message: updated });
+          continue;
+        }
+        if (event.type === "stream-error") {
+          const serialized = event.payload.error as { message?: string } | undefined;
+          throw new Error(serialized?.message ?? "模型流式调用失败。");
         }
       }
 
@@ -2396,6 +3539,7 @@ export class AssistantRuntime {
         providerTraceId,
       });
       this.options.emit({ type: "message", conversationId: conversation.id, message: completed });
+      await this.registerAssistantGeneratedArtifacts(input, completed);
 
       const tool = detectToolFromAssistantOutput(content);
       if (tool) {
@@ -2418,6 +3562,203 @@ export class AssistantRuntime {
     } finally {
       this.abortControllers.delete(assistantMessage.id);
     }
+  }
+
+  private createAssistantRuntimeToolDefinitions(input: AssistantSendInput, conversation: AssistantConversation, assistantMessage: AssistantMessage): ToolDefinition[] {
+    return [
+      {
+        name: TOOL_NAMES.sql_query,
+        description: "请求执行受控只读 SQL 查询。必须提供只读 SQL 候选语句，系统会进行安全校验并按用户审批权限处理。",
+        inputSchema: TOOL_SCHEMAS.sql_query,
+        riskLevel: "high",
+        handler: async (request, context) => this.handleModelSqlTool(request as Record<string, unknown>, input, conversation, assistantMessage, context.toolCallId),
+      },
+      {
+        name: TOOL_NAMES.python_analysis,
+        description: "请求执行受控 Python 数据分析。优先使用会话最新 SQL/Workflow 数据集作为输入；如提供 script，系统会按用户审批权限处理。",
+        inputSchema: TOOL_SCHEMAS.python_analysis,
+        riskLevel: "high",
+        handler: async (request, context) => this.handleModelPythonTool(request as Record<string, unknown>, input, conversation, assistantMessage, context.toolCallId),
+      },
+      {
+        name: TOOL_NAMES.chart_rendering,
+        description: "请求登记受控 VisualizationSpec 图表 Artifact。图表数据必须来自已授权结果或可信小型 inline rows。",
+        inputSchema: TOOL_SCHEMAS.chart_rendering,
+        riskLevel: "medium",
+        handler: async (request, context) => this.handleModelChartTool(request as Record<string, unknown>, input, assistantMessage, context.toolCallId),
+      },
+      {
+        name: TOOL_NAMES.report_generation,
+        description: "请求登记 Markdown 报告 Artifact。报告必须基于会话工具结果和 Artifact 摘要，不得伪造数据。",
+        inputSchema: TOOL_SCHEMAS.report_generation,
+        riskLevel: "low",
+        handler: async (request, context) => this.handleModelReportTool(request as Record<string, unknown>, input, assistantMessage, context.toolCallId),
+      },
+    ];
+  }
+
+  private async handleModelSqlTool(
+    request: Record<string, unknown>,
+    input: AssistantSendInput,
+    conversation: AssistantConversation,
+    assistantMessage: AssistantMessage,
+    modelToolCallId: string,
+  ) {
+    const script = typeof request.sql === "string" ? request.sql : typeof request.script === "string" ? request.script : "";
+    if (!script.trim()) {
+      return {
+        status: "waiting_input",
+        toolCallId: modelToolCallId,
+        message: "request_sql_query_execution 需要提供 sql 字段，且必须是单条只读 SQL。",
+      };
+    }
+    const currentMessage = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(assistantMessage.id));
+    await this.handleToolCall(
+      {
+        ...input,
+        prompt: typeof request.userRequest === "string" ? request.userRequest : input.prompt,
+      },
+      conversation,
+      currentMessage,
+      { kind: "sql", script },
+      { appendToMessage: true },
+    );
+    return {
+      status: input.approvalMode === "request_approval" ? "waiting_approval" : "submitted",
+      toolCallId: modelToolCallId,
+      message: "SQL 工具请求已进入本地安全校验和审批执行流程。",
+    };
+  }
+
+  private async handleModelPythonTool(
+    request: Record<string, unknown>,
+    input: AssistantSendInput,
+    conversation: AssistantConversation,
+    assistantMessage: AssistantMessage,
+    modelToolCallId: string,
+  ) {
+    const script = typeof request.script === "string" ? request.script : "";
+    if (!script.trim()) {
+      const state = await this.toolResultRegistry.getConversationState(conversation.id);
+      return {
+        status: "waiting_input",
+        toolCallId: modelToolCallId,
+        latestSqlToolCallId: state.latestSuccessfulSqlToolCallId,
+        latestSqlArtifactIds: state.latestSuccessfulSqlArtifactIds,
+        message: "request_python_analysis_execution 需要提供 script 字段，或先完成可分析 SQL/Workflow 数据集。",
+      };
+    }
+    const currentMessage = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(assistantMessage.id));
+    await this.handleToolCall(
+      {
+        ...input,
+        prompt: typeof request.userRequest === "string" ? request.userRequest : input.prompt,
+      },
+      conversation,
+      currentMessage,
+      { kind: "python", script },
+      { appendToMessage: true },
+    );
+    return {
+      status: input.approvalMode === "request_approval" ? "waiting_approval" : "submitted",
+      toolCallId: modelToolCallId,
+      message: "Python 工具请求已进入本地审批和沙箱执行流程。",
+    };
+  }
+
+  private async handleModelChartTool(
+    request: Record<string, unknown>,
+    input: AssistantSendInput,
+    assistantMessage: AssistantMessage,
+    modelToolCallId: string,
+  ) {
+    const parsed = parseVisualizationSpecJson(JSON.stringify(request.visualizationSpec ?? {}), {
+      allowInlineData: true,
+      inlineDataMaxRows: 200,
+      inlineDataMaxBytes: 64 * 1024,
+    });
+    if (!parsed.success) {
+      return {
+        status: "waiting_input",
+        toolCallId: modelToolCallId,
+        message: `request_chart_rendering 需要提供合法 visualizationSpec：${parsed.error.message}`,
+      };
+    }
+    const record = await this.registerGeneratedToolRecord({
+      toolKind: "chart_rendering",
+      toolCallId: `chart_${modelToolCallId}`,
+      message: this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(assistantMessage.id)),
+      userRequest: typeof request.userRequest === "string" ? request.userRequest : input.prompt,
+      title: parsed.spec.title,
+      summary: `图表「${parsed.spec.title}」已通过 request_chart_rendering 生成。`,
+      artifact: {
+        artifactId: `assistant-chart-spec:${modelToolCallId}`,
+        artifactType: "visualization_spec",
+        title: parsed.spec.title,
+        contentType: "visualization",
+        content: parsed.spec,
+        metadata: {
+          modelToolCallId,
+          visualizationId: parsed.spec.visualizationId,
+          warnings: parsed.warnings,
+        },
+      },
+      parentKinds: ["python_analysis", "sql_query"],
+    });
+    await this.emitToolState(assistantMessage.conversationId);
+    return {
+      status: "completed",
+      toolCallId: modelToolCallId,
+      artifactIds: record?.outputArtifactIds ?? [],
+      summary: record?.result?.summary,
+    };
+  }
+
+  private async handleModelReportTool(
+    request: Record<string, unknown>,
+    input: AssistantSendInput,
+    assistantMessage: AssistantMessage,
+    modelToolCallId: string,
+  ) {
+    const markdown = typeof request.markdown === "string" ? request.markdown.trim() : "";
+    if (!markdown) {
+      const state = await this.toolResultRegistry.getConversationState(assistantMessage.conversationId);
+      return {
+        status: "waiting_input",
+        toolCallId: modelToolCallId,
+        latestSqlToolCallId: state.latestSuccessfulSqlToolCallId,
+        latestPythonToolCallId: state.latestSuccessfulPythonToolCallId,
+        latestChartToolCallId: state.latestSuccessfulChartToolCallId,
+        message: "request_markdown_report_generation 需要提供 markdown 字段，或先完成报告内容生成。",
+      };
+    }
+    const title = typeof request.title === "string" && request.title.trim() ? request.title.trim().slice(0, 120) : inferReportTitle(markdown) ?? "分析报告";
+    const record = await this.registerGeneratedToolRecord({
+      toolKind: "report_generation",
+      toolCallId: `report_${modelToolCallId}`,
+      message: this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(assistantMessage.id)),
+      userRequest: typeof request.userRequest === "string" ? request.userRequest : input.prompt,
+      title,
+      summary: `Markdown 报告「${title}」已通过 request_markdown_report_generation 生成。`,
+      artifact: {
+        artifactId: `assistant-report-markdown:${modelToolCallId}`,
+        artifactType: "report_markdown",
+        title,
+        contentType: "markdown",
+        content: markdown,
+        metadata: {
+          modelToolCallId,
+        },
+      },
+      parentKinds: ["chart_rendering", "python_analysis", "sql_query"],
+    });
+    await this.emitToolState(assistantMessage.conversationId);
+    return {
+      status: "completed",
+      toolCallId: modelToolCallId,
+      artifactIds: record?.outputArtifactIds ?? [],
+      summary: record?.result?.summary,
+    };
   }
 
   private async buildProviderMessages(
@@ -2454,9 +3795,11 @@ export class AssistantRuntime {
           "VisualizationSpec 只描述业务语义、图表类型、字段映射、指标格式、交互需求和数据来源。图表数据必须优先引用 SQL/Python/Workflow Artifact；只有系统已给出小型聚合结果且可信时，才允许 inline rows。",
           "当前客户端把受控 VisualizationSpec 作为内部 visualization 节点处理。确需输出图表时，请使用单个 ```visualization JSON 代码块承载 VisualizationSpec；客户端会将其转换为内部图表节点，不会把协议作为普通 Markdown 展示。",
           "VisualizationSpec 中不要指定 rendererId、rendererClass、dynamicImport、importPath、任意颜色、原始 HTML、本地文件路径或可执行代码。系统会根据业务语义和图表类型自动路由 renderer。",
+          TOOL_ORCHESTRATION_SYSTEM_PROMPT,
           "仅在本地脚本调试场景才输出 /sql 或 /python 代码块，客户端会按审批权限处理。",
           `当前数据源：${dataSourceLabel || "未选择"}`,
           `当前 Skill：${skill || "未选择"}`,
+          selectedSkillSystemPrompt(skill),
           `审批权限：${approvalMode}`,
           schemaContextMarkdown ? `\n以下是已授权数据源 Schema Context。请遵守其中 Usage Policy、安全约束和工具调用要求，不要基于样例行推断全量结论。\n${schemaContextMarkdown}` : undefined,
           workflowContext ? `\n${workflowContext}` : undefined,

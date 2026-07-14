@@ -682,6 +682,54 @@ button {
   width: min(360px, 100%);
 }
 
+.assistant-report-card {
+  width: min(420px, 100%);
+  border: 1px solid color-mix(in srgb, var(--workbench-foreground, #fafafa) 12%, transparent);
+  background: color-mix(in srgb, var(--workbench-background, #171717) 76%, #ffffff);
+}
+
+.assistant-report-card-icon {
+  display: inline-grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  flex: 0 0 auto;
+  border: 1px solid color-mix(in srgb, var(--workbench-foreground, #fafafa) 12%, transparent);
+  border-radius: 7px;
+  color: color-mix(in srgb, var(--workbench-foreground, #fafafa) 82%, transparent);
+  background: color-mix(in srgb, var(--workbench-background, #171717) 66%, var(--workbench-foreground, #fafafa));
+}
+
+.assistant-report-card-summary {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.assistant-report-card-meta {
+  min-width: 0;
+}
+
+.assistant-report-card-meta span {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+  border: 1px solid color-mix(in srgb, var(--workbench-foreground, #fafafa) 10%, transparent);
+  border-radius: 999px;
+  padding: 2px 7px;
+  color: color-mix(in srgb, var(--workbench-foreground, #fafafa) 68%, transparent);
+  background: color-mix(in srgb, var(--workbench-background, #171717) 72%, #ffffff);
+  font-size: 11px;
+}
+
+.assistant-tool-call-detail {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  max-width: 100%;
+}
+
 .assistant-artifact-card {
   min-width: 0;
   max-width: 100%;
@@ -916,8 +964,8 @@ button {
 }
 
 .assistant-visualization-svg-wrap rect {
-  fill: color-mix(in srgb, var(--workbench-accent, var(--viz-series-0, #fafafa)) 82%, var(--workbench-background, #171717));
-  stroke: color-mix(in srgb, var(--workbench-accent, var(--viz-series-0, #fafafa)) 34%, transparent);
+  fill: color-mix(in srgb, var(--viz-current, var(--viz-series-0, #fafafa)) 86%, var(--viz-surface, var(--workbench-background, #171717)));
+  stroke: color-mix(in srgb, var(--viz-current, var(--viz-series-0, #fafafa)) 42%, transparent);
   stroke-width: 1;
 }
 
@@ -952,7 +1000,7 @@ button {
 
 .assistant-visualization-svg-wrap .line {
   fill: none;
-  stroke: var(--workbench-accent, var(--viz-series-0, #fafafa));
+  stroke: var(--viz-current, var(--viz-series-0, #fafafa));
   stroke-width: 3;
   stroke-linecap: round;
   stroke-linejoin: round;
@@ -960,11 +1008,11 @@ button {
 }
 
 .assistant-visualization-svg-wrap .area {
-  fill: color-mix(in srgb, var(--workbench-accent, var(--viz-series-0, #fafafa)) 18%, transparent);
+  fill: color-mix(in srgb, var(--viz-current, var(--viz-series-0, #fafafa)) 18%, transparent);
 }
 
 .assistant-visualization-svg-wrap circle {
-  fill: var(--workbench-accent, var(--viz-series-0, #fafafa));
+  fill: var(--viz-current, var(--viz-series-0, #fafafa));
   stroke: var(--workbench-background, #171717);
   stroke-width: 1.5;
 }
@@ -1182,14 +1230,46 @@ button {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   flex: 0 0 auto;
+  box-sizing: border-box;
   min-width: 320px;
   max-width: min(920px, 72vw);
+  width: 100%;
   height: 100%;
   min-height: 0;
   min-inline-size: 0;
   overflow: hidden;
   border-left: 1px solid color-mix(in srgb, var(--workbench-foreground, #e6edf6) 12%, transparent);
   background: color-mix(in srgb, var(--workbench-background, #0f1724) 96%, #ffffff);
+}
+
+.assistant-artifact-panel > *,
+.assistant-artifact-panel .assistant-artifact-toolbar,
+.assistant-artifact-panel .astryx-toolbar,
+.assistant-artifact-panel [role="toolbar"] {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  min-inline-size: 0;
+}
+
+.assistant-artifact-panel [role="toolbar"] {
+  overflow: hidden;
+}
+
+.assistant-artifact-panel [role="toolbar"] > div {
+  box-sizing: border-box;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.assistant-artifact-panel [role="toolbar"] > div:first-of-type {
+  flex: 1 1 auto;
+  overflow: hidden;
+}
+
+.assistant-artifact-panel [role="toolbar"] > div:nth-of-type(2) {
+  flex: 0 0 auto;
 }
 
 .assistant-artifact-panel.maximized {
@@ -1202,7 +1282,24 @@ button {
 }
 
 .assistant-artifact-toolbar-title {
+  flex: 1 1 auto;
   min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.assistant-artifact-toolbar-title > *,
+.assistant-artifact-toolbar-actions {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.assistant-artifact-toolbar-title > :not(svg) {
+  overflow: hidden;
+}
+
+.assistant-artifact-toolbar-actions {
+  flex: 0 0 auto;
 }
 
 .assistant-artifact-toolbar-title :where(.astryx-text) {
@@ -1212,8 +1309,10 @@ button {
 }
 
 .assistant-artifact-body {
+  box-sizing: border-box;
   min-height: 0;
   min-width: 0;
+  width: 100%;
   max-width: 100%;
   overflow: auto;
   padding: 18px 22px;
@@ -1223,13 +1322,27 @@ button {
 
 .assistant-artifact-body > *,
 .assistant-artifact-body .assistant-artifact-markdown,
+.assistant-artifact-body .assistant-artifact-markdown-content,
 .assistant-artifact-body .astryx-markdown {
+  display: block;
   box-sizing: border-box;
   width: 100%;
+  inline-size: 100%;
   max-width: 100%;
+  max-inline-size: 100%;
   min-width: 0;
+  min-inline-size: 0;
   overflow-wrap: anywhere;
   word-break: break-word;
+}
+
+.assistant-artifact-body .assistant-artifact-markdown {
+  overflow-x: hidden;
+}
+
+.assistant-artifact-body .assistant-artifact-markdown-content :where(*) {
+  box-sizing: border-box;
+  max-width: 100%;
 }
 
 .assistant-artifact-body :where(p, li, blockquote, td, th, h1, h2, h3, h4, h5, h6, a, span, strong, em) {
@@ -1244,6 +1357,11 @@ button {
   max-width: 100%;
   overflow-x: auto;
   white-space: normal;
+}
+
+.assistant-artifact-body :where(thead, tbody, tr) {
+  width: max-content;
+  max-width: none;
 }
 
 .assistant-artifact-body :where(pre) {

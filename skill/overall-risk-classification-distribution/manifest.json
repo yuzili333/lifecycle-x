@@ -1,0 +1,50 @@
+{
+  "skillId": "overall-risk-classification-distribution",
+  "name": "overall-risk-classification-distribution",
+  "displayName": "整体风险分类分布（笔数+金额）",
+  "description": "查询并分析信贷资产五级及十二级风险分类的笔数和贷款余额分布，计算关注率、不良率、风险边界指标，生成图表和完整 Markdown 风险分析报告。",
+  "version": "1.0.0",
+  "category": "credit-risk-analysis",
+  "tags": [
+    "信贷资产",
+    "风险分类",
+    "五级分类",
+    "十二级分类",
+    "贷款余额",
+    "不良率",
+    "关注率",
+    "风险分布",
+    "贷后管理",
+    "存续期"
+  ],
+  "keywords": [
+    "风险分类分布",
+    "资产质量",
+    "不良贷款",
+    "关注贷款",
+    "贷款余额",
+    "合同笔数",
+    "整体风险分类分布",
+    "资产质量分析"
+  ],
+  "sourceType": "local_builtin",
+  "runtime": "cycle-probe-client",
+  "clientOnly": true,
+  "enabled": true,
+  "requiredTools": [
+    "request_sql_query_execution",
+    "request_python_analysis_execution",
+    "request_chart_rendering",
+    "request_markdown_report_generation"
+  ],
+  "entryFile": "SKILL.md",
+  "templateFile": "report-template.md",
+  "inputSchemaFile": "schemas/skill-input.schema.json",
+  "reportDataSchemaFile": "schemas/report-data.schema.json",
+  "toolPolicyFile": "tool-policy.json",
+  "aliases": [
+    "@整体风险分类分布",
+    "@风险分类",
+    "@资产质量分析"
+  ]
+}

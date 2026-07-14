@@ -1,0 +1,78 @@
+{
+  "skillId": "overall-risk-classification-distribution",
+  "requiredTools": [
+    "request_sql_query_execution",
+    "request_python_analysis_execution",
+    "request_chart_rendering",
+    "request_markdown_report_generation"
+  ],
+  "approval": {
+    "request_sql_query_execution": "required",
+    "request_python_analysis_execution": "required",
+    "request_chart_rendering": "not_required_when_using_existing_artifacts",
+    "request_markdown_report_generation": "not_required_when_using_existing_artifacts"
+  },
+  "security": {
+    "clientOnly": true,
+    "allowRemoteMarketplace": false,
+    "allowNetworkAccess": false,
+    "allowDatabaseCredentials": false,
+    "allowArbitraryLocalFileAccess": false,
+    "allowExecutableSkillCode": false,
+    "allowMutatingSql": false,
+    "allowFullSourceTableInPrompt": false
+  },
+  "toolFlow": [
+    {
+      "step": "resolve_fields",
+      "required": true
+    },
+    {
+      "step": "sql_query",
+      "tool": "request_sql_query_execution",
+      "required": true,
+      "approvalRequired": true
+    },
+    {
+      "step": "python_analysis",
+      "tool": "request_python_analysis_execution",
+      "required": true,
+      "approvalRequired": true
+    },
+    {
+      "step": "chart_rendering",
+      "tool": "request_chart_rendering",
+      "required": false
+    },
+    {
+      "step": "report_generation",
+      "tool": "request_markdown_report_generation",
+      "required": true
+    }
+  ],
+  "errorCodes": [
+    "SKILL_NOT_INSTALLED",
+    "SKILL_LOAD_FAILED",
+    "DATA_SOURCE_NOT_SELECTED",
+    "FIELD_MAPPING_INCOMPLETE",
+    "FIVE_LEVEL_FIELD_MISSING",
+    "LOAN_BALANCE_FIELD_MISSING",
+    "TWELVE_LEVEL_FIELD_MISSING",
+    "CLASSIFICATION_MAPPING_INVALID",
+    "SQL_QUERY_FAILED",
+    "PYTHON_ANALYSIS_FAILED",
+    "CHART_RENDER_FAILED",
+    "REPORT_GENERATION_FAILED",
+    "DATA_QUALITY_INVALID",
+    "UNKNOWN_ERROR"
+  ],
+  "degradation": {
+    "missingTwelveLevel": "Generate five-level report and state the limitation.",
+    "missingContractAmount": "Omit total contract amount.",
+    "chartFailed": "Continue with tables and Markdown report.",
+    "reportFailed": "Keep SQL, Python, and chart artifacts.",
+    "unknownClassification": "Classify as 未识别 and add a warning.",
+    "validationFailed": "Show data quality warning.",
+    "permissionDenied": "Stop tool calls and explain insufficient permission."
+  }
+}

@@ -266,6 +266,21 @@ ipcMain.handle("assistant:tool:approve", (_event, userId: string, toolCallId: st
 ipcMain.handle("assistant:workflow:context", (_event, userId: string, conversationId: string) =>
   getAssistantRuntime().getWorkflowContext(userId, conversationId),
 );
+ipcMain.handle("assistant:tools:state", (_event, userId: string, conversationId: string) =>
+  getAssistantRuntime().getConversationToolState(userId, conversationId),
+);
+ipcMain.handle("assistant:tools:list", (_event, userId: string, conversationId: string) =>
+  getAssistantRuntime().listConversationToolCalls(userId, conversationId),
+);
+ipcMain.handle("assistant:tools:latest", (_event, userId: string, conversationId: string, toolKind: import("./toolOrchestration").ToolKind) =>
+  getAssistantRuntime().getLatestConversationToolResult(userId, conversationId, toolKind),
+);
+ipcMain.handle("assistant:tools:select", (_event, userId: string, conversationId: string, toolKind: import("./toolOrchestration").ToolKind, toolCallId: string) =>
+  getAssistantRuntime().selectConversationToolResult(userId, conversationId, toolKind, toolCallId),
+);
+ipcMain.handle("assistant:tools:artifact", (_event, userId: string, conversationId: string, artifactId: string) =>
+  getAssistantRuntime().getConversationToolArtifact(userId, conversationId, artifactId),
+);
 ipcMain.handle("assistant:workflow:confirm-dataset", (_event, userId: string, conversationId: string, datasetId?: string) =>
   getAssistantRuntime().confirmWorkflowDataset(userId, conversationId, datasetId),
 );
