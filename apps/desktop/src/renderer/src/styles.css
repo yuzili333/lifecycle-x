@@ -751,6 +751,38 @@ button {
   font-size: 11px;
 }
 
+.assistant-message-block.report-transition {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  animation: assistant-report-card-fade-in 180ms ease-out;
+}
+
+.assistant-message-block.report-transition-buffer {
+  min-width: 0;
+}
+
+.assistant-message-block.report-transition-buffer > .assistant-message-block {
+  margin: 0;
+}
+
+.assistant-message-block.report-transition .assistant-report-card {
+  max-width: min(420px, 100%);
+}
+
+.assistant-message-block.report-preface {
+  margin-bottom: 2px;
+}
+
+@keyframes assistant-report-card-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
 .assistant-tool-call-detail {
   display: grid;
   gap: 8px;
@@ -1276,6 +1308,8 @@ button {
 }
 
 .assistant-artifact-panel > *,
+.assistant-artifact-panel.astryx-stack,
+.assistant-artifact-panel > .astryx-stack,
 .assistant-artifact-panel .assistant-artifact-toolbar,
 .assistant-artifact-panel .astryx-toolbar,
 .assistant-artifact-panel [role="toolbar"] {
@@ -1309,10 +1343,20 @@ button {
   position: fixed;
   inset: 0;
   z-index: 60;
-  width: 100vw;
+  width: 100vw !important;
+  inline-size: 100vw !important;
   max-width: none;
-  height: 100dvh;
+  max-inline-size: none;
+  height: 100dvh !important;
   border-left: 0;
+}
+
+.assistant-artifact-panel.maximized.astryx-stack,
+.assistant-artifact-panel.maximized > .astryx-stack {
+  width: 100%;
+  inline-size: 100%;
+  max-width: 100%;
+  max-inline-size: 100%;
 }
 
 .assistant-artifact-panel.minimized {
@@ -1361,6 +1405,7 @@ button {
 .assistant-artifact-body > *,
 .assistant-artifact-body .assistant-artifact-markdown,
 .assistant-artifact-body .assistant-artifact-markdown-content,
+.assistant-artifact-body .astryx-stack,
 .assistant-artifact-body .astryx-markdown {
   display: block;
   box-sizing: border-box;

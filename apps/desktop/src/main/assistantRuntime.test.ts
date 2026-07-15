@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildOverallRiskDistributionMarkdown, inferReportTitle, isReportGenerationContent, shouldAutoStartPythonReport, shouldRouteSkillThroughModel, shouldStartOverallRiskWorkflowAfterModelText } from "./assistantRuntime";
+import { buildOverallRiskDistributionMarkdown, generalStreamSegmentId, generalTextStreamSegmentId, inferReportTitle, isReportGenerationContent, reportStreamSegmentId, shouldAutoStartPythonReport, shouldRouteSkillThroughModel, shouldStartOverallRiskWorkflowAfterModelText } from "./assistantRuntime";
 
 describe("AssistantRuntime workflow intent", () => {
   it("starts Python report flow for one-shot SQL, chart, and report requests", () => {
@@ -57,6 +57,13 @@ describe("AssistantRuntime workflow intent", () => {
 });
 
 describe("AssistantRuntime report artifact helpers", () => {
+  it("builds stable stream segment ids for general markdown and report artifacts", () => {
+    expect(generalStreamSegmentId("message-1")).toBe("message:message-1:markdown");
+    expect(generalTextStreamSegmentId("message-1")).toBe("message:message-1:text");
+    expect(generalTextStreamSegmentId("message-1")).not.toBe(generalStreamSegmentId("message-1"));
+    expect(reportStreamSegmentId("message-1", "report-1", 3)).toBe("report:message-1:report-1:v3");
+  });
+
   it("detects markdown report content and infers stable report titles", () => {
     const content = "# 不良贷款分析报告\n\n## 分析结论\n杭州分行占比较高。";
 

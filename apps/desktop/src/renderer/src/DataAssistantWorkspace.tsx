@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { Avatar } from "@astryxdesign/core/Avatar";
 import { Button } from "@astryxdesign/core/Button";
 import {
@@ -30,7 +30,19 @@ import type { AuthFailure, AuthUser } from "./auth";
 import { useAppToast } from "./useAppToast";
 import { workbenchApi, type ApiResult, type DataSourceSummary } from "./workbenchApi";
 import { VisualizationRenderer } from "./components/VisualizationRenderer";
-import { ReportMarkdownViewer, ReportToolCallCard, toolKindLabel, toolStatusLabel } from "./components/tool-calls";
+import { ReportMarkdownViewer, toolKindLabel, toolStatusLabel } from "./components/tool-calls";
+import { StreamingReportSegment } from "./components/streaming-content";
+import {
+  applyChatStreamEvent,
+  DEFAULT_REPORT_TRANSITION_POLICY,
+  reportMarkdownContentIndex,
+  ReportTransitionController,
+  splitReportMarkdownContent,
+  StreamSegmentManager,
+  type ChatStreamEvent,
+  type ReportContentSegment,
+  type ReportTransitionPolicy,
+} from "./streaming-content";
 import { parseVisualizationSpecJson } from "../../shared/visualization";
 import approveIcon from "./assets/approve.svg";
 import attachIcon from "./assets/attach.svg";
@@ -74,6 +86,10 @@ const ARTIFACT_WINDOW_STATE_KEY = "cycle-probe:assistant:artifact-window";
 const ARTIFACT_PANEL_WIDTH_KEY = "cycle-probe:assistant:artifact-panel-width";
 const SKILL_TOKEN_PREFIX = "skill_";
 const MAX_CONVERSATION_TITLE_LENGTH = 200;
+const REPORT_TRANSITION_POLICY: ReportTransitionPolicy = {
+  ...DEFAULT_REPORT_TRANSITION_POLICY,
+  bufferDelayMs: 1000,
+};
 
 type ArtifactWindowState = {
   messageId: string | null;
@@ -89,6 +105,13 @@ type ArtifactContentState = {
   markdown: string;
   error?: string;
 };
+
+type ReportCardTransitionState = {
+  status: "hidden" | "buffering" | "card_ready" | "visible" | "error";
+  segmentId: string;
+};
+
+type MessageDeltaStreamEvent = Extract<AssistantStreamEvent, { type: "message-delta" }>;
 
 const defaultArtifactWindowState: ArtifactWindowState = {
   messageId: null,
@@ -434,19 +457,18 @@ function reportArtifactIdForMessage(message: AssistantMessage, toolState?: Conve
   return reportRecord?.result?.primaryArtifactId ?? reportRecord?.outputArtifactIds?.find((artifactId) => artifactId.includes("report"));
 }
 
+function reportSegmentIdForMessage(message: AssistantMessage, toolState?: ConversationToolState | null) {
+  const reportRecord = completedReportRecordForMessage(message, toolState);
+  if (!reportRecord) {
+    return null;
+  }
+  return `report:${message.id}:${reportRecord.toolCallId}:v${reportRecord.version}`;
+}
+
 function reportRecordsForState(toolState?: ConversationToolState | null) {
   return (toolState?.toolCalls ?? [])
     .filter((record) => record.toolKind === "report_generation" && record.status === "completed")
     .sort((a, b) => b.version - a.version || Date.parse(b.createdAt) - Date.parse(a.createdAt));
-}
-
-function artifactVersion(message: AssistantMessage, toolState?: ConversationToolState | null) {
-  const reportRecord = reportRecordForMessage(message, toolState);
-  if (reportRecord) {
-    return reportRecord.version;
-  }
-  const version = message.content.match(/版本\s*(\d+)/)?.[1] ?? message.content.match(/\bv(\d+)\b/i)?.[1];
-  return version ? Number(version) : undefined;
 }
 
 function addArtifactLikeIds(sources: Set<string>, values?: string[]) {
@@ -513,21 +535,6 @@ function artifactDataSourceMeta(message: AssistantMessage, toolState?: Conversat
   }
   const labels = Array.from(sources.values());
   return { count: labels.length, labels };
-}
-
-function artifactStatus(message: AssistantMessage, toolState?: ConversationToolState | null) {
-  const reportRecord = reportRecordForMessage(message, toolState);
-  const status = reportRecord?.status;
-  if (!status) {
-    return message.status === "completed" ? "completed" : message.status === "error" ? "failed" : "creating";
-  }
-  if (status === "completed") {
-    return "completed";
-  }
-  if (status === "failed" || status === "rejected" || status === "cancelled" || status === "blocked") {
-    return "failed";
-  }
-  return "creating";
 }
 
 function assistantToolStatus(status?: AssistantBlock["toolStatus"]): ChatToolCallItem["status"] {
@@ -726,12 +733,112 @@ export function DataAssistantWorkspace({
   const [deletingConversation, setDeletingConversation] = useState<AssistantConversation | null>(null);
   const [artifactWindow, setArtifactWindow] = useState<ArtifactWindowState>(() => readArtifactWindowState());
   const [artifactContentByMessage, setArtifactContentByMessage] = useState<Record<string, ArtifactContentState>>({});
+  const [reportCardTransitions, setReportCardTransitions] = useState<Record<string, ReportCardTransitionState>>({});
+  const [reportTransitionHeights, setReportTransitionHeights] = useState<Record<string, number>>({});
+  const [streamContentRevision, setStreamContentRevision] = useState(0);
+  const streamSegmentManagerRef = useRef(new StreamSegmentManager());
+  const pendingMessageDeltasRef = useRef(new Map<string, MessageDeltaStreamEvent>());
+  const messageDeltaFlushTimerRef = useRef<number | null>(null);
+  const reportTransitionController = useMemo(
+    () =>
+      new ReportTransitionController(
+        REPORT_TRANSITION_POLICY,
+        (segmentId) => {
+          streamSegmentManagerRef.current.markReportCardReady(segmentId);
+          setStreamContentRevision((current) => current + 1);
+          setReportCardTransitions((current) => ({
+            ...current,
+            [segmentId]: { segmentId, status: "card_ready" },
+          }));
+        },
+        (segmentId) => {
+          streamSegmentManagerRef.current.showReportCard(segmentId);
+          setStreamContentRevision((current) => current + 1);
+          setReportCardTransitions((current) => ({
+            ...current,
+            [segmentId]: { segmentId, status: "visible" },
+          }));
+        },
+        (segmentId) => {
+          streamSegmentManagerRef.current.startReportBuffer(segmentId);
+          setStreamContentRevision((current) => current + 1);
+          setReportCardTransitions((current) => {
+            const existing = current[segmentId];
+            if (existing?.status === "visible") {
+              return current;
+            }
+            return {
+              ...current,
+              [segmentId]: { segmentId, status: "buffering" },
+            };
+          });
+        },
+      ),
+    [],
+  );
   const artifactResize = useResizable({
     defaultSize: 440,
     minSizePx: 320,
     maxSizePx: 860,
     autoSaveId: ARTIFACT_PANEL_WIDTH_KEY,
   });
+
+  const flushPendingMessageDeltas = useCallback(() => {
+    if (messageDeltaFlushTimerRef.current !== null) {
+      window.clearTimeout(messageDeltaFlushTimerRef.current);
+      messageDeltaFlushTimerRef.current = null;
+    }
+    const pending = Array.from(pendingMessageDeltasRef.current.values());
+    pendingMessageDeltasRef.current.clear();
+    if (pending.length === 0) {
+      return;
+    }
+    setMessagesByConversation((current) => {
+      const next = { ...current };
+      for (const event of pending) {
+        const messages = next[event.conversationId] ?? [];
+        next[event.conversationId] = messages.map((message) =>
+          message.id === event.messageId
+            ? { ...message, content: event.content, blocks: event.blocks, status: event.status, updatedAt: new Date().toISOString() }
+            : message,
+        );
+      }
+      return next;
+    });
+  }, []);
+
+  const queueMessageDelta = useCallback(
+    (event: MessageDeltaStreamEvent) => {
+      pendingMessageDeltasRef.current.set(event.messageId, event);
+      if (messageDeltaFlushTimerRef.current !== null) {
+        return;
+      }
+      messageDeltaFlushTimerRef.current = window.setTimeout(flushPendingMessageDeltas, 48);
+    },
+    [flushPendingMessageDeltas],
+  );
+
+  const measureReportTransitionHeight = useCallback((segmentId: string, node: HTMLDivElement | null) => {
+    if (!node) {
+      return;
+    }
+    const height = Math.ceil(node.getBoundingClientRect().height);
+    if (height <= 0) {
+      return;
+    }
+    setReportTransitionHeights((current) => current[segmentId] === height ? current : { ...current, [segmentId]: height });
+  }, []);
+
+  const releaseReportTransitionHeight = useCallback((segmentId: string) => {
+    setReportTransitionHeights((current) => {
+      if (!(segmentId in current)) {
+        return current;
+      }
+      const next = { ...current };
+      delete next[segmentId];
+      return next;
+    });
+  }, []);
 
   const activeConversation = useMemo(
     () => conversations.find((conversation) => conversation.id === activeConversationId) ?? conversations[0],
@@ -860,24 +967,21 @@ export function DataAssistantWorkspace({
         return;
       }
       if (event.type === "message") {
+        flushPendingMessageDeltas();
         upsertMessage(event.conversationId, event.message);
         return;
       }
       if (event.type === "message-delta") {
-        setMessagesByConversation((current) => {
-          const messages = current[event.conversationId] ?? [];
-          return {
-            ...current,
-            [event.conversationId]: messages.map((message) =>
-              message.id === event.messageId
-                ? { ...message, content: event.content, blocks: event.blocks, status: event.status, updatedAt: new Date().toISOString() }
-                : message,
-            ),
-          };
-        });
+        queueMessageDelta(event);
+        return;
+      }
+      if (event.type === "stream-content") {
+        applyChatStreamEvent(streamSegmentManagerRef.current, event.event as ChatStreamEvent);
+        setStreamContentRevision((current) => current + 1);
         return;
       }
       if (event.type === "tool") {
+        flushPendingMessageDeltas();
         upsertMessage(event.conversationId, event.message);
         return;
       }
@@ -899,8 +1003,15 @@ export function DataAssistantWorkspace({
       }
     });
 
-    return () => dispose?.();
-  }, [toast, upsertMessage]);
+    return () => {
+      if (messageDeltaFlushTimerRef.current !== null) {
+        window.clearTimeout(messageDeltaFlushTimerRef.current);
+        messageDeltaFlushTimerRef.current = null;
+      }
+      pendingMessageDeltasRef.current.clear();
+      dispose?.();
+    };
+  }, [flushPendingMessageDeltas, queueMessageDelta, toast, upsertMessage]);
 
   useEffect(() => {
     let isMounted = true;
@@ -945,6 +1056,74 @@ export function DataAssistantWorkspace({
   useEffect(() => {
     writeArtifactWindowState(artifactWindow);
   }, [artifactWindow]);
+
+  useEffect(() => () => reportTransitionController.dispose(), [reportTransitionController]);
+
+  useEffect(() => {
+    const activeSegmentIds = new Set<string>();
+    const inactiveSegmentIds = new Set<string>();
+    for (const message of activeMessages) {
+      if (message.role !== "assistant" || message.status !== "completed") {
+        continue;
+      }
+      const reportRecord = completedReportRecordForMessage(message, activeToolState);
+      const toolSegmentId = reportSegmentIdForMessage(message, activeToolState);
+      const streamSegments = streamSegmentManagerRef.current.getMessageSegments(message.id);
+      const streamReportSegment = streamSegments.find((segment) => segment.type === "report" && segment.reportArtifactId);
+      const segmentId = toolSegmentId ?? streamReportSegment?.segmentId;
+      const reportSegment = segmentId ? streamSegmentManagerRef.current.getSegment(segmentId) : undefined;
+      const artifactId = reportArtifactIdForMessage(message, activeToolState) ?? (streamReportSegment?.type === "report" ? streamReportSegment.reportArtifactId : undefined);
+      const title = typeof reportRecord?.request.title === "string"
+        ? reportRecord.request.title
+        : streamReportSegment?.type === "report" && streamReportSegment.reportTitle
+          ? streamReportSegment.reportTitle
+          : artifactTitle(message);
+      const markdownStreamCompleted =
+        !reportSegment ||
+        reportSegment.type !== "report" ||
+        reportSegment.status === "completed" ||
+        reportSegment.status === "buffering" ||
+        reportSegment.status === "card_ready" ||
+        reportSegment.status === "card_visible";
+      if (!segmentId || !artifactId || !markdownStreamCompleted) {
+        if (segmentId && reportCardTransitions[segmentId]?.status !== "visible") {
+          reportTransitionController.cancel(segmentId);
+          inactiveSegmentIds.add(segmentId);
+        }
+        continue;
+      }
+      activeSegmentIds.add(segmentId);
+      reportTransitionController.schedule({
+        segmentId,
+        markdownStreamCompleted,
+        reportArtifactId: artifactId,
+        reportTitle: title,
+        isCardVisible: reportCardTransitions[segmentId]?.status === "visible",
+      });
+    }
+    for (const segmentId of Object.keys(reportCardTransitions)) {
+      if (!activeSegmentIds.has(segmentId) && reportCardTransitions[segmentId]?.status !== "visible") {
+        reportTransitionController.cancel(segmentId);
+        inactiveSegmentIds.add(segmentId);
+      }
+    }
+    if (inactiveSegmentIds.size > 0) {
+      setReportCardTransitions((current) => {
+        let changed = false;
+        const next = { ...current };
+        for (const segmentId of inactiveSegmentIds) {
+          if (next[segmentId]?.status === "visible") {
+            continue;
+          }
+          if (segmentId in next) {
+            delete next[segmentId];
+            changed = true;
+          }
+        }
+        return changed ? next : current;
+      });
+    }
+  }, [activeMessages, activeToolState, reportCardTransitions, reportTransitionController, streamContentRevision]);
 
   useEffect(() => {
     if (!isStreaming) {
@@ -1162,7 +1341,7 @@ export function DataAssistantWorkspace({
     setArtifactWindow((current) => ({ ...current, isOpen: false, messageId: null }));
   }, []);
 
-  const toggleArtifactMinimized = useCallback(() => {
+  const restoreArtifactWindowWidth = useCallback(() => {
     setArtifactWindow((current) => ({ ...current, isMinimized: false, isMaximized: false }));
   }, []);
 
@@ -1560,22 +1739,115 @@ export function DataAssistantWorkspace({
     );
   };
 
-  const renderArtifactCard = (message: AssistantMessage) => {
-    const reportRecord = reportRecordForMessage(message, activeToolState);
-    const title = typeof reportRecord?.request.title === "string" ? reportRecord.request.title : artifactTitle(message);
-    const generatedAt = reportRecord?.completedAt ?? reportRecord?.updatedAt ?? message.createdAt;
+  const renderReportBufferBlock = (block: AssistantBlock, role: AssistantMessage["role"], status: AssistantMessageStatus, segmentId: string) => (
+    <div
+      key={`${segmentId}:buffering`}
+      className="assistant-message-block report-transition-buffer"
+      ref={(node) => measureReportTransitionHeight(segmentId, node)}
+    >
+      {renderBlock(block, role, status)}
+    </div>
+  );
+
+  const renderReportReplacementBlock = (message: AssistantMessage, block: AssistantBlock, status: AssistantMessageStatus, segmentId: string) => {
+    const reportRecord = completedReportRecordForMessage(message, activeToolState);
+    const streamReportSegment = streamSegmentManagerRef.current.getSegment(segmentId);
+    const title = typeof reportRecord?.request.title === "string"
+      ? reportRecord.request.title
+      : streamReportSegment?.type === "report" && streamReportSegment.reportTitle
+        ? streamReportSegment.reportTitle
+        : artifactTitle(message);
+    const { preface, reportMarkdown } = splitReportMarkdownContent(block.content, title);
+    const artifactId = reportArtifactIdForMessage(message, activeToolState) ?? (streamReportSegment?.type === "report" ? streamReportSegment.reportArtifactId : undefined);
     const dataSourceMeta = artifactDataSourceMeta(message, activeToolState);
+    const generatedAt = reportRecord?.completedAt ?? reportRecord?.updatedAt ?? message.createdAt;
+    const reportSegment: ReportContentSegment = {
+      segmentId,
+      messageId: message.id,
+      sequence: 0,
+      createdAt: message.createdAt,
+      updatedAt: reportRecord?.updatedAt ?? message.updatedAt,
+      type: "report",
+      markdownContent: reportMarkdown || block.content,
+      status: "card_visible",
+      reportArtifactId: artifactId,
+      reportTitle: title,
+      reportVersion: reportRecord?.version,
+      streamCompletedAt: message.updatedAt,
+      bufferStartedAt: reportCardTransitions[segmentId]?.status === "visible" ? reportRecord?.updatedAt : undefined,
+    };
+    const stableHeight = reportTransitionHeights[segmentId];
     return (
-      <ReportToolCallCard
-        title={title}
-        version={artifactVersion(message, activeToolState)}
-        generatedAt={formatArtifactGeneratedAt(generatedAt)}
-        chartCount={artifactChartCount(message, activeToolState)}
-        dataSourceCount={dataSourceMeta.count}
-        dataSourceLabels={dataSourceMeta.labels}
-        status={artifactStatus(message, activeToolState)}
-        onOpen={() => openArtifact(message)}
-      />
+      <div
+        key={`${segmentId}:visible`}
+        className="assistant-message-block report-transition card-visible"
+        style={stableHeight ? { minHeight: `${stableHeight}px` } : undefined}
+        onAnimationEnd={() => releaseReportTransitionHeight(segmentId)}
+      >
+        {preface && (
+          <div className="assistant-message-block markdown report-preface">
+            <Markdown
+              density="compact"
+              headingLevelStart={3}
+              contentWidth="100%"
+              autolink="gfm"
+              isStreaming={status === "receiving" || status === "processing"}
+              components={markdownComponents}
+            >
+              {preface}
+            </Markdown>
+          </div>
+        )}
+        <StreamingReportSegment
+          segment={reportSegment}
+          markdownComponents={markdownComponents}
+          chartCount={artifactChartCount(message, activeToolState)}
+          dataSourceCount={dataSourceMeta.count}
+          dataSourceLabels={dataSourceMeta.labels}
+          generatedAt={formatArtifactGeneratedAt(generatedAt)}
+          onOpen={() => openArtifact(message)}
+        />
+      </div>
+    );
+  };
+
+  const renderAssistantMessageBlocks = (message: AssistantMessage) => {
+    const toolSegmentId = reportSegmentIdForMessage(message, activeToolState);
+    const streamReportSegment = streamSegmentManagerRef.current
+      .getMessageSegments(message.id)
+      .find((segment) => segment.type === "report" && segment.reportArtifactId);
+    const segmentId = toolSegmentId ?? streamReportSegment?.segmentId;
+    const transition = segmentId ? reportCardTransitions[segmentId] : undefined;
+    const reportRecord = completedReportRecordForMessage(message, activeToolState);
+    const reportTitle = typeof reportRecord?.request.title === "string"
+      ? reportRecord.request.title
+      : streamReportSegment?.type === "report" && streamReportSegment.reportTitle
+        ? streamReportSegment.reportTitle
+        : artifactTitle(message);
+    const isReportTransitionActive = Boolean(segmentId) && (transition?.status === "card_ready" || transition?.status === "visible");
+    const shouldShowReportCard =
+      Boolean(segmentId) &&
+      transition?.status === "visible" &&
+      message.status === "completed" &&
+      Boolean(reportArtifactIdForMessage(message, activeToolState));
+    const markdownBlockCandidates = isReportTransitionActive
+      ? message.blocks
+          .map((block, index) => ({ block, index }))
+          .filter(({ block }) => block.type === "markdown" && !isRenderableCodeLanguage(block.language))
+      : [];
+    const reportContentIndex = reportMarkdownContentIndex(markdownBlockCandidates.map(({ block }) => block.content), reportTitle);
+    const reportBlockIndex = reportContentIndex >= 0 ? markdownBlockCandidates[reportContentIndex]?.index ?? -1 : -1;
+
+    return (
+      <div className="assistant-message-blocks">
+        {message.blocks.map((block, index) =>
+          shouldShowReportCard && segmentId && index === reportBlockIndex
+            ? renderReportReplacementBlock(message, block, message.status, segmentId)
+            : transition?.status === "card_ready" && segmentId && index === reportBlockIndex
+              ? renderReportBufferBlock(block, message.role, message.status, segmentId)
+            : renderBlock(block, message.role, message.status),
+        )}
+      </div>
     );
   };
 
@@ -1815,7 +2087,6 @@ export function DataAssistantWorkspace({
               <ChatMessageList isStreaming={isStreaming} density="compact">
                 {activeMessages.map((message) => {
                   const sender = message.role === "user" ? "user" : "assistant";
-                  const isArtifactMessage = isAssistantArtifactMessage(message, activeToolState);
                   const workflowToolCalls = sender === "assistant" ? toolCallsFromToolState(message, activeToolState, approveTool) : [];
                   const toolCalls = sender === "assistant"
                     ? workflowToolCalls.length > 0
@@ -1841,12 +2112,8 @@ export function DataAssistantWorkspace({
                       >
                         {sender === "user" ? (
                           renderUserMessageBody(message)
-                        ) : isArtifactMessage ? (
-                          renderArtifactCard(message)
                         ) : message.blocks.length > 0 ? (
-                          <div className="assistant-message-blocks">
-                            {message.blocks.map((block) => renderBlock(block, message.role, message.status))}
-                          </div>
+                          renderAssistantMessageBlocks(message)
                         ) : (
                           <span className="assistant-stream-cursor">
                             <Icon icon={LoaderCircle} size="xsm" color="inherit" className="assistant-message-status-spinner" />
@@ -1940,7 +2207,7 @@ export function DataAssistantWorkspace({
                       size="sm"
                       isIconOnly
                       icon={<Icon icon={Minimize2} size="sm" color="inherit" />}
-                      onClick={toggleArtifactMinimized}
+                      onClick={restoreArtifactWindowWidth}
                     />
                     <Button
                       label={artifactWindow.isMaximized ? "还原窗口" : "最大化窗口"}

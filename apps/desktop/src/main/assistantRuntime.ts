@@ -144,10 +144,51 @@ export type AssistantRetryInput = {
   approvalMode: AssistantApprovalMode;
 };
 
+export type AssistantStreamContentEvent =
+  | {
+      type: "markdown_delta" | "text_delta";
+      messageId: string;
+      segmentId: string;
+      sequence: number;
+      delta: string;
+      contentRole?: "general";
+    }
+  | {
+      type: "report_markdown_delta";
+      messageId: string;
+      segmentId: string;
+      sequence: number;
+      delta: string;
+      reportId?: string;
+    }
+  | {
+      type: "report_artifact_ready";
+      messageId: string;
+      segmentId: string;
+      reportId: string;
+      reportArtifactId: string;
+      title: string;
+      version: number;
+      createdAt: string;
+    }
+  | {
+      type: "message_stream_completed";
+      messageId: string;
+      completedAt: string;
+    }
+  | {
+      type: "stream_error";
+      messageId: string;
+      segmentId?: string;
+      code: string;
+      message: string;
+    };
+
 export type AssistantStreamEvent =
   | { type: "conversation"; conversation: AssistantConversation }
   | { type: "message"; conversationId: string; message: AssistantMessage }
   | { type: "message-delta"; conversationId: string; messageId: string; content: string; blocks: AssistantBlock[]; status: AssistantMessageStatus }
+  | { type: "stream-content"; conversationId: string; event: AssistantStreamContentEvent }
   | { type: "tool"; conversationId: string; toolCall: AssistantToolCall; message: AssistantMessage }
   | { type: "tool-state"; conversationId: string; state: ConversationToolState }
   | { type: "workflow"; conversationId: string; context: WorkflowContextSummary }
@@ -480,6 +521,22 @@ function assistantBlockTypeForContent(content: string): AssistantBlockType {
   return isMarkdownLikeContent(content) ? "markdown" : "text";
 }
 
+function stableAssistantBlockId(index: number, type: AssistantBlockType, startOffset: number) {
+  return `block-${index}-${type}-${startOffset}`;
+}
+
+export function generalStreamSegmentId(messageId: string) {
+  return `message:${messageId}:markdown`;
+}
+
+export function generalTextStreamSegmentId(messageId: string) {
+  return `message:${messageId}:text`;
+}
+
+export function reportStreamSegmentId(messageId: string, toolCallId: string, version: number) {
+  return `report:${messageId}:${toolCallId}:v${version}`;
+}
+
 function parseAssistantBlocks(content: string): AssistantBlock[] {
   const blocks: AssistantBlock[] = [];
   const fencePattern = /```([a-z0-9_+#.-]+)?\s*([\s\S]*?)```/gi;
@@ -489,7 +546,8 @@ function parseAssistantBlocks(content: string): AssistantBlock[] {
   while ((match = fencePattern.exec(content))) {
     const before = content.slice(cursor, match.index).trim();
     if (before) {
-      blocks.push({ id: randomUUID(), type: assistantBlockTypeForContent(before), content: before });
+      const type = assistantBlockTypeForContent(before);
+      blocks.push({ id: stableAssistantBlockId(blocks.length, type, cursor), type, content: before });
     }
 
     const language = (match[1] ?? "markdown").toLowerCase();
@@ -497,7 +555,7 @@ function parseAssistantBlocks(content: string): AssistantBlock[] {
     if (isVisualizationLanguage(language)) {
       const parsed = parseVisualizationSpecJson(body, { allowInlineData: true, inlineDataMaxRows: 200, inlineDataMaxBytes: 64 * 1024 });
       blocks.push({
-        id: randomUUID(),
+        id: stableAssistantBlockId(blocks.length, "visualization", match.index),
         type: "visualization",
         content: "",
         title: parsed.success ? parsed.spec.title : "可视化配置无法解析",
@@ -510,9 +568,10 @@ function parseAssistantBlocks(content: string): AssistantBlock[] {
       continue;
     }
     const isMarkdown = language === "markdown" || language === "md";
+    const blockType = language === "json" ? "json" : language === "mermaid" ? "mermaid" : "markdown";
     blocks.push({
-      id: randomUUID(),
-      type: language === "json" ? "json" : language === "mermaid" ? "mermaid" : "markdown",
+      id: stableAssistantBlockId(blocks.length, blockType, match.index),
+      type: blockType,
       content: body,
       title: language === "json" ? "JSON" : language === "mermaid" ? "Mermaid" : isMarkdown ? undefined : language.toUpperCase(),
       language,
@@ -523,10 +582,10 @@ function parseAssistantBlocks(content: string): AssistantBlock[] {
   const rest = content.slice(cursor).trim();
   if (rest) {
     const type = assistantBlockTypeForContent(rest);
-    blocks.push({ id: randomUUID(), type, content: rest, title: type === "json" ? "JSON" : undefined });
+    blocks.push({ id: stableAssistantBlockId(blocks.length, type, cursor), type, content: rest, title: type === "json" ? "JSON" : undefined });
   }
 
-  return blocks.length > 0 ? blocks : [{ id: randomUUID(), type: "text", content: "" }];
+  return blocks.length > 0 ? blocks : [{ id: stableAssistantBlockId(0, "text", 0), type: "text", content: "" }];
 }
 
 function isVisualizationLanguage(language: string) {
@@ -2921,11 +2980,11 @@ export class AssistantRuntime {
     const analysisArtifact = analysisArtifactId ? await this.toolArtifactManager.getArtifact(analysisArtifactId) : null;
     const markdown = typeof analysisArtifact?.content === "string"
       ? analysisArtifact.content.replace(/^# .+$/m, `# 整体风险分类分布报告 v${executing.version}`)
-        : buildOverallRiskDistributionMarkdown(await this.rowsForLatestSkillSqlRecord(executing.conversationId), {
-            title: "整体风险分类分布报告",
-            dataSourceLabel,
-            version: executing.version,
-          });
+      : buildOverallRiskDistributionMarkdown(await this.rowsForLatestSkillSqlRecord(executing.conversationId), {
+          title: "整体风险分类分布报告",
+          dataSourceLabel,
+          version: executing.version,
+        });
     const artifact = await this.toolArtifactManager.createArtifact({
       artifactId: `assistant-report-markdown:${executing.toolCallId}`,
       artifactType: "report_markdown",
@@ -2964,6 +3023,17 @@ export class AssistantRuntime {
         })
       : this.fallbackAssistantMessage(executing, markdown);
     this.options.emit({ type: "message", conversationId: executing.conversationId, message });
+    this.emitReportContentReady({
+      conversationId: executing.conversationId,
+      messageId: message.id,
+      toolCallId: completed.toolCallId,
+      version: completed.version,
+      artifactId: artifact.artifactId,
+      title: artifact.title ?? `整体风险分类分布报告 v${completed.version}`,
+      createdAt: artifact.createdAt,
+      completedAt: message.updatedAt,
+      markdown,
+    });
     await this.emitToolState(executing.conversationId);
     return message;
   }
@@ -2972,6 +3042,57 @@ export class AssistantRuntime {
     const planId = record.metadata?.planId;
     const records = await this.toolResultRegistry.listByConversation(record.conversationId);
     return records.find((item) => item.toolKind === toolKind && item.metadata?.planId === planId) ?? null;
+  }
+
+  private emitReportContentReady(input: {
+    conversationId: string;
+    messageId: string;
+    toolCallId: string;
+    version: number;
+    artifactId: string;
+    title: string;
+    createdAt: string;
+    completedAt: string;
+    markdown: string;
+  }) {
+    const segmentId = reportStreamSegmentId(input.messageId, input.toolCallId, input.version);
+    if (input.markdown.trim()) {
+      this.options.emit({
+        type: "stream-content",
+        conversationId: input.conversationId,
+        event: {
+          type: "report_markdown_delta",
+          messageId: input.messageId,
+          segmentId,
+          sequence: 1,
+          delta: input.markdown,
+          reportId: input.toolCallId,
+        },
+      });
+    }
+    this.options.emit({
+      type: "stream-content",
+      conversationId: input.conversationId,
+      event: {
+        type: "report_artifact_ready",
+        messageId: input.messageId,
+        segmentId,
+        reportId: input.toolCallId,
+        reportArtifactId: input.artifactId,
+        title: input.title,
+        version: input.version,
+        createdAt: input.createdAt,
+      },
+    });
+    this.options.emit({
+      type: "stream-content",
+      conversationId: input.conversationId,
+      event: {
+        type: "message_stream_completed",
+        messageId: input.messageId,
+        completedAt: input.completedAt,
+      },
+    });
   }
 
   private orchestrationRecordAsAssistantTool(record: ToolCallRecord, kind: AssistantToolKind, script: string, status: AssistantToolStatus): AssistantToolCall {
@@ -3922,9 +4043,10 @@ export class AssistantRuntime {
 
     const controller = new AbortController();
     this.abortControllers.set(assistantMessage.id, controller);
-    let content = "";
-    let providerTraceId = `trace_${assistantMessage.id}`;
-    let providerToolActivity = false;
+	    let content = "";
+	    let providerTraceId = `trace_${assistantMessage.id}`;
+	    let providerToolActivity = false;
+	    let streamSequence = 0;
 
     try {
       const adapter = createStreamingModelAdapter({
@@ -3972,6 +4094,18 @@ export class AssistantRuntime {
             blocks,
             providerTraceId,
           });
+          this.options.emit({
+            type: "stream-content",
+            conversationId: conversation.id,
+            event: {
+              type: event.type === "text-delta" ? "text_delta" : "markdown_delta",
+              messageId: assistantMessage.id,
+              segmentId: event.type === "text-delta" ? generalTextStreamSegmentId(assistantMessage.id) : generalStreamSegmentId(assistantMessage.id),
+              sequence: ++streamSequence,
+              delta,
+              contentRole: "general",
+            },
+          });
           this.options.emit({ type: "message-delta", conversationId: conversation.id, messageId: assistantMessage.id, content, blocks: updated.blocks, status: updated.status });
           continue;
         }
@@ -4000,6 +4134,15 @@ export class AssistantRuntime {
         providerTraceId,
       });
       this.options.emit({ type: "message", conversationId: conversation.id, message: completed });
+      this.options.emit({
+        type: "stream-content",
+        conversationId: conversation.id,
+        event: {
+          type: "message_stream_completed",
+          messageId: assistantMessage.id,
+          completedAt: completed.updatedAt,
+        },
+      });
 
       const tool = detectToolFromAssistantOutput(content);
       const shouldStartSkillWorkflow = !providerToolActivity && shouldStartOverallRiskWorkflowAfterModelText(input, content);
@@ -4022,6 +4165,17 @@ export class AssistantRuntime {
         providerTraceId,
       });
       this.options.emit({ type: "message", conversationId: conversation.id, message: failed });
+      this.options.emit({
+        type: "stream-content",
+        conversationId: conversation.id,
+        event: {
+          type: "stream_error",
+          messageId: assistantMessage.id,
+          segmentId: generalStreamSegmentId(assistantMessage.id),
+          code: aborted ? "REPORT_TRANSITION_CANCELLED" : "UNKNOWN_ERROR",
+          message: messageText,
+        },
+      });
       if (!aborted) {
         this.options.emit({ type: "error", conversationId: conversation.id, messageId: assistantMessage.id, message: messageText, traceId: providerTraceId ?? sha256(messageText).slice(0, 12) });
       }
@@ -4184,10 +4338,10 @@ export class AssistantRuntime {
           warnings: parsed.warnings,
         },
       },
-      parentKinds: ["python_analysis", "sql_query"],
-    });
-    await this.emitToolState(assistantMessage.conversationId);
-    return {
+	      parentKinds: ["python_analysis", "sql_query"],
+	    });
+	    await this.emitToolState(assistantMessage.conversationId);
+	    return {
       status: "completed",
       toolCallId: modelToolCallId,
       artifactIds: record?.outputArtifactIds ?? [],
@@ -4232,8 +4386,22 @@ export class AssistantRuntime {
         },
       },
       parentKinds: ["chart_rendering", "python_analysis", "sql_query"],
-    });
-    await this.emitToolState(assistantMessage.conversationId);
+	    });
+	    if (record) {
+	      const artifactId = record.result?.primaryArtifactId ?? record.outputArtifactIds?.[0] ?? `assistant-report-markdown:${modelToolCallId}`;
+	      this.emitReportContentReady({
+	        conversationId: assistantMessage.conversationId,
+	        messageId: assistantMessage.id,
+	        toolCallId: record.toolCallId,
+	        version: record.version,
+	        artifactId,
+	        title,
+	        createdAt: record.completedAt ?? record.updatedAt,
+	        completedAt: record.completedAt ?? record.updatedAt,
+	        markdown,
+	      });
+	    }
+	    await this.emitToolState(assistantMessage.conversationId);
     return {
       status: "completed",
       toolCallId: modelToolCallId,
