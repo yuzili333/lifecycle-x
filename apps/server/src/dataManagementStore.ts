@@ -10,6 +10,16 @@ import {
   type BuildSchemaContextInput,
   type DataSourceRef,
 } from "./schemaContext/index.js";
+import {
+  OVERALL_RISK_REQUIRED_FIELDS,
+  convertCsvValue,
+  parseCsvDictionary,
+  validateCsvRows,
+  validateRequiredHeaderMatches,
+  type FieldDictionaryDefinition,
+  type LogicalFieldType,
+  type SQLiteFieldType,
+} from "./semanticFields.js";
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require("node:sqlite") as { DatabaseSync: new (path: string) => any };
@@ -70,6 +80,20 @@ export type DatabaseColumn = {
   sensitive: boolean;
   largeField: boolean;
   comment: string;
+  sourceHeader?: string;
+  physicalName?: string;
+  businessFieldId?: string;
+  displayNameZh?: string;
+  displayNameEn?: string;
+  logicalType?: LogicalFieldType;
+  sqliteType?: SQLiteFieldType;
+  fieldComment?: string;
+  aliases?: string[];
+  mappingSource?: "dictionary" | "business_dictionary" | "manual" | "inferred";
+  mappingConfidence?: number;
+  mappingStatus?: "unmapped" | "suggested" | "confirmed" | "rejected" | "conflict";
+  constraints?: Record<string, unknown>;
+  sensitivity?: "public" | "internal" | "sensitive" | "restricted";
 };
 
 export type DatabaseIndex = {
@@ -256,7 +280,7 @@ function parseCsvRecords(content: string) {
     const char = content[index];
     const next = content[index + 1];
     if (char === '"' && inQuotes && next === '"') {
-      current += char;
+      current += `${char}${next}`;
       index += 1;
       continue;
     }
@@ -361,6 +385,14 @@ function uniqueSqliteColumnNames(headers: string[]) {
   });
 }
 
+function businessFieldDomain(businessFieldId: string) {
+  const parts = businessFieldId.split(".").map((part) => part.trim()).filter(Boolean);
+  if (parts.length >= 2) {
+    return parts.slice(0, 2).join(".");
+  }
+  return parts[0] || "custom";
+}
+
 function isIntegerType(type: string) {
   return /int|bigint|smallint|tinyint/i.test(type);
 }
@@ -439,8 +471,78 @@ function inferCsvColumns(headers: string[], rows: Record<string, string>[], tabl
     indexed: false,
     sensitive: isSensitiveName(header),
     largeField: false,
-    comment: "CSV 推断字段",
+    comment: "未配置字段说明",
   }));
+}
+
+function columnTypeFromDictionary(definition: FieldDictionaryDefinition) {
+  if (definition.logicalType === "integer" || definition.sqliteType === "INTEGER") {
+    return "bigint";
+  }
+  if (definition.logicalType === "decimal" || definition.sqliteType === "REAL" || definition.sqliteType === "NUMERIC") {
+    return "decimal(18,4)";
+  }
+  if (definition.logicalType === "date") {
+    return "date";
+  }
+  if (definition.logicalType === "datetime") {
+    return "datetime";
+  }
+  return "text";
+}
+
+function semanticColumnFromDictionary(tableId: string, definition: FieldDictionaryDefinition, sourceHeader: string, confidence: number, mappingSource: DatabaseColumn["mappingSource"]): DatabaseColumn {
+  return {
+    id: `${tableId}:col:${definition.fieldNameEn}`,
+    name: definition.fieldNameEn,
+    type: columnTypeFromDictionary(definition),
+    nullable: definition.nullable,
+    primaryKey: definition.primaryKey,
+    indexed: definition.primaryKey || definition.unique,
+    sensitive: definition.sensitivity === "sensitive" || definition.sensitivity === "restricted" || isSensitiveName(definition.fieldNameEn) || isSensitiveName(definition.fieldNameZh),
+    largeField: false,
+    comment: definition.fieldComment,
+    sourceHeader,
+    physicalName: definition.fieldNameEn,
+    businessFieldId: definition.businessFieldId,
+    displayNameZh: definition.fieldNameZh,
+    displayNameEn: definition.fieldNameEn,
+    logicalType: definition.logicalType,
+    sqliteType: definition.sqliteType,
+    fieldComment: definition.fieldComment,
+    aliases: definition.aliases,
+    mappingSource,
+    mappingConfidence: confidence,
+    mappingStatus: "confirmed",
+    constraints: definition.constraints as Record<string, unknown>,
+    sensitivity: definition.sensitivity,
+  };
+}
+
+function csvValueForSemanticColumn(column: DatabaseColumn, value: unknown): CsvCellValue {
+  const text = String(value ?? "").trim();
+  if (!text) {
+    return null;
+  }
+  if (column.logicalType && column.sqliteType) {
+    const converted = convertCsvValue(text, {
+      fieldOrder: 0,
+      fieldNameZh: column.displayNameZh ?? column.name,
+      fieldNameEn: column.physicalName ?? column.name,
+      businessFieldId: column.businessFieldId ?? "",
+      sourceFieldName: column.sourceHeader ?? column.name,
+      logicalType: column.logicalType,
+      sqliteType: column.sqliteType,
+      nullable: column.nullable,
+      unique: false,
+      primaryKey: column.primaryKey,
+      constraints: column.constraints ?? {},
+      fieldComment: column.fieldComment ?? column.comment,
+      aliases: column.aliases ?? [],
+    });
+    return converted.ok ? converted.value : null;
+  }
+  return csvValueForColumn(column, value);
 }
 
 class CsvSqliteStore {
@@ -477,6 +579,18 @@ class CsvSqliteStore {
     columns: DatabaseColumn[];
     rows: Record<string, CsvCellValue>[];
     importedAt: string;
+    importJobId?: string;
+    dictionary?: { fileName: string; validationMode: "strict" | "quarantine"; definitions: FieldDictionaryDefinition[] };
+    validationIssues?: Array<{
+      rowNumber?: number;
+      sourceHeader?: string;
+      physicalName?: string;
+      businessFieldId?: string;
+      rawValue?: unknown;
+      code: string;
+      severity: string;
+      message: string;
+    }>;
   }) {
     if (!this.db) {
       return;
@@ -508,8 +622,11 @@ class CsvSqliteStore {
       const insertColumn = this.db.prepare(
         [
           "INSERT INTO csv_dataset_columns",
-          "(data_source_id, table_id, ordinal_index, name, sqlite_column_name, type, nullable, primary_key, indexed, sensitive, large_field, comment)",
-          "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          [
+            "(data_source_id, table_id, ordinal_index, name, sqlite_column_name, type, nullable, primary_key, indexed, sensitive, large_field, comment,",
+            "source_header, physical_name, business_field_id, display_name_zh, display_name_en, logical_type, sqlite_type, field_comment, aliases_json, mapping_source, mapping_confidence, mapping_status, constraints_json, sensitivity)",
+          ].join(" "),
+          "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         ].join(" "),
       );
       for (const column of sqliteColumns) {
@@ -526,7 +643,60 @@ class CsvSqliteStore {
           column.sensitive ? 1 : 0,
           column.largeField ? 1 : 0,
           column.comment,
+          column.sourceHeader ?? column.name,
+          column.physicalName ?? column.sqliteColumnName,
+          column.businessFieldId ?? null,
+          column.displayNameZh ?? column.sourceHeader ?? column.name,
+          column.displayNameEn ?? null,
+          column.logicalType ?? null,
+          column.sqliteType ?? sqliteTypeForColumn(column),
+          column.fieldComment ?? column.comment,
+          JSON.stringify(column.aliases ?? []),
+          column.mappingSource ?? "inferred",
+          column.mappingConfidence ?? null,
+          column.mappingStatus ?? "suggested",
+          JSON.stringify(column.constraints ?? {}),
+          column.sensitivity ?? null,
         );
+      }
+
+      if (input.dictionary) {
+        this.seedBusinessFieldDictionaryFromImport(input.dictionary.definitions, input.importedAt);
+        this.db
+          .prepare(
+            "INSERT INTO imported_table_dictionaries (id, data_source_id, table_id, dictionary_file_name, dictionary_version, validation_mode, definition_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+          )
+          .run(
+            `dict_${input.tableId}`,
+            input.dataSourceId,
+            input.tableId,
+            input.dictionary.fileName,
+            "table-dictionary",
+            input.dictionary.validationMode,
+            JSON.stringify(input.dictionary.definitions),
+            input.importedAt,
+          );
+      }
+      const importJobId = input.importJobId ?? `import_${input.tableId}`;
+      if (input.validationIssues?.length) {
+        const insertIssue = this.db.prepare(
+          "INSERT INTO csv_import_validation_issues (id, import_job_id, row_number, source_header, physical_name, business_field_id, raw_value, error_code, severity, error_message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        );
+        for (const [issueIndex, issue] of input.validationIssues.entries()) {
+          insertIssue.run(
+            `${importJobId}:issue:${issueIndex + 1}`,
+            importJobId,
+            issue.rowNumber ?? null,
+            issue.sourceHeader ?? null,
+            issue.physicalName ?? null,
+            issue.businessFieldId ?? null,
+            issue.rawValue == null ? null : String(issue.rawValue),
+            issue.code,
+            issue.severity,
+            issue.message,
+            input.importedAt,
+          );
+        }
       }
 
       if (input.rows.length === 0) {
@@ -538,7 +708,7 @@ class CsvSqliteStore {
         `INSERT INTO ${quoteIdentifier(sqliteTableName)} (${insertColumns}) VALUES (${placeholders})`,
       );
       for (const [rowIndex, row] of input.rows.entries()) {
-        insertRow.run(rowIndex + 1, ...input.columns.map((column) => csvValueForColumn(column, row[column.name])));
+        insertRow.run(rowIndex + 1, ...input.columns.map((column) => csvValueForSemanticColumn(column, row[column.sourceHeader ?? column.name] ?? row[column.name])));
       }
     });
   }
@@ -693,8 +863,58 @@ class CsvSqliteStore {
         PRIMARY KEY (data_source_id, ordinal_index),
         FOREIGN KEY (data_source_id) REFERENCES csv_dataset_tables(data_source_id) ON DELETE CASCADE
       );
+      CREATE TABLE IF NOT EXISTS business_field_dictionary (
+        business_field_id TEXT PRIMARY KEY,
+        business_domain TEXT NOT NULL,
+        display_name_zh TEXT NOT NULL,
+        display_name_en TEXT,
+        logical_type TEXT NOT NULL,
+        aliases_json TEXT,
+        description TEXT,
+        dictionary_version TEXT,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS imported_table_dictionaries (
+        id TEXT PRIMARY KEY,
+        data_source_id TEXT NOT NULL,
+        table_id TEXT NOT NULL,
+        dictionary_file_name TEXT,
+        dictionary_version TEXT,
+        validation_mode TEXT NOT NULL,
+        definition_json TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS csv_import_validation_issues (
+        id TEXT PRIMARY KEY,
+        import_job_id TEXT NOT NULL,
+        row_number INTEGER,
+        source_header TEXT,
+        physical_name TEXT,
+        business_field_id TEXT,
+        raw_value TEXT,
+        error_code TEXT NOT NULL,
+        severity TEXT NOT NULL,
+        error_message TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
     `);
     this.ensureColumn("csv_dataset_tables", "aliases_json", "TEXT NOT NULL DEFAULT '[]'");
+    this.ensureColumn("csv_dataset_columns", "source_header", "TEXT");
+    this.ensureColumn("csv_dataset_columns", "physical_name", "TEXT");
+    this.ensureColumn("csv_dataset_columns", "business_field_id", "TEXT");
+    this.ensureColumn("csv_dataset_columns", "display_name_zh", "TEXT");
+    this.ensureColumn("csv_dataset_columns", "display_name_en", "TEXT");
+    this.ensureColumn("csv_dataset_columns", "logical_type", "TEXT");
+    this.ensureColumn("csv_dataset_columns", "sqlite_type", "TEXT");
+    this.ensureColumn("csv_dataset_columns", "field_comment", "TEXT");
+    this.ensureColumn("csv_dataset_columns", "aliases_json", "TEXT NOT NULL DEFAULT '[]'");
+    this.ensureColumn("csv_dataset_columns", "mapping_source", "TEXT");
+    this.ensureColumn("csv_dataset_columns", "mapping_confidence", "REAL");
+    this.ensureColumn("csv_dataset_columns", "mapping_status", "TEXT");
+    this.ensureColumn("csv_dataset_columns", "constraints_json", "TEXT");
+    this.ensureColumn("csv_dataset_columns", "sensitivity", "TEXT");
   }
 
   private ensureColumn(tableName: string, columnName: string, definition: string) {
@@ -703,6 +923,31 @@ class CsvSqliteStore {
       return;
     }
     this.db.prepare(`ALTER TABLE ${quoteIdentifier(tableName)} ADD COLUMN ${quoteIdentifier(columnName)} ${definition}`).run();
+  }
+
+  private seedBusinessFieldDictionaryFromImport(definitions: FieldDictionaryDefinition[], timestamp: string) {
+    const insert = this.db.prepare(
+      [
+        "INSERT OR REPLACE INTO business_field_dictionary",
+        "(business_field_id, business_domain, display_name_zh, display_name_en, logical_type, aliases_json, description, dictionary_version, enabled, created_at, updated_at)",
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, COALESCE((SELECT created_at FROM business_field_dictionary WHERE business_field_id = ?), ?), ?)",
+      ].join(" "),
+    );
+    for (const field of definitions) {
+      insert.run(
+        field.businessFieldId,
+        businessFieldDomain(field.businessFieldId),
+        field.fieldNameZh,
+        field.fieldNameEn,
+        field.logicalType,
+        JSON.stringify(field.aliases),
+        field.fieldComment || null,
+        "table-dictionary",
+        field.businessFieldId,
+        timestamp,
+        timestamp,
+      );
+    }
   }
 
   private transaction(callback: () => void) {
@@ -985,14 +1230,59 @@ export class DataManagementStore {
     };
   }
 
-  importCsv(fileId: string, userId: string) {
+  importCsv(fileId: string, userId: string, dictionaryFileId?: string, validationMode: "strict" | "quarantine" = "strict") {
     const file = this.csvFiles.get(fileId);
     if (!file) {
       return null;
     }
+    const dictionaryFile = dictionaryFileId ? this.csvFiles.get(dictionaryFileId) : null;
+    if (!dictionaryFile) {
+      return {
+        success: false as const,
+        error: {
+          code: "DICTIONARY_FILE_NOT_FOUND",
+          message: "CSV 导入必须同时提供表字典文件。",
+        },
+      };
+    }
     const parsed = parseCsv(file.content);
+    const dictionary = parseCsvDictionary(dictionaryFile.content);
+    if (!dictionary.valid) {
+      return {
+        success: false as const,
+        error: {
+          code: "DICTIONARY_SCHEMA_INVALID",
+          message: dictionary.errors[0]?.message ?? "表字典校验失败。",
+          errors: dictionary.errors,
+          warnings: dictionary.warnings,
+        },
+      };
+    }
+    const headerValidation = validateRequiredHeaderMatches(parsed.headers, dictionary.definitions);
+    const matchedByDefinition = new Map<FieldDictionaryDefinition, { sourceHeader: string; confidence: number; mappingSource: DatabaseColumn["mappingSource"] }>();
+    for (const match of headerValidation.matches) {
+      if (match.matched && match.dictionaryField) {
+        matchedByDefinition.set(match.dictionaryField, {
+          sourceHeader: match.sourceHeader,
+          confidence: match.confidence,
+          mappingSource: match.matchSource === "business_dictionary" ? "business_dictionary" : "dictionary",
+        });
+      }
+    }
+    if (headerValidation.errors.length > 0) {
+      return {
+        success: false as const,
+        error: {
+          code: "CSV_HEADER_MISSING",
+          message: headerValidation.errors[0]?.message ?? "CSV 表头与表字典不匹配。",
+          errors: headerValidation.errors,
+          warnings: headerValidation.warnings,
+        },
+      };
+    }
     const dataSourceId = id("ds_csv");
     const tableId = id("tbl_csv");
+    const importJobId = id("import_job");
     const importedAt = nowIso();
     const source = this.buildSource(
       {
@@ -1014,7 +1304,42 @@ export class DataManagementStore {
     source.schemaCount = 1;
     source.tableCount = 1;
     const actualSizeMb = Math.max(1, Math.round(file.content.length / 1024 / 1024));
-    const columns = inferCsvColumns(parsed.headers, parsed.rows, tableId);
+    const columns = dictionary.definitions
+      .map((definition) => {
+        const match = matchedByDefinition.get(definition);
+        return match ? semanticColumnFromDictionary(tableId, definition, match.sourceHeader, match.confidence, match.mappingSource) : null;
+      })
+      .filter((column): column is DatabaseColumn => Boolean(column));
+    const rowValidation = validateCsvRows(
+      parsed.rows,
+      columns.map((column) => {
+        const definition = dictionary.definitions.find((candidate) => candidate.businessFieldId === column.businessFieldId && candidate.fieldNameEn === column.name);
+        if (!definition || !column.sourceHeader) {
+          throw new Error("Semantic column missing dictionary mapping.");
+        }
+        return { sourceHeader: column.sourceHeader, definition };
+      }),
+      validationMode,
+    );
+    if (validationMode === "strict" && rowValidation.issues.some((issue) => issue.severity !== "warning")) {
+      return {
+        success: false as const,
+        error: {
+          code: "FIELD_CONSTRAINT_VIOLATED",
+          message: rowValidation.issues[0]?.message ?? "CSV 数据未通过表字典约束校验。",
+          errors: rowValidation.issues,
+          warnings: headerValidation.warnings,
+        },
+      };
+    }
+    const normalizedRows = parsed.rows.map((row) =>
+      Object.fromEntries(
+        columns.map((column) => {
+          const sourceHeader = column.sourceHeader ?? column.name;
+          return [column.name, csvValueForSemanticColumn(column, row[sourceHeader])];
+        }),
+      ) as Record<string, string | number | boolean | null>,
+    );
     this.csvSqliteStore.importDataset({
       dataSourceId,
       tableId,
@@ -1022,6 +1347,22 @@ export class DataManagementStore {
       columns,
       rows: parsed.rows,
       importedAt,
+      importJobId,
+      dictionary: {
+        fileName: dictionaryFile.name,
+        validationMode,
+        definitions: dictionary.definitions,
+      },
+      validationIssues: [...dictionary.warnings, ...headerValidation.warnings, ...rowValidation.issues].map((issue) => ({
+        rowNumber: issue.rowNumber,
+        sourceHeader: issue.sourceHeader,
+        physicalName: issue.physicalName,
+        businessFieldId: issue.businessFieldId,
+        rawValue: issue.rawValue,
+        code: issue.code,
+        severity: issue.severity,
+        message: issue.message,
+      })),
     });
     this.dataSources.set(dataSourceId, source);
     this.csvFileProfiles.set(dataSourceId, {
@@ -1033,9 +1374,6 @@ export class DataManagementStore {
       columnCount: parsed.headers.length,
     });
     this.schemas.set(dataSourceId, [{ id: `${dataSourceId}:schema:csv_imports`, dataSourceId, name: "csv_imports", tableCount: 1, viewCount: 0, lastSyncedAt: source.lastSyncedAt }]);
-    const normalizedRows = parsed.rows.map((row) =>
-      Object.fromEntries(columns.map((column) => [column.name, csvValueForColumn(column, row[column.name])])) as Record<string, string | number | boolean | null>,
-    );
     const previewRows = this.csvSqliteStore.isAvailable ? normalizedRows.slice(0, CSV_PREVIEW_ROW_LIMIT) : normalizedRows;
     this.tables.set(dataSourceId, [
       applyLargeTableRule({
@@ -1057,8 +1395,31 @@ export class DataManagementStore {
       }),
     ]);
     this.csvFiles.delete(fileId);
+    if (dictionaryFileId) {
+      this.csvFiles.delete(dictionaryFileId);
+    }
     this.persist();
-    return { success: true as const, job: { id: id("import_job"), status: "completed", importedTableId: tableId, dataSourceId, importedRows: parsed.rows.length } };
+    return {
+      success: true as const,
+      job: {
+        id: importJobId,
+        status: rowValidation.issues.length > 0 ? "completed_with_warnings" as const : "completed" as const,
+        importedTableId: tableId,
+        dataSourceId,
+        importedRows: parsed.rows.length,
+        invalidRows: rowValidation.invalidRows,
+        fieldMappings: columns.map((column) => ({
+          sourceHeader: column.sourceHeader,
+          physicalName: column.physicalName ?? column.name,
+          businessFieldId: column.businessFieldId,
+          displayNameZh: column.displayNameZh,
+          mappingSource: column.mappingSource,
+          mappingConfidence: column.mappingConfidence,
+          mappingStatus: column.mappingStatus,
+        })),
+        warnings: [...dictionary.warnings, ...headerValidation.warnings, ...rowValidation.issues.filter((issue) => issue.severity === "warning")],
+      },
+    };
   }
 
   deleteCsvDataSource(dataSourceId: string) {
@@ -1111,6 +1472,92 @@ export class DataManagementStore {
     return {
       success: true as const,
       context,
+    };
+  }
+
+  resolveBusinessField(input: { dataSourceId: string; businessFieldId: string; tableId?: string }) {
+    const tables = this.listTables(input.dataSourceId).filter((table) => !input.tableId || table.id === input.tableId);
+    const candidates = tables.flatMap((table) =>
+      table.columns
+        .filter((column) => column.businessFieldId === input.businessFieldId)
+        .map((column) => ({
+          tableId: table.id,
+          physicalTableName: table.name,
+          businessFieldId: column.businessFieldId ?? input.businessFieldId,
+          displayNameZh: column.displayNameZh ?? column.sourceHeader ?? column.name,
+          physicalName: column.physicalName ?? column.name,
+          logicalType: column.logicalType ?? "unknown",
+          sqliteType: column.sqliteType ?? sqliteTypeForColumn(column),
+          mappingSource: column.mappingSource ?? "inferred",
+          mappingConfidence: column.mappingConfidence,
+          mappingStatus: column.mappingStatus ?? "suggested",
+        })),
+    );
+    return candidates.length === 1 ? candidates[0] : null;
+  }
+
+  resolveSkillFields(input: { skillId: string; dataSourceId: string; tableIds?: string[] }) {
+    const requirements = input.skillId === "overall-risk-classification-distribution" ? OVERALL_RISK_REQUIRED_FIELDS : [];
+    const tables = this.listTables(input.dataSourceId).filter((table) => !input.tableIds || input.tableIds.includes(table.id));
+    const resolvedFields: Array<{
+      businessFieldId: string;
+      displayNameZh: string;
+      tableId: string;
+      physicalTableName: string;
+      physicalName: string;
+      required: boolean;
+    }> = [];
+    const missingRequiredFields: Array<{ businessFieldId: string; displayNameZh: string }> = [];
+    const ambiguousFields: Array<{ businessFieldId: string; candidates: NonNullable<ReturnType<DataManagementStore["resolveBusinessField"]>>[] }> = [];
+
+    for (const requirement of requirements) {
+      const acceptableBusinessFieldIds: string[] = [requirement.businessFieldId, ...("compatibleBusinessFieldIds" in requirement ? requirement.compatibleBusinessFieldIds : [])];
+      const candidates = tables.flatMap((table) =>
+        table.columns
+          .filter((column) => column.businessFieldId && acceptableBusinessFieldIds.includes(column.businessFieldId))
+          .map((column) => ({
+            tableId: table.id,
+            physicalTableName: table.name,
+            businessFieldId: column.businessFieldId ?? requirement.businessFieldId,
+            displayNameZh: column.displayNameZh ?? requirement.displayNameZh,
+            physicalName: column.physicalName ?? column.name,
+            logicalType: column.logicalType ?? "unknown",
+            sqliteType: column.sqliteType ?? sqliteTypeForColumn(column),
+            mappingSource: column.mappingSource ?? "inferred",
+            mappingConfidence: column.mappingConfidence,
+            mappingStatus: column.mappingStatus ?? "suggested",
+          })),
+      ).sort((left, right) => {
+        const leftRank = left.businessFieldId === requirement.businessFieldId ? 0 : acceptableBusinessFieldIds.indexOf(left.businessFieldId);
+        const rightRank = right.businessFieldId === requirement.businessFieldId ? 0 : acceptableBusinessFieldIds.indexOf(right.businessFieldId);
+        return leftRank - rightRank;
+      });
+      const bestRank = candidates.length > 0 ? acceptableBusinessFieldIds.indexOf(candidates[0].businessFieldId) : -1;
+      const bestCandidates = bestRank >= 0 ? candidates.filter((candidate) => acceptableBusinessFieldIds.indexOf(candidate.businessFieldId) === bestRank) : [];
+      if (bestCandidates.length === 1) {
+        const candidate = bestCandidates[0];
+        resolvedFields.push({
+          businessFieldId: candidate.businessFieldId,
+          displayNameZh: candidate.displayNameZh,
+          tableId: candidate.tableId,
+          physicalTableName: candidate.physicalTableName,
+          physicalName: candidate.physicalName,
+          required: requirement.required,
+        });
+      } else if (bestCandidates.length > 1) {
+        ambiguousFields.push({ businessFieldId: requirement.businessFieldId, candidates: bestCandidates });
+      } else if (requirement.required) {
+        missingRequiredFields.push({ businessFieldId: requirement.businessFieldId, displayNameZh: requirement.displayNameZh });
+      }
+    }
+
+    return {
+      skillId: input.skillId,
+      dataSourceId: input.dataSourceId,
+      resolvedFields,
+      missingRequiredFields,
+      ambiguousFields,
+      ready: missingRequiredFields.length === 0 && ambiguousFields.length === 0,
     };
   }
 

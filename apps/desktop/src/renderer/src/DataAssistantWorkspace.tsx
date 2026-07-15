@@ -408,12 +408,28 @@ function artifactTitle(message: AssistantMessage) {
   return extractMarkdownTitle(message.content, "数据助手生成文档");
 }
 
+function toolRecordsForMessage(message: AssistantMessage, toolState?: ConversationToolState | null) {
+  return (toolState?.toolCalls ?? []).filter((record) => record.messageId === message.id);
+}
+
+function sortedToolRecords(records: ToolCallRecord[]) {
+  return [...records].sort((a, b) => b.version - a.version || Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
+}
+
+function reportRecordsForMessage(message: AssistantMessage, toolState?: ConversationToolState | null) {
+  return sortedToolRecords(toolRecordsForMessage(message, toolState).filter((record) => record.toolKind === "report_generation"));
+}
+
 function reportRecordForMessage(message: AssistantMessage, toolState?: ConversationToolState | null) {
-  return toolState?.toolCalls.find((record) => record.toolKind === "report_generation" && record.messageId === message.id && record.status === "completed");
+  return reportRecordsForMessage(message, toolState)[0];
+}
+
+function completedReportRecordForMessage(message: AssistantMessage, toolState?: ConversationToolState | null) {
+  return reportRecordsForMessage(message, toolState).find((record) => record.status === "completed");
 }
 
 function reportArtifactIdForMessage(message: AssistantMessage, toolState?: ConversationToolState | null) {
-  const reportRecord = reportRecordForMessage(message, toolState);
+  const reportRecord = completedReportRecordForMessage(message, toolState) ?? reportRecordForMessage(message, toolState);
   return reportRecord?.result?.primaryArtifactId ?? reportRecord?.outputArtifactIds?.find((artifactId) => artifactId.includes("report"));
 }
 
@@ -432,27 +448,85 @@ function artifactVersion(message: AssistantMessage, toolState?: ConversationTool
   return version ? Number(version) : undefined;
 }
 
-function artifactSummary(content: string) {
-  return content
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line && !line.startsWith("#") && !line.startsWith("```") && !/^\|/.test(line))
-    .find(Boolean)
-    ?.replace(/^[-*]\s*/, "")
-    .slice(0, 120);
+function addArtifactLikeIds(sources: Set<string>, values?: string[]) {
+  values?.forEach((value) => {
+    if (/^(workflow-dataset|dataset|assistant-sql-result)[:_-]/i.test(value)) {
+      sources.add(value);
+    }
+  });
 }
 
-function artifactDataSourceCount(message: AssistantMessage) {
-  const sources = new Set<string>();
+function artifactChartCount(message: AssistantMessage, toolState?: ConversationToolState | null) {
+  const chartIds = new Set<string>();
+  message.blocks.forEach((block) => {
+    if (block.type === "visualization") {
+      chartIds.add(block.visualizationSpec?.visualizationId ?? block.id);
+    }
+  });
+  for (const record of toolRecordsForMessage(message, toolState)) {
+    if (record.toolKind !== "chart_rendering") {
+      continue;
+    }
+    const artifactIds = record.outputArtifactIds ?? record.result?.artifactIds ?? [];
+    if (artifactIds.length === 0) {
+      chartIds.add(record.toolCallId);
+      continue;
+    }
+    artifactIds.forEach((artifactId) => chartIds.add(artifactId));
+  }
+  return chartIds.size;
+}
+
+function artifactDataSourceMeta(message: AssistantMessage, toolState?: ConversationToolState | null) {
+  const sources = new Map<string, string>();
+  const fallbackSources = new Set<string>();
+  const addSource = (key?: string, label?: string) => {
+    const normalizedKey = key?.trim() || label?.trim();
+    if (!normalizedKey) {
+      return;
+    }
+    sources.set(normalizedKey, label?.trim() || normalizedKey);
+  };
   for (const block of message.blocks) {
     if (block.toolTarget) {
-      sources.add(block.toolTarget);
+      addSource(block.toolTarget);
     }
-    block.toolFiles?.forEach((file) => sources.add(file));
+    block.toolFiles?.forEach((file) => addSource(file));
     const artifactMatch = block.content.match(/\b(?:artifact|dataset|workflow-dataset)[:_-][\w-]+/gi);
-    artifactMatch?.forEach((artifactId) => sources.add(artifactId));
+    artifactMatch?.forEach((artifactId) => fallbackSources.add(artifactId));
   }
-  return sources.size;
+  for (const record of toolRecordsForMessage(message, toolState)) {
+    if (record.toolKind === "sql_query") {
+      const dataSourceId = typeof record.request.dataSourceId === "string" ? record.request.dataSourceId : undefined;
+      const dataSourceLabel = typeof record.request.dataSourceLabel === "string" ? record.request.dataSourceLabel : undefined;
+      addSource(dataSourceId ?? dataSourceLabel ?? record.toolCallId, dataSourceLabel ?? dataSourceId ?? record.toolCallId);
+    }
+    addArtifactLikeIds(fallbackSources, record.sourceArtifactIds);
+    addArtifactLikeIds(fallbackSources, record.outputArtifactIds ?? record.result?.artifactIds);
+  }
+  if (sources.size === 0 && message.context?.dataSourceLabel) {
+    addSource(message.context.dataSourceLabel);
+  }
+  if (sources.size === 0) {
+    fallbackSources.forEach((source) => addSource(source));
+  }
+  const labels = Array.from(sources.values());
+  return { count: labels.length, labels };
+}
+
+function artifactStatus(message: AssistantMessage, toolState?: ConversationToolState | null) {
+  const reportRecord = reportRecordForMessage(message, toolState);
+  const status = reportRecord?.status;
+  if (!status) {
+    return message.status === "completed" ? "completed" : message.status === "error" ? "failed" : "creating";
+  }
+  if (status === "completed") {
+    return "completed";
+  }
+  if (status === "failed" || status === "rejected" || status === "cancelled" || status === "blocked") {
+    return "failed";
+  }
+  return "creating";
 }
 
 function assistantToolStatus(status?: AssistantBlock["toolStatus"]): ChatToolCallItem["status"] {
@@ -1486,15 +1560,19 @@ export function DataAssistantWorkspace({
   };
 
   const renderArtifactCard = (message: AssistantMessage) => {
+    const reportRecord = reportRecordForMessage(message, activeToolState);
+    const title = typeof reportRecord?.request.title === "string" ? reportRecord.request.title : artifactTitle(message);
+    const generatedAt = reportRecord?.completedAt ?? reportRecord?.updatedAt ?? message.createdAt;
+    const dataSourceMeta = artifactDataSourceMeta(message, activeToolState);
     return (
       <ReportToolCallCard
-        title={artifactTitle(message)}
+        title={title}
         version={artifactVersion(message, activeToolState)}
-        generatedAt={formatArtifactGeneratedAt(message.createdAt)}
-        summary={artifactSummary(message.content)}
-        chartCount={message.blocks.filter((block) => block.type === "visualization").length}
-        dataSourceCount={artifactDataSourceCount(message)}
-        status={message.status}
+        generatedAt={formatArtifactGeneratedAt(generatedAt)}
+        chartCount={artifactChartCount(message, activeToolState)}
+        dataSourceCount={dataSourceMeta.count}
+        dataSourceLabels={dataSourceMeta.labels}
+        status={artifactStatus(message, activeToolState)}
         onOpen={() => openArtifact(message)}
       />
     );
@@ -1737,8 +1815,11 @@ export function DataAssistantWorkspace({
                 {activeMessages.map((message) => {
                   const sender = message.role === "user" ? "user" : "assistant";
                   const isArtifactMessage = isAssistantArtifactMessage(message, activeToolState);
+                  const workflowToolCalls = sender === "assistant" ? toolCallsFromToolState(message, activeToolState, approveTool) : [];
                   const toolCalls = sender === "assistant"
-                    ? [...toolCallsFromMessage(message), ...toolCallsFromToolState(message, activeToolState, approveTool)]
+                    ? workflowToolCalls.length > 0
+                      ? workflowToolCalls
+                      : toolCallsFromMessage(message)
                     : [];
                   return (
                     <ChatMessage

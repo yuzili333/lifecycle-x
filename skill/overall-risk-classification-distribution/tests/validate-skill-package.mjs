@@ -30,6 +30,7 @@ assert.match(manifest.version, /^\d+\.\d+\.\d+$/);
 assert.deepEqual(manifest.requiredTools, requiredTools);
 assert.equal(manifest.entryFile, "SKILL.md");
 assert.equal(manifest.templateFile, "report-template.md");
+assert.equal(manifest.fieldRequirementsFile, "field-requirements.json");
 assert.equal(manifest.inputSchemaFile, "schemas/skill-input.schema.json");
 assert.equal(manifest.reportDataSchemaFile, "schemas/report-data.schema.json");
 assert.ok(manifest.aliases.includes("@整体风险分类分布"));
@@ -43,8 +44,33 @@ assert.ok(skill.includes("request_python_analysis_execution"));
 assert.ok(skill.includes("request_chart_rendering"));
 assert.ok(skill.includes("request_markdown_report_generation"));
 assert.ok(skill.includes("不得使用报告模板中的示例数字"));
+assert.ok(skill.includes("bf.loan_contract.contract_serial"));
+assert.ok(skill.includes("bf.loan_contract.latest_risk"));
+assert.ok(skill.includes("bf.loan_contract.latest_five_level_risk"));
+assert.ok(skill.includes("bf.loan_contract.latest_risk_result"));
+assert.ok(skill.includes("十二级分类只允许使用 `latest_risk_result`"));
+assert.ok(skill.includes("【笔数维度】"));
+assert.ok(skill.includes("【金额维度】"));
+assert.ok(skill.includes("【正常类维度】"));
+assert.ok(skill.includes("含“正常1”“正常2”“正常3”的数据总计笔数"));
+assert.ok(skill.includes("bf.loan_contract.loan_balance_10k"));
 assert.ok(skill.includes("正常3 + 全部关注类"));
 assert.ok(skill.includes("Tool Flow"));
+
+const fieldRequirements = await readJson("field-requirements.json");
+assert.equal(fieldRequirements.dictionaryMode, "uploaded-table-dictionary-first");
+const requiredFields = Object.fromEntries(fieldRequirements.requiredFields.map((field) => [field.semantic, field]));
+assert.equal(requiredFields.contract_id.businessFieldId, "bf.loan_contract.contract_serial");
+assert.ok(requiredFields.contract_id.compatibleBusinessFieldIds.includes("credit.contract_id"));
+assert.equal(requiredFields.five_level_classification.businessFieldId, "bf.loan_contract.latest_risk");
+assert.ok(requiredFields.five_level_classification.compatibleBusinessFieldIds.includes("bf.loan_contract.latest_five_level_risk"));
+assert.equal(requiredFields.twelve_level_classification.businessFieldId, "bf.loan_contract.latest_risk_result");
+assert.equal(requiredFields.twelve_level_classification.physicalName, "latest_risk_result");
+assert.match(requiredFields.twelve_level_classification.purpose, /十二级分类/);
+assert.match(requiredFields.twelve_level_classification.purpose, /不得由 latest_risk 推断/);
+assert.equal(requiredFields.loan_balance.businessFieldId, "bf.loan_contract.loan_balance_10k");
+assert.equal(requiredFields.loan_balance.amountUnit, "ten_thousand_yuan");
+assert.equal(requiredFields.contract_amount.businessFieldId, "bf.loan_contract.contract_amount_10k");
 
 const template = await readText("report-template.md");
 for (const token of [
@@ -56,10 +82,16 @@ for (const token of [
 ]) {
   assert.ok(template.includes(token), `missing template token ${token}`);
 }
+assert.ok(template.includes("【笔数维度】"));
+assert.ok(template.includes("【金额维度】"));
+assert.ok(template.includes("【正常类维度】"));
+assert.ok(template.includes("含“正常1”“正常2”“正常3”的数据汇总总计笔数"));
 
 const inputSchema = await readJson("schemas/skill-input.schema.json");
 assert.equal(inputSchema.title, "OverallRiskClassificationSkillInput");
 assert.equal(inputSchema.additionalProperties, false);
+assert.equal(inputSchema.properties.fieldMapping.properties.contractId.$ref, "#/$defs/fieldMapping");
+assert.equal(inputSchema.properties.fieldMapping.properties.loanBalance.$ref, "#/$defs/amountFieldMapping");
 assert.deepEqual(inputSchema.properties.analysisOptions.properties.amountUnit.enum, [
   "yuan",
   "ten_thousand_yuan",
@@ -70,6 +102,8 @@ const reportSchema = await readJson("schemas/report-data.schema.json");
 assert.equal(reportSchema.title, "OverallRiskClassificationReportData");
 assert.ok(reportSchema.required.includes("artifactRefs"));
 assert.ok(reportSchema.required.includes("provenance"));
+assert.match(reportSchema.properties.analysisText.properties.normalInternalStructure.description, /正常类维度/);
+assert.match(reportSchema.properties.analysisText.properties.normalInternalStructure.description, /正常1/);
 assert.deepEqual(reportSchema.$defs.fiveLevelItem.properties.classification.enum, [
   "正常",
   "关注",

@@ -11,7 +11,7 @@ import { Switch } from "@astryxdesign/core/Switch";
 import { Text } from "@astryxdesign/core/Text";
 import { TextInput } from "@astryxdesign/core/TextInput";
 import { TopNav, TopNavHeading, TopNavItem, TopNavMenu } from "@astryxdesign/core/TopNav";
-import { UserCircle } from "lucide-react";
+import { UserCog } from "lucide-react";
 import type { AuthFailure } from "./auth";
 import { DataAssistantWorkspace } from "./DataAssistantWorkspace";
 import { DataManagementWorkspace } from "./DataManagementWorkspace";
@@ -554,7 +554,7 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
     openSettings("agent");
   };
 
-  const activateDataManagement = (action: DataSourceMenuAction = "open-database") => {
+  const activateDataManagement = (action: DataSourceMenuAction = "open-csv") => {
     if (!auth.permissions.includes("datasource:read")) {
       toast({
         type: "error",
@@ -572,10 +572,15 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
     setIsLogoutConfirmOpen(true);
   };
 
-  const confirmLogout = async () => {
-    setIsLogoutConfirmOpen(false);
+  const dismissSessionExpiredPrompt = () => {
     sessionExpiredPromptPhaseRef.current = "handled";
     setIsSessionExpiredConfirmOpen(false);
+    setIsSessionExpiredLogoutPending(false);
+  };
+
+  const confirmLogout = async () => {
+    setIsLogoutConfirmOpen(false);
+    dismissSessionExpiredPrompt();
     await auth.logout();
   };
 
@@ -583,13 +588,11 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
     if (sessionExpiredPromptPhaseRef.current === "logging-out" || sessionExpiredPromptPhaseRef.current === "handled") {
       return;
     }
-    sessionExpiredPromptPhaseRef.current = "logging-out";
     setIsSessionExpiredLogoutPending(true);
-    setIsSessionExpiredConfirmOpen(false);
+    dismissSessionExpiredPrompt();
     try {
       await auth.logout({ remote: false });
     } finally {
-      sessionExpiredPromptPhaseRef.current = "handled";
       setIsSessionExpiredLogoutPending(false);
     }
   };
@@ -648,12 +651,12 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
     const nextSettings =
       nextApiKey.length > 0
         ? {
-            ...settings,
-            configuration: {
-              ...settings.configuration,
-              apiKeyStatus: "configured" as const,
-            },
-          }
+          ...settings,
+          configuration: {
+            ...settings.configuration,
+            apiKeyStatus: "configured" as const,
+          },
+        }
         : settings;
 
     const cachedSettings = withLocalModelApiKeyStatus(nextSettings, nextApiKey.length > 0 || await hasLocalModelApiKey(auth.user));
@@ -735,18 +738,18 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
                 label="DataSource"
                 items={[
                   {
-                    title: "Database",
-                    description: "Database Connection",
-                    icon: <NavAssetIcon src={databaseIcon} size="lg" />,
-                    href: "#database",
-                    onClick: () => activateDataManagement("open-database"),
-                  },
-                  {
                     title: "CSV",
                     description: "Import CSV",
                     icon: <NavAssetIcon src={csvIcon} size="lg" />,
                     href: "#csv",
                     onClick: () => activateDataManagement("open-csv"),
+                  },
+                  {
+                    title: "Database",
+                    description: "Database Connection",
+                    icon: <NavAssetIcon src={databaseIcon} size="lg" />,
+                    href: "#database",
+                    onClick: () => activateDataManagement("open-database"),
                   },
                 ]}
               />
@@ -757,7 +760,7 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
           <Button
             label="Profile"
             variant="ghost"
-            icon={<UserCircle size={18} />}
+            icon={<UserCog size={24} />}
             isIconOnly
             className="workbench-profile-button"
             onClick={() => openSettings("profile")}

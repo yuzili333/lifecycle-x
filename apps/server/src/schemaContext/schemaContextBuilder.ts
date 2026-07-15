@@ -107,6 +107,7 @@ export class SchemaContextBuilder {
     const toolRequiredTasks = detectToolRequiredTasks(context.userQuestion);
     return [
       SCHEMA_CONTEXT_SYSTEM_INSTRUCTION,
+      "使用 businessFieldId 理解字段业务语义；生成 SQL 时必须使用对应 physicalName；生成页面标题、分析结论和报告内容时使用 displayNameZh。不得把 displayNameZh 直接作为 SQL 字段名，除非 physicalName 本身为中文。",
       context.purpose ? `当前任务目的：${context.purpose}` : undefined,
       toolRequiredTasks.length > 0 ? `检测到需要工具完成的任务类型：${toolRequiredTasks.join(", ")}。不要基于样例行直接给出全量结论。` : undefined,
       context.availableTools?.length ? `可用工具：${context.availableTools.map((tool) => tool.toolName).join(", ")}。` : undefined,
@@ -235,8 +236,8 @@ function renderTable(profile: DataSourceProfile, table: TableProfile) {
     table.description ? `说明：${table.description}` : undefined,
     `数据源：${profile.displayName}；估算行数：${table.rowCount ?? "--"}；字段数：${table.columnCount ?? table.columns.length}`,
     "",
-    "| 字段名 | 类型 | 推断类型 | 缺失率 | 唯一值 | 敏感等级 | 说明 |",
-    "|---|---|---|---:|---:|---|---|",
+    "| 物理字段 | 业务字段 ID | 中文名称 | 类型 | 逻辑类型 | 缺失率 | 唯一值 | 敏感等级 | 字段说明 |",
+    "|---|---|---|---|---|---:|---:|---|---|",
     ...table.columns.map(renderColumn),
     "",
     table.sampleRows?.length ? "样例行（已脱敏/截断，仅用于理解数据形态）：" : undefined,
@@ -248,7 +249,7 @@ function renderTable(profile: DataSourceProfile, table: TableProfile) {
 }
 
 function renderColumn(column: ColumnProfile) {
-  return `| ${column.columnName} | ${column.dataType} | ${column.inferredType ?? "--"} | ${percent(column.missingRate)} | ${column.uniqueCount ?? "--"} | ${column.sensitivity ?? "internal"} | ${column.businessMeaning ?? "--"} |`;
+  return `| ${column.physicalName ?? column.columnName} | ${column.businessFieldId ?? "--"} | ${column.displayNameZh ?? column.displayName ?? column.columnName} | ${column.dataType} | ${column.logicalType ?? column.inferredType ?? "--"} | ${percent(column.missingRate)} | ${column.uniqueCount ?? "--"} | ${column.sensitivity ?? "internal"} | ${column.fieldComment ?? column.businessMeaning ?? "--"} |`;
 }
 
 function percent(value?: number) {

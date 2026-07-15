@@ -48,6 +48,7 @@ export type AuthFailure = {
     traceId: string;
     fields?: Record<string, string>;
     remainingAttempts?: number;
+    detail?: unknown;
   };
 };
 

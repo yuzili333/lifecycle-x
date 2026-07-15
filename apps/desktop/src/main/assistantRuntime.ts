@@ -186,6 +186,14 @@ type CsvDatasetColumnRow = {
   name: string;
   sqlite_column_name: string;
   ordinal_index: number;
+  source_header?: string;
+  physical_name?: string;
+  business_field_id?: string;
+  display_name_zh?: string;
+  logical_type?: string;
+  mapping_status?: string;
+  field_comment?: string;
+  aliases_json?: string;
 };
 
 type ToolDetection = {
@@ -210,7 +218,11 @@ function selectedSkillSystemPrompt(skill: AssistantSkill | null | undefined) {
     "目标：基于用户选择的数据源，分析信贷资产五级和十二级风险分类的笔数、贷款余额、关注率、不良率、关注加不良率和正常3+关注类风险边界，并生成图表和 Markdown 报告。",
     "执行顺序：先确认数据源和字段映射；需要真实数据时调用 request_sql_query_execution；统计计算、分类标准化、占比和数据质量校验调用 request_python_analysis_execution；需要图表时调用 request_chart_rendering；完整报告调用 request_markdown_report_generation。",
     "SQL 和 Python 执行前必须遵守当前审批权限；不得绕过安全校验、权限校验或用户审批。",
-    "必需字段：合同唯一标识、五级分类、贷款余额。十二级分类和合同金额缺失时必须降级说明，不得伪造。",
+    "当用户说“根据/据选择的数据源生成报告”“生成一份整体风险分类分布报告”等新建报告请求时，必须重新进行意图识别并发起 SQL 查询和 Python 分析工具调用；不得直接返回最近一次或历史版本报告。",
+    "只有用户明确说“基于上一轮/刚才/已有报告/历史版本继续修改或查看”时，才允许复用最近报告 Artifact。",
+    "字段契约：优先使用上传表字典的 businessFieldId 理解字段，SQL 必须使用 BusinessFieldResolver 解析出的 physicalName，报告和结论使用 displayNameZh。",
+    "当前标准字典必需 businessFieldId：bf.loan_contract.contract_serial、bf.loan_contract.latest_risk、bf.loan_contract.loan_balance_10k。兼容风险字段：bf.loan_contract.latest_five_level_risk、credit.five_level_classification。可选：bf.loan_contract.latest_risk_result、bf.loan_contract.contract_amount_10k、bf.loan_contract.p_date、bf.loan_contract.branch_name、bf.loan_contract.product_name。",
+    "兼容旧字段：credit.contract_id、credit.five_level_classification、credit.loan_balance、credit.twelve_level_classification、credit.contract_amount。缺少合同唯一标识或五级分类时阻止完整执行；缺少贷款余额时仅允许笔数分析；缺少十二级分类或合同金额时必须降级说明，不得伪造。",
     "SQL 查询必须保留后续报告计算所需字段，优先读取明细样本后交由 Python 统一计算；除非用户只要求 SQL 聚合结果，否则不要只返回按风险分类聚合后的少量行。",
     "口径：不良类=次级+可疑+损失；关注加不良=关注+次级+可疑+损失；风险边界默认=正常3+全部关注类。",
     "报告必须区分笔数维度和金额维度，包含五级分类表、十二级分类明细、核心指标、图表引用、数据质量说明、计算口径和 Artifact 数据血缘。",
@@ -523,6 +535,25 @@ function isOverallRiskSkill(skill: AssistantSkill | null | undefined) {
   return skill === "overall-risk-classification-distribution";
 }
 
+export function shouldRouteSkillThroughModel(skill: AssistantSkill | null | undefined) {
+  return isOverallRiskSkill(skill);
+}
+
+export function shouldStartOverallRiskWorkflowAfterModelText(input: { skill?: AssistantSkill | null; prompt: string }, assistantContent: string) {
+  if (!isOverallRiskSkill(input.skill)) {
+    return false;
+  }
+  const combined = `${input.prompt}\n${assistantContent}`;
+  const asksForNewReport =
+    /(据|根据|基于|使用|利用).{0,16}(选择|所选|当前|已确认).{0,16}数据源.{0,24}(生成|输出|出具|形成|重新生成).{0,12}(整体风险分类分布)?报告/i.test(combined) ||
+    /(生成|输出|出具|形成|重新生成).{0,12}(一份)?整体风险分类分布(分析)?报告/i.test(combined);
+  if (!asksForNewReport) {
+    return false;
+  }
+  const explicitlyReferencesHistory = /(上一轮|上一次|刚才|已有报告|历史报告|历史版本|报告版本|基于此版本|沿用|复用|修改)/i.test(combined);
+  return !explicitlyReferencesHistory;
+}
+
 function parseAmountValue(value: unknown) {
   if (typeof value === "number" && Number.isFinite(value)) {
     return value;
@@ -540,9 +571,47 @@ function findColumnByPattern(rows: Array<Record<string, unknown>>, patterns: Reg
   return columns.find((column) => patterns.some((pattern) => pattern.test(column))) ?? null;
 }
 
+function looksLikeDateColumn(column: string) {
+  return /(^|[_\s.-])(date|time|dt|at)$|(^|[_\s.-])(date|time|dt|at)[_\s.-]|日期|时间|p_date|partition_date|classified_at/i.test(column);
+}
+
+function looksLikeDateValue(value: unknown) {
+  const text = String(value ?? "").trim();
+  return /^\d{4}[-/]?\d{2}[-/]?\d{2}(?:\s+\d{2}:\d{2}:\d{2})?$/.test(text);
+}
+
+function findRiskClassificationColumn(rows: Array<Record<string, unknown>>) {
+  const columns = Object.keys(rows[0] ?? {});
+  const scored = columns
+    .map((column) => {
+      if (looksLikeDateColumn(column)) {
+        return { column, score: 0 };
+      }
+      if (/^latest_risk$/i.test(column) || /bf\.loan_contract\.latest_risk/i.test(column) || /最新风险分类$/.test(column)) {
+        return { column, score: 220 };
+      }
+      if (/^five_level_classification$/i.test(column) || /^latest_five_level_risk$/i.test(column) || /credit\.five_level_classification/i.test(column) || /五级分类/.test(column)) {
+        return { column, score: 210 };
+      }
+      if (/risk.*class|risk_level|风险.*分类|风险等级/i.test(column)) {
+        return { column, score: 100 };
+      }
+      return { column, score: 0 };
+    })
+    .filter((item) => item.score > 0)
+    .sort((left, right) => right.score - left.score);
+  for (const candidate of scored) {
+    const sampleValues = rows.slice(0, 20).map((row) => row[candidate.column]).filter((value) => value !== null && value !== undefined && value !== "");
+    if (sampleValues.length === 0 || sampleValues.some((value) => !looksLikeDateValue(value))) {
+      return candidate.column;
+    }
+  }
+  return null;
+}
+
 function riskBucket(value: unknown) {
   const text = String(value ?? "").trim();
-  if (!text) {
+  if (!text || looksLikeDateValue(text)) {
     return "未分类";
   }
   if (/正常\s*[1１]/i.test(text)) {
@@ -553,6 +622,15 @@ function riskBucket(value: unknown) {
   }
   if (/正常\s*[3３]/i.test(text)) {
     return "正常3";
+  }
+  if (/关注\s*[1１]/i.test(text)) {
+    return "关注1";
+  }
+  if (/关注\s*[2２]/i.test(text)) {
+    return "关注2";
+  }
+  if (/关注\s*[3３]/i.test(text)) {
+    return "关注3";
   }
   if (/正常/i.test(text)) {
     return "正常";
@@ -569,6 +647,9 @@ function riskBucket(value: unknown) {
   if (/损失/i.test(text)) {
     return "损失";
   }
+  if (/不良/i.test(text)) {
+    return "不良";
+  }
   return text;
 }
 
@@ -582,13 +663,26 @@ function pctText(value: number, total: number) {
 
 export function buildOverallRiskDistributionMarkdown(rows: Array<Record<string, unknown>>, context: { title?: string; dataSourceLabel?: string | null; version?: number }) {
   const totalCount = rows.length;
-  const idColumn = findColumnByPattern(rows, [/合同.*(号|编号|id)/i, /借据/i, /loan.*id/i, /contract.*id/i, /^id$/i]);
-  const fiveRiskColumn = findColumnByPattern(rows, [/五级/i, /五.*分类/i, /风险.*分类/i, /risk.*class/i, /risk_level/i, /资产.*分类/i]);
-  const twelveRiskColumn = findColumnByPattern(rows, [/十二级/i, /12\s*级/i, /十二.*分类/i, /细分.*分类/i, /risk.*12/i]);
-  const balanceColumn = findColumnByPattern(rows, [/贷款余额/i, /本金余额/i, /余额/i, /balance/i, /amount/i, /金额/i]);
-  const contractAmountColumn = findColumnByPattern(rows, [/合同金额/i, /发放金额/i, /授信金额/i, /contract.*amount/i]);
+  const idColumn = findColumnByPattern(rows, [/^contract_id$/i, /^contract_serial$/i, /^contract_no$/i, /bf\.loan_contract\.contract_serial/i, /credit\.contract_id/i, /合同.*(号|编号|id|流水)/i, /借据/i, /loan.*id/i, /contract.*(id|serial|no)/i, /^id$/i]);
+  const fiveRiskColumn = findRiskClassificationColumn(rows);
+  const twelveRiskColumn = findColumnByPattern(rows, [
+    /^twelve_level_classification$/i,
+    /^latest_risk_result$/i,
+    /bf\.loan_contract\.latest_risk_result/i,
+    /credit\.twelve_level_classification/i,
+    /最新风险分类结果/i,
+    /当前风险分类结果/i,
+    /十二级/i,
+    /12\s*级/i,
+    /十二.*分类/i,
+    /细分.*分类/i,
+    /risk.*12/i,
+    /risk.*result/i,
+  ]);
+  const balanceColumn = findColumnByPattern(rows, [/^loan_balance$/i, /credit\.loan_balance/i, /贷款余额/i, /本金余额/i, /余额/i, /balance/i, /amount/i, /金额/i]);
+  const contractAmountColumn = findColumnByPattern(rows, [/^contract_amount$/i, /credit\.contract_amount/i, /合同金额/i, /发放金额/i, /授信金额/i, /contract.*amount/i]);
 
-  const fiveOrder = ["正常", "正常1", "正常2", "正常3", "关注", "次级", "可疑", "损失", "未分类"];
+  const fiveOrder = ["正常", "正常1", "正常2", "正常3", "关注", "不良", "次级", "可疑", "损失", "未分类"];
   const fiveStats = new Map<string, { count: number; amount: number }>();
   const twelveStats = new Map<string, { count: number; amount: number }>();
 
@@ -607,20 +701,32 @@ export function buildOverallRiskDistributionMarkdown(rows: Array<Record<string, 
   const totalAmount = Array.from(fiveStats.values()).reduce((sum, item) => sum + item.amount, 0);
   const attentionCount = Array.from(fiveStats.entries()).filter(([key]) => key.includes("关注")).reduce((sum, [, item]) => sum + item.count, 0);
   const attentionAmount = Array.from(fiveStats.entries()).filter(([key]) => key.includes("关注")).reduce((sum, [, item]) => sum + item.amount, 0);
-  const nonPerformingKeys = ["次级", "可疑", "损失"];
+  const nonPerformingKeys = ["不良", "次级", "可疑", "损失"];
   const nonPerformingCount = Array.from(fiveStats.entries()).filter(([key]) => nonPerformingKeys.some((risk) => key.includes(risk))).reduce((sum, [, item]) => sum + item.count, 0);
   const nonPerformingAmount = Array.from(fiveStats.entries()).filter(([key]) => nonPerformingKeys.some((risk) => key.includes(risk))).reduce((sum, [, item]) => sum + item.amount, 0);
   const boundaryCount = Array.from(fiveStats.entries()).filter(([key]) => key.includes("正常3") || key.includes("关注")).reduce((sum, [, item]) => sum + item.count, 0);
   const boundaryAmount = Array.from(fiveStats.entries()).filter(([key]) => key.includes("正常3") || key.includes("关注")).reduce((sum, [, item]) => sum + item.amount, 0);
   const orderedFive = [...fiveOrder.filter((key) => fiveStats.has(key)), ...Array.from(fiveStats.keys()).filter((key) => !fiveOrder.includes(key))];
   const orderedTwelve = Array.from(twelveStats.keys()).sort((a, b) => a.localeCompare(b, "zh-CN"));
+  const normalClassKeys = ["正常1", "正常2", "正常3"];
+  const normalClassCount = normalClassKeys.reduce((sum, key) => sum + (twelveStats.get(key)?.count ?? 0), 0);
+  const normalClassAmount = normalClassKeys.reduce((sum, key) => sum + (twelveStats.get(key)?.amount ?? 0), 0);
+  const normalClassBreakdown = normalClassKeys
+    .map((key) => `${key} ${twelveStats.get(key)?.count ?? 0} 笔`)
+    .join("、");
+  const topFive = orderedFive
+    .map((key) => ({ key, count: fiveStats.get(key)?.count ?? 0, amount: fiveStats.get(key)?.amount ?? 0 }))
+    .sort((left, right) => right.count - left.count)[0];
+  const topAmount = orderedFive
+    .map((key) => ({ key, count: fiveStats.get(key)?.count ?? 0, amount: fiveStats.get(key)?.amount ?? 0 }))
+    .sort((left, right) => right.amount - left.amount)[0];
 
   const qualityNotes = [
     idColumn ? `合同唯一标识字段：${idColumn}` : "未识别合同唯一标识字段，笔数按数据行数统计。",
     fiveRiskColumn ? `五级分类字段：${fiveRiskColumn}` : "未识别五级分类字段，分类统计将归入“未分类”。",
-    balanceColumn ? `贷款余额/金额字段：${balanceColumn}` : "未识别贷款余额字段，金额维度按 0 处理。",
+    balanceColumn ? `贷款余额(万元)字段：${balanceColumn}` : "未识别贷款余额(万元)字段，金额维度按 0 处理。",
     twelveRiskColumn ? `十二级分类字段：${twelveRiskColumn}` : "未识别十二级分类字段，十二级明细降级展示为空。",
-    contractAmountColumn ? `合同金额字段：${contractAmountColumn}` : "未识别合同金额字段，报告不展示合同金额维度。",
+    contractAmountColumn ? `合同金额(万元)字段：${contractAmountColumn}` : "未识别合同金额(万元)字段，报告不展示合同金额维度。",
   ];
 
   return [
@@ -629,11 +735,11 @@ export function buildOverallRiskDistributionMarkdown(rows: Array<Record<string, 
     "## 一、分析范围",
     `- 数据源：${context.dataSourceLabel || "用户选择数据源"}`,
     `- 样本笔数：${totalCount}`,
-    `- 贷款余额合计：${amountText(totalAmount)}`,
+    `- 贷款余额(万元)合计：${amountText(totalAmount)}`,
     `- 生成时间：${nowIso()}`,
     "",
     "## 二、整体风险分类分布（笔数+金额）",
-    "| 风险分类 | 笔数 | 笔数占比 | 贷款余额 | 金额占比 |",
+    "| 风险分类 | 笔数 | 笔数占比 | 贷款余额(万元) | 金额占比 |",
     "| --- | ---: | ---: | ---: | ---: |",
     ...orderedFive.map((key) => {
       const item = fiveStats.get(key) ?? { count: 0, amount: 0 };
@@ -648,13 +754,33 @@ export function buildOverallRiskDistributionMarkdown(rows: Array<Record<string, 
     `- 正常3+关注风险边界：${pctText(boundaryCount, totalCount)}（笔数），${pctText(boundaryAmount, totalAmount)}（金额）。`,
     "",
     "## 四、十二级分类明细",
-    orderedTwelve.length > 0 ? "| 十二级分类 | 笔数 | 笔数占比 | 贷款余额 | 金额占比 |\n| --- | ---: | ---: | ---: | ---: |" : "未识别十二级分类字段，本节不生成明细表。",
+    orderedTwelve.length > 0 ? "| 十二级分类 | 笔数 | 笔数占比 | 贷款余额(万元) | 金额占比 |\n| --- | ---: | ---: | ---: | ---: |" : "未识别十二级分类字段，本节不生成明细表。",
     ...orderedTwelve.map((key) => {
       const item = twelveStats.get(key) ?? { count: 0, amount: 0 };
       return `| ${key} | ${item.count} | ${pctText(item.count, totalCount)} | ${amountText(item.amount)} | ${pctText(item.amount, totalAmount)} |`;
     }),
     "",
-    "## 五、数据质量与口径说明",
+    "## 五、分析结论",
+    "",
+    "### 5.1 【笔数维度】",
+    topFive
+      ? `笔数维度下，${topFive.key}分类笔数最高，为 ${topFive.count} 笔，占样本 ${pctText(topFive.count, totalCount)}；关注加不良合计 ${attentionCount + nonPerformingCount} 笔，占样本 ${pctText(attentionCount + nonPerformingCount, totalCount)}。`
+      : "笔数维度暂无可用分类结论。",
+    "",
+    "### 5.2 【金额维度】",
+    topAmount
+      ? `金额维度下，${topAmount.key}分类贷款余额(万元)最高，为 ${amountText(topAmount.amount)}，占余额合计 ${pctText(topAmount.amount, totalAmount)}；不良金额率为 ${pctText(nonPerformingAmount, totalAmount)}。`
+      : "金额维度暂无可用分类结论。",
+    "",
+    "### 5.3 【正常类维度】",
+    twelveRiskColumn
+      ? `正常类维度口径为十二级分类 latest_risk_result 中含“正常1”“正常2”“正常3”的数据。该口径下正常类总计 ${normalClassCount} 笔，占样本 ${pctText(normalClassCount, totalCount)}，贷款余额(万元) ${amountText(normalClassAmount)}；内部结构为 ${normalClassBreakdown}。`
+      : "未识别十二级分类 latest_risk_result 字段，无法按“正常1/正常2/正常3”计算正常类维度。",
+    "",
+    "### 5.4 风险边界与迁徙风险",
+    `风险边界口径为正常3与关注类合并观察，当前风险边界 ${boundaryCount} 笔，占样本 ${pctText(boundaryCount, totalCount)}；无历史时点数据时仅提示潜在迁徙风险，不判断已发生迁徙。`,
+    "",
+    "## 六、数据质量与口径说明",
     ...qualityNotes.map((note) => `- ${note}`),
     "- 不良类口径：次级、可疑、损失。",
     "- 关注加不良口径：关注、次级、可疑、损失。",
@@ -815,7 +941,7 @@ export class AssistantRuntime {
     this.options.emit({ type: "message", conversationId: conversation.id, message: assistantMessage });
 
     const tool = detectTool(prompt);
-    if (await this.routeOverallRiskSkillWorkflow(input, conversation, assistantMessage)) {
+    if (!shouldRouteSkillThroughModel(input.skill) && await this.routeOverallRiskSkillWorkflow(input, conversation, assistantMessage)) {
       // Routed to the governed multi-step skill workflow.
     } else if (tool) {
       void this.handleToolCall(input, conversation, assistantMessage, tool);
@@ -1118,7 +1244,7 @@ export class AssistantRuntime {
       approvalMode: input.approvalMode,
     };
 
-    if (await this.routeOverallRiskSkillWorkflow(retryInput, nextConversation, assistantMessage)) {
+    if (!shouldRouteSkillThroughModel(retryInput.skill) && await this.routeOverallRiskSkillWorkflow(retryInput, nextConversation, assistantMessage)) {
       // Routed to the governed multi-step skill workflow.
     } else if (!(await this.routePriorSqlAnalysis(retryInput, nextConversation, assistantMessage))) {
       void this.streamModelResponse(retryInput, nextConversation, assistantMessage);
@@ -1521,7 +1647,49 @@ export class AssistantRuntime {
       "def pct(value, total):",
       "    return round(value * 100.0 / total, 2) if total else 0.0",
       "",
+      "def number(row, key):",
+      "    try:",
+      "        return float(row.get(key) or 0)",
+      "    except (TypeError, ValueError):",
+      "        return 0.0",
+      "",
+      "def pick_field(keys, candidates):",
+      "    risk_candidates = any('risk' in candidate.lower() or '分类' in candidate for candidate in candidates)",
+      "    lowered = {str(key).lower(): key for key in keys}",
+      "    for candidate in candidates:",
+      "        if candidate.lower() in lowered:",
+      "            matched = lowered[candidate.lower()]",
+      "            if not risk_candidates or not re.search(r'date|time|classified_at|日期|时间|p_date|partition_date', str(matched), re.I):",
+      "                return matched",
+      "    for key in keys:",
+      "        text = str(key).lower()",
+      "        if risk_candidates and re.search(r'date|time|classified_at|日期|时间|p_date|partition_date', str(key), re.I):",
+      "            continue",
+      "        if any(candidate.lower() in text for candidate in candidates):",
+      "            return key",
+      "    return None",
+      "",
+      "def five_bucket(value):",
+      "    text = str(value or '').strip()",
+      "    if '损失' in text:",
+      "        return '损失'",
+      "    if '可疑' in text:",
+      "        return '可疑'",
+      "    if '次级' in text:",
+      "        return '次级'",
+      "    if '关注' in text:",
+      "        return '关注'",
+      "    if '正常' in text:",
+      "        return '正常'",
+      "    if '不良' in text:",
+      "        return '不良'",
+      "    return text or '未分类'",
+      "",
       "total_rows = len(rows)",
+      "keys = set(rows[0].keys()) if rows else set()",
+      "raw_risk_field = pick_field(keys, ['five_level_classification', 'latest_risk', 'latest_five_level_risk', 'latest_five_level_risk_class', 'risk_classification', 'risk_level', '最新风险分类', '五级分类', '最新风险五级分类'])",
+      "raw_balance_field = pick_field(keys, ['loan_balance_10k', 'loan_balance', 'balance', '贷款余额(万元)', '贷款余额', '本金余额'])",
+      "raw_amount_field = pick_field(keys, ['contract_amount_10k', 'contract_amount', '合同金额(万元)', '合同金额', '授信金额'])",
       "term_field = 'loan_term_type'",
       "branch_field = 'branch_name'",
       "preferred_terms = ['短期', '中期', '长期']",
@@ -1546,9 +1714,9 @@ export class AssistantRuntime {
       "    total_balance = sum(number(row, 'total_balance') for row in rows)",
       "    total_amount = sum(number(row, 'total_amount') for row in rows)",
       "    lines.append('## 整体风险分类分布（笔数+金额）')",
-      "    lines.append('| 风险分类 | 笔数 | 笔数占比 | 贷款余额 | 余额占比 | 合同金额 | 金额占比 |')",
+      "    lines.append('| 风险分类 | 笔数 | 笔数占比 | 贷款余额(万元) | 余额占比 | 合同金额(万元) | 金额占比 |')",
       "    lines.append('|---|---:|---:|---:|---:|---:|---:|')",
-      "    risk_order = {'正常': 1, '关注': 2, '次级': 3, '可疑': 4, '损失': 5}",
+      "    risk_order = {'正常': 1, '关注': 2, '不良': 3, '次级': 4, '可疑': 5, '损失': 6}",
       "    ordered_rows = sorted(rows, key=lambda row: risk_order.get(str(row.get('five_level') or ''), 99))",
       "    for row in ordered_rows:",
       "        count = int(number(row, 'contract_count'))",
@@ -1557,9 +1725,9 @@ export class AssistantRuntime {
       "        lines.append(f\"| {row.get('five_level') or '--'} | {count} | {pct(count, total_count)}% | {round(balance, 2)} | {pct(balance, total_balance)}% | {round(amount, 2)} | {pct(amount, total_amount)}% |\")",
       "    lines.append(f\"| 合计 | {total_count} | 100.0% | {round(total_balance, 2)} | {100.0 if total_balance else 0.0}% | {round(total_amount, 2)} | {100.0 if total_amount else 0.0}% |\")",
       "    attention_count = sum(int(number(row, 'contract_count')) for row in rows if '关注' in str(row.get('five_level') or ''))",
-      "    npl_count = sum(int(number(row, 'contract_count')) for row in rows if any(key in str(row.get('five_level') or '') for key in ['次级', '可疑', '损失']))",
+      "    npl_count = sum(int(number(row, 'contract_count')) for row in rows if any(key in str(row.get('five_level') or '') for key in ['不良', '次级', '可疑', '损失']))",
       "    attention_balance = sum(number(row, 'total_balance') for row in rows if '关注' in str(row.get('five_level') or ''))",
-      "    npl_balance = sum(number(row, 'total_balance') for row in rows if any(key in str(row.get('five_level') or '') for key in ['次级', '可疑', '损失']))",
+      "    npl_balance = sum(number(row, 'total_balance') for row in rows if any(key in str(row.get('five_level') or '') for key in ['不良', '次级', '可疑', '损失']))",
       "    lines.append('')",
       "    lines.append('## 核心风险指标')",
       "    lines.append(f'- 关注类占比：{pct(attention_count, total_count)}%（笔数），{pct(attention_balance, total_balance)}%（余额）。')",
@@ -1567,7 +1735,40 @@ export class AssistantRuntime {
       "    lines.append(f'- 关注+不良占比：{pct(attention_count + npl_count, total_count)}%（笔数），{pct(attention_balance + npl_balance, total_balance)}%（余额）。')",
       "    lines.append('')",
       "    lines.append('## 数据质量与口径说明')",
-      "    lines.append('- 本次 SQL 已返回风险分类聚合结果，报告基于聚合结果计算，不再要求 loan_term_type 或 branch_name 明细字段。')",
+      "    lines.append('- 本次 SQL 已返回风险分类聚合结果，报告基于聚合结果计算。')",
+      "    lines.append('- 不良类口径：次级、可疑、损失；关注加不良口径：关注、次级、可疑、损失。')",
+      "elif raw_risk_field and (raw_balance_field or raw_amount_field):",
+      "    stats = defaultdict(lambda: {'count': 0, 'balance': 0.0, 'amount': 0.0})",
+      "    for row in rows:",
+      "        bucket = five_bucket(row.get(raw_risk_field))",
+      "        stats[bucket]['count'] += 1",
+      "        if raw_balance_field:",
+      "            stats[bucket]['balance'] += number(row, raw_balance_field)",
+      "        if raw_amount_field:",
+      "            stats[bucket]['amount'] += number(row, raw_amount_field)",
+      "    total_count = sum(item['count'] for item in stats.values())",
+      "    total_balance = sum(item['balance'] for item in stats.values())",
+      "    total_amount = sum(item['amount'] for item in stats.values())",
+      "    risk_order = {'正常': 1, '关注': 2, '不良': 3, '次级': 4, '可疑': 5, '损失': 6, '未分类': 99}",
+      "    ordered = sorted(stats.items(), key=lambda item: risk_order.get(item[0], 50))",
+      "    lines.append('## 整体风险分类分布（笔数+金额）')",
+      "    lines.append('| 风险分类 | 笔数 | 笔数占比 | 贷款余额(万元) | 余额占比 | 合同金额(万元) | 金额占比 |')",
+      "    lines.append('|---|---:|---:|---:|---:|---:|---:|')",
+      "    for bucket, item in ordered:",
+      "        lines.append(f\"| {bucket} | {item['count']} | {pct(item['count'], total_count)}% | {round(item['balance'], 2)} | {pct(item['balance'], total_balance)}% | {round(item['amount'], 2)} | {pct(item['amount'], total_amount)}% |\")",
+      "    lines.append(f\"| 合计 | {total_count} | 100.0% | {round(total_balance, 2)} | {100.0 if total_balance else 0.0}% | {round(total_amount, 2)} | {100.0 if total_amount else 0.0}% |\")",
+      "    attention_count = stats.get('关注', {}).get('count', 0)",
+      "    npl_count = sum(stats.get(key, {}).get('count', 0) for key in ['不良', '次级', '可疑', '损失'])",
+      "    attention_balance = stats.get('关注', {}).get('balance', 0.0)",
+      "    npl_balance = sum(stats.get(key, {}).get('balance', 0.0) for key in ['不良', '次级', '可疑', '损失'])",
+      "    lines.append('')",
+      "    lines.append('## 核心风险指标')",
+      "    lines.append(f'- 关注类占比：{pct(attention_count, total_count)}%（笔数），{pct(attention_balance, total_balance)}%（余额）。')",
+      "    lines.append(f'- 不良率：{pct(npl_count, total_count)}%（笔数），{pct(npl_balance, total_balance)}%（余额）。')",
+      "    lines.append(f'- 关注+不良占比：{pct(attention_count + npl_count, total_count)}%（笔数），{pct(attention_balance + npl_balance, total_balance)}%（余额）。')",
+      "    lines.append('')",
+      "    lines.append('## 数据质量与口径说明')",
+      "    lines.append(f'- 风险分类字段：{raw_risk_field}；贷款余额(万元)字段：{raw_balance_field or \"未提供\"}；合同金额(万元)字段：{raw_amount_field or \"未提供\"}。')",
       "    lines.append('- 不良类口径：次级、可疑、损失；关注加不良口径：关注、次级、可疑、损失。')",
       "elif 'accounting_org_name' in rows[0] and 'latest_risk_result' in rows[0] and ('柱状图' in question or '条形图' in question or '图表' in question or '可视化' in question or '报告' in question):",
       "    branch_field = 'accounting_org_name'",
@@ -1791,7 +1992,7 @@ export class AssistantRuntime {
       "        lines.append('- 中期与长期高占比分行存在差异，建议分别从区域行业集中度、客户结构和授信期限配置进行对比复核。')",
       "else:",
       "    lines.append('## 数据概览')",
-      "    lines.append('上一轮 SQL 工具结果未同时包含 loan_term_type 与 branch_name 字段，无法按指定维度完成统计。')",
+      "    lines.append('上一轮 SQL 工具结果未识别到整体风险分类分布所需字段组合，无法直接生成笔数与金额分布。请确认 SQL 至少返回风险分类字段以及 loan_balance_10k 或 contract_amount_10k。')",
       "    lines.append('')",
       "    lines.append('| 字段 | 非空样本数 | 去重值数量 |')",
       "    lines.append('|---|---:|---:|')",
@@ -1952,9 +2153,13 @@ export class AssistantRuntime {
     const preparedViews: string[] = [];
 
     for (const dataset of datasets) {
+      const datasetColumnInfo = this.db
+        .prepare(`pragma ${alias}.table_info(csv_dataset_columns)`)
+        .all() as Array<{ name: string }>;
+      const hasColumnMeta = (name: string) => datasetColumnInfo.some((column) => column.name === name);
       const columns = this.db
         .prepare(
-          `select name, sqlite_column_name, ordinal_index
+          `select name, sqlite_column_name, ordinal_index${hasColumnMeta("physical_name") ? ", physical_name" : ""}${hasColumnMeta("business_field_id") ? ", business_field_id" : ""}${hasColumnMeta("display_name_zh") ? ", display_name_zh" : ""}
            from ${quoteIdentifier(alias)}.csv_dataset_columns
            where data_source_id = ?
            order by ordinal_index`,
@@ -2277,23 +2482,27 @@ export class AssistantRuntime {
 
     const planId = `skill_${randomUUID()}`;
     const sql = this.defaultSqlForSkillWorkflow(input);
+    const existingContent = assistantMessage.content.trim();
+    const planContent = [
+      "已识别 Skill 工作流：整体风险分类分布（笔数+金额）。",
+      "",
+      "执行计划：",
+      "1. 查询用户选择数据源，获取风险分类分析样本。",
+      "2. 计算五级/十二级分类笔数、金额及核心风险指标。",
+      "3. 按模板生成完整 Markdown 报告，并登记报告版本。",
+    ].join("\n");
+    const planBlocksContent = [
+      existingContent,
+      "## 智能体工作流",
+      "",
+      "- 状态：已完成意图识别，正在创建工具执行计划。",
+      "- 计划：SQL 查询 -> Python 分析 -> Markdown 报告生成。",
+      `- 审批模式：${input.approvalMode}`,
+    ].filter(Boolean).join("\n\n");
     const started = this.updateMessage(assistantMessage.id, {
       status: "processing",
-      content: [
-        "已识别 Skill 工作流：整体风险分类分布（笔数+金额）。",
-        "",
-        "执行计划：",
-        "1. 查询用户选择数据源，获取风险分类分析样本。",
-        "2. 计算五级/十二级分类笔数、金额及核心风险指标。",
-        "3. 按模板生成完整 Markdown 报告，并登记报告版本。",
-      ].join("\n"),
-      blocks: parseAssistantBlocks([
-        "## 智能体工作流",
-        "",
-        "- 状态：已完成意图识别，正在创建工具执行计划。",
-        "- 计划：SQL 查询 -> Python 分析 -> Markdown 报告生成。",
-        `- 审批模式：${input.approvalMode}`,
-      ].join("\n")),
+      content: [existingContent, planContent].filter(Boolean).join("\n\n"),
+      blocks: parseAssistantBlocks(planBlocksContent),
     });
     this.options.emit({ type: "message", conversationId: conversation.id, message: started });
 
@@ -2349,10 +2558,17 @@ export class AssistantRuntime {
     await this.emitToolState(conversation.id);
 
     if (input.approvalMode === "no_access") {
+      const blockedContent = "当前审批权限为“禁止访问权限”，整体风险分类分布工作流已被拦截。";
+      const blockedBlocksContent = [
+        existingContent,
+        "## 工作流已阻断",
+        "",
+        "当前审批权限禁止执行数据查询和分析工具。",
+      ].filter(Boolean).join("\n\n");
       const blocked = this.updateMessage(assistantMessage.id, {
         status: "error",
-        content: "当前审批权限为“禁止访问权限”，整体风险分类分布工作流已被拦截。",
-        blocks: parseAssistantBlocks("## 工作流已阻断\n\n当前审批权限禁止执行数据查询和分析工具。"),
+        content: [existingContent, blockedContent].filter(Boolean).join("\n\n"),
+        blocks: parseAssistantBlocks(blockedBlocksContent),
         errorMessage: "工具调用被权限策略拦截。",
       });
       this.options.emit({ type: "message", conversationId: conversation.id, message: blocked });
@@ -2360,10 +2576,17 @@ export class AssistantRuntime {
     }
 
     if (input.approvalMode === "request_approval") {
+      const waitingContent = "整体风险分类分布工作流已创建，SQL 查询等待审批。";
+      const waitingBlocksContent = [
+        existingContent,
+        "## 工作流等待审批",
+        "",
+        "已创建 SQL 查询、Python 分析、报告生成三步工具计划。请先批准 SQL 查询。",
+      ].filter(Boolean).join("\n\n");
       const waiting = this.updateMessage(assistantMessage.id, {
         status: "awaiting_approval",
-        content: "整体风险分类分布工作流已创建，SQL 查询等待审批。",
-        blocks: parseAssistantBlocks("## 工作流等待审批\n\n已创建 SQL 查询、Python 分析、报告生成三步工具计划。请先批准 SQL 查询。"),
+        content: [existingContent, waitingContent].filter(Boolean).join("\n\n"),
+        blocks: parseAssistantBlocks(waitingBlocksContent),
       });
       this.options.emit({ type: "message", conversationId: conversation.id, message: waiting });
       return true;
@@ -2723,10 +2946,198 @@ export class AssistantRuntime {
   private defaultSqlForSkillWorkflow(input: Pick<AssistantSendInput, "dataSourceId" | "dataSourceLabel">) {
     const csvViewName = input.dataSourceId ? this.csvViewNameForDataSource(input.dataSourceId) : null;
     if (csvViewName) {
-      return `select * from ${quoteIdentifier(csvViewName)}`;
+      const resolved = input.dataSourceId ? this.resolveOverallRiskCsvFields(input.dataSourceId) : null;
+      if (resolved?.ready && resolved.fields.length > 0) {
+        const selectList = resolved.fields
+          .map((field) => `${quoteIdentifier(field.physicalName)} as ${quoteIdentifier(field.aliasName)}`)
+          .join(", ");
+        return `select ${selectList} from ${quoteIdentifier(csvViewName)}`;
+      }
+      const missingText = resolved?.missingRequiredFields.length
+        ? resolved.missingRequiredFields.map((field) => `${field.displayNameZh}(${field.businessFieldId})`).join(", ")
+        : "业务字段映射";
+      return `select * from ${quoteIdentifier(csvViewName)} /* BusinessFieldResolver 未就绪：缺少 ${missingText}。请检查表字典 business_field_id 映射。 */`;
     }
     const labelName = input.dataSourceLabel?.split("/")[0]?.trim();
     return `select * from ${quoteIdentifier(labelName || "数据源")}`;
+  }
+
+  private resolveOverallRiskCsvFields(dataSourceId: string) {
+    const fields = [
+      { semantic: "contract_id", displayNameZh: "合同流水号", aliasName: "contract_id", required: true },
+      { semantic: "five_level_classification", displayNameZh: "最新风险分类", aliasName: "five_level_classification", required: true },
+      { semantic: "twelve_level_classification", displayNameZh: "最新风险分类结果", aliasName: "twelve_level_classification", required: false },
+      { semantic: "loan_balance", displayNameZh: "贷款余额(万元)", aliasName: "loan_balance", required: true },
+      { semantic: "contract_amount", displayNameZh: "合同金额(万元)", aliasName: "contract_amount", required: false },
+    ];
+    const columns = this.csvSemanticColumnsForDataSource(dataSourceId);
+    const resolvedFields: Array<(typeof fields)[number] & { physicalName: string }> = [];
+    const missingRequiredFields: Array<{ businessFieldId: string; displayNameZh: string }> = [];
+    const ambiguousFields: Array<{ businessFieldId: string; count: number }> = [];
+    for (const field of fields) {
+      const scoredCandidates = columns
+        .map((column) => ({ column, score: this.scoreOverallRiskColumn(column, field.semantic) }))
+        .filter((candidate) => candidate.score > 0)
+        .sort((left, right) => right.score - left.score);
+      const bestScore = scoredCandidates[0]?.score ?? 0;
+      const candidates = scoredCandidates.filter((candidate) => candidate.score === bestScore);
+      if (candidates.length > 0) {
+        const exactPrimary = candidates.find((candidate) => candidate.column.business_field_id === this.primaryOverallRiskBusinessFieldId(field.semantic));
+        const column = exactPrimary?.column ?? candidates[0].column;
+        resolvedFields.push({ ...field, physicalName: column.physical_name || column.name });
+      } else if (field.required) {
+        missingRequiredFields.push({ businessFieldId: field.semantic, displayNameZh: field.displayNameZh });
+      }
+    }
+    return {
+      ready: missingRequiredFields.length === 0 && ambiguousFields.length === 0,
+      fields: resolvedFields,
+      missingRequiredFields,
+      ambiguousFields,
+    };
+  }
+
+  private primaryOverallRiskBusinessFieldId(semantic: string) {
+    switch (semantic) {
+      case "contract_id":
+        return "bf.loan_contract.contract_serial";
+      case "five_level_classification":
+        return "bf.loan_contract.latest_risk";
+      case "twelve_level_classification":
+        return "bf.loan_contract.latest_risk_result";
+      case "loan_balance":
+        return "bf.loan_contract.loan_balance_10k";
+      case "contract_amount":
+        return "bf.loan_contract.contract_amount_10k";
+      default:
+        return "";
+    }
+  }
+
+  private scoreOverallRiskColumn(column: CsvDatasetColumnRow, semantic: string) {
+    const text = [
+      column.business_field_id,
+      column.name,
+      column.physical_name,
+      column.display_name_zh,
+      column.source_header,
+      column.field_comment,
+      ...parseCsvAliasJson(column.aliases_json),
+    ]
+      .filter(Boolean)
+      .join("\n")
+      .toLowerCase();
+    const has = (...patterns: RegExp[]) => patterns.some((pattern) => pattern.test(text));
+    const businessFieldId = (column.business_field_id ?? "").trim();
+    if (
+      ["date", "datetime", "timestamp"].includes(String(column.logical_type ?? "").toLowerCase()) ||
+      looksLikeDateColumn(column.business_field_id ?? "") ||
+      looksLikeDateColumn(column.name) ||
+      looksLikeDateColumn(column.physical_name ?? "") ||
+      looksLikeDateColumn(column.display_name_zh ?? "")
+    ) {
+      return 0;
+    }
+    if (semantic === "contract_id") {
+      if (businessFieldId === "bf.loan_contract.contract_serial") {
+        return 230;
+      }
+      if (businessFieldId === "bf.loan_contract.contract_no") {
+        return 220;
+      }
+      if (businessFieldId === "credit.contract_id") {
+        return 210;
+      }
+      if (has(/customer[_\s-]*id|客户/)) {
+        return 0;
+      }
+      if (has(/contract[_\s-]*(serial|id|no|number)|loan[_\s-]*contract|借据|合同.*(流水|编号|号)|业务编号/)) {
+        return 100;
+      }
+      return 0;
+    }
+    if (semantic === "five_level_classification") {
+      if (businessFieldId === "bf.loan_contract.latest_risk") {
+        return 230;
+      }
+      if (businessFieldId === "bf.loan_contract.latest_five_level_risk") {
+        return 220;
+      }
+      if (businessFieldId === "credit.five_level_classification") {
+        return 210;
+      }
+      if (has(/twelve|12[_\s-]*level|sub[_\s-]*risk|risk[_\s-]*sub|十二|细分|分类结果/)) {
+        return 0;
+      }
+      if (has(/^latest[_\s-]*risk$|最新风险分类$/)) {
+        return 120;
+      }
+      if (has(/five[_\s-]*level|5[_\s-]*level|risk[_\s-]*class(?!ified)|latest[_\s-]*risk[_\s-]*class(?!ified)|五级|风险分类(?!时间)|风险等级/)) {
+        return 100;
+      }
+      return 0;
+    }
+    if (semantic === "twelve_level_classification") {
+      if (businessFieldId === "bf.loan_contract.latest_risk_result") {
+        return 230;
+      }
+      if (businessFieldId === "bf.loan_contract.year_start_risk_detail") {
+        return 220;
+      }
+      if (businessFieldId === "credit.twelve_level_classification") {
+        return 210;
+      }
+      if (has(/twelve|12[_\s-]*level|sub[_\s-]*risk|risk[_\s-]*sub|latest[_\s-]*risk[_\s-]*result|十二|细分|分类结果/)) {
+        return 100;
+      }
+      return 0;
+    }
+    if (semantic === "loan_balance") {
+      if (businessFieldId === "bf.loan_contract.loan_balance_10k" || businessFieldId === "credit.loan_balance") {
+        return 200;
+      }
+      if (has(/contract[_\s-]*amount|loan[_\s-]*amount|合同金额|授信金额|借款金额/)) {
+        return 0;
+      }
+      if (has(/loan[_\s-]*balance|outstanding[_\s-]*balance|current[_\s-]*balance|本金余额|贷款余额|当前余额|未偿余额/)) {
+        return 100;
+      }
+      return 0;
+    }
+    if (semantic === "contract_amount") {
+      if (businessFieldId === "bf.loan_contract.contract_amount_10k" || businessFieldId === "credit.contract_amount") {
+        return 200;
+      }
+      if (has(/balance|余额/)) {
+        return 0;
+      }
+      if (has(/contract[_\s-]*amount|loan[_\s-]*amount|合同金额|授信金额|借款金额/)) {
+        return 100;
+      }
+      return 0;
+    }
+    return 0;
+  }
+
+  private csvSemanticColumnsForDataSource(dataSourceId: string) {
+    if (!existsSync(this.options.csvSqlitePath)) {
+      return [] as CsvDatasetColumnRow[];
+    }
+    const alias = "csvdata";
+    const databases = this.db.prepare("pragma database_list").all() as Array<{ name: string; file: string }>;
+    if (!databases.some((database) => database.name === alias)) {
+      this.db.prepare(`attach database ? as ${quoteIdentifier(alias)}`).run(this.options.csvSqlitePath);
+    }
+    const columnsInfo = this.db.prepare(`pragma ${alias}.table_info(csv_dataset_columns)`).all() as Array<{ name: string }>;
+    const hasColumn = (name: string) => columnsInfo.some((column) => column.name === name);
+    return this.db
+      .prepare(
+        `select name, sqlite_column_name, ordinal_index${hasColumn("source_header") ? ", source_header" : ""}${hasColumn("physical_name") ? ", physical_name" : ""}${hasColumn("business_field_id") ? ", business_field_id" : ""}${hasColumn("display_name_zh") ? ", display_name_zh" : ""}${hasColumn("logical_type") ? ", logical_type" : ""}${hasColumn("mapping_status") ? ", mapping_status" : ""}${hasColumn("field_comment") ? ", field_comment" : ""}${hasColumn("aliases_json") ? ", aliases_json" : ""}
+         from ${quoteIdentifier(alias)}.csv_dataset_columns
+         where data_source_id = ?
+         order by ordinal_index`,
+      )
+      .all(dataSourceId) as CsvDatasetColumnRow[];
   }
 
   private csvViewNameForDataSource(dataSourceId: string) {
@@ -3467,6 +3878,7 @@ export class AssistantRuntime {
     this.abortControllers.set(assistantMessage.id, controller);
     let content = "";
     let providerTraceId = `trace_${assistantMessage.id}`;
+    let providerToolActivity = false;
 
     try {
       const adapter = createStreamingModelAdapter({
@@ -3476,7 +3888,9 @@ export class AssistantRuntime {
         model: input.modelName,
         toolExecutionMode: "serial",
       });
-      for (const tool of this.createAssistantRuntimeToolDefinitions(input, conversation, assistantMessage)) {
+      for (const tool of this.createAssistantRuntimeToolDefinitions(input, conversation, assistantMessage, () => {
+        providerToolActivity = true;
+      })) {
         adapter.registerTool(tool);
       }
       const providerMessages = await this.buildProviderMessages(input.userId, conversation.id, input.prompt, input.dataSourceLabel, input.schemaContextMarkdown, input.skill, input.approvalMode);
@@ -3516,6 +3930,7 @@ export class AssistantRuntime {
           continue;
         }
         if (event.type === "tool-call-start" || event.type === "tool-execution-start") {
+          providerToolActivity = true;
           const current = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(assistantMessage.id));
           const updated = this.updateMessage(assistantMessage.id, {
             status: "processing",
@@ -3539,11 +3954,16 @@ export class AssistantRuntime {
         providerTraceId,
       });
       this.options.emit({ type: "message", conversationId: conversation.id, message: completed });
-      await this.registerAssistantGeneratedArtifacts(input, completed);
 
       const tool = detectToolFromAssistantOutput(content);
-      if (tool) {
+      const shouldStartSkillWorkflow = !providerToolActivity && shouldStartOverallRiskWorkflowAfterModelText(input, content);
+      if (!shouldStartSkillWorkflow) {
+        await this.registerAssistantGeneratedArtifacts(input, completed);
+      }
+      if (tool && !shouldStartSkillWorkflow) {
         await this.handleToolCall(input, conversation, completed, tool, { appendToMessage: true });
+      } else if (shouldStartSkillWorkflow) {
+        await this.routeOverallRiskSkillWorkflow(input, conversation, completed);
       }
     } catch (error) {
       const aborted = controller.signal.aborted;
@@ -3564,35 +3984,50 @@ export class AssistantRuntime {
     }
   }
 
-  private createAssistantRuntimeToolDefinitions(input: AssistantSendInput, conversation: AssistantConversation, assistantMessage: AssistantMessage): ToolDefinition[] {
+  private createAssistantRuntimeToolDefinitions(input: AssistantSendInput, conversation: AssistantConversation, assistantMessage: AssistantMessage, markProviderToolActivity: () => void): ToolDefinition[] {
+    if (isOverallRiskSkill(input.skill)) {
+      return [];
+    }
     return [
       {
         name: TOOL_NAMES.sql_query,
         description: "请求执行受控只读 SQL 查询。必须提供只读 SQL 候选语句，系统会进行安全校验并按用户审批权限处理。",
         inputSchema: TOOL_SCHEMAS.sql_query,
         riskLevel: "high",
-        handler: async (request, context) => this.handleModelSqlTool(request as Record<string, unknown>, input, conversation, assistantMessage, context.toolCallId),
+        handler: async (request, context) => {
+          markProviderToolActivity();
+          return this.handleModelSqlTool(request as Record<string, unknown>, input, conversation, assistantMessage, context.toolCallId);
+        },
       },
       {
         name: TOOL_NAMES.python_analysis,
         description: "请求执行受控 Python 数据分析。优先使用会话最新 SQL/Workflow 数据集作为输入；如提供 script，系统会按用户审批权限处理。",
         inputSchema: TOOL_SCHEMAS.python_analysis,
         riskLevel: "high",
-        handler: async (request, context) => this.handleModelPythonTool(request as Record<string, unknown>, input, conversation, assistantMessage, context.toolCallId),
+        handler: async (request, context) => {
+          markProviderToolActivity();
+          return this.handleModelPythonTool(request as Record<string, unknown>, input, conversation, assistantMessage, context.toolCallId);
+        },
       },
       {
         name: TOOL_NAMES.chart_rendering,
         description: "请求登记受控 VisualizationSpec 图表 Artifact。图表数据必须来自已授权结果或可信小型 inline rows。",
         inputSchema: TOOL_SCHEMAS.chart_rendering,
         riskLevel: "medium",
-        handler: async (request, context) => this.handleModelChartTool(request as Record<string, unknown>, input, assistantMessage, context.toolCallId),
+        handler: async (request, context) => {
+          markProviderToolActivity();
+          return this.handleModelChartTool(request as Record<string, unknown>, input, assistantMessage, context.toolCallId);
+        },
       },
       {
         name: TOOL_NAMES.report_generation,
         description: "请求登记 Markdown 报告 Artifact。报告必须基于会话工具结果和 Artifact 摘要，不得伪造数据。",
         inputSchema: TOOL_SCHEMAS.report_generation,
         riskLevel: "low",
-        handler: async (request, context) => this.handleModelReportTool(request as Record<string, unknown>, input, assistantMessage, context.toolCallId),
+        handler: async (request, context) => {
+          markProviderToolActivity();
+          return this.handleModelReportTool(request as Record<string, unknown>, input, assistantMessage, context.toolCallId);
+        },
       },
     ];
   }

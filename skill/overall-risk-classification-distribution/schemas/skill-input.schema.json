@@ -15,24 +15,20 @@
       "additionalProperties": false,
       "properties": {
         "contractId": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/$defs/fieldMapping"
         },
         "fiveLevelClassification": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/$defs/fieldMapping"
         },
         "twelveLevelClassification": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/$defs/fieldMapping",
+          "description": "业务术语“十二级分类”的字段映射，必须对应表字典字段“最新风险分类结果 latest_risk_result”。"
         },
         "loanBalance": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/$defs/amountFieldMapping"
         },
         "contractAmount": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/$defs/amountFieldMapping"
         }
       }
     },
@@ -203,5 +199,62 @@
         ]
       }
     }
-  ]
+  ],
+  "$defs": {
+    "fieldMapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "businessFieldId",
+        "physicalName",
+        "displayNameZh"
+      ],
+      "properties": {
+        "businessFieldId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "physicalName": {
+          "type": "string",
+          "minLength": 1
+        },
+        "displayNameZh": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "amountFieldMapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "businessFieldId",
+        "physicalName",
+        "displayNameZh"
+      ],
+      "properties": {
+        "businessFieldId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "physicalName": {
+          "type": "string",
+          "minLength": 1
+        },
+        "displayNameZh": {
+          "type": "string",
+          "minLength": 1
+        },
+        "amountUnit": {
+          "type": "string",
+          "enum": [
+            "yuan",
+            "ten_thousand_yuan",
+            "hundred_million_yuan"
+          ],
+          "default": "ten_thousand_yuan"
+        }
+      }
+    }
+  }
 }

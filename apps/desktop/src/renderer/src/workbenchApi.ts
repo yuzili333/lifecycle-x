@@ -89,6 +89,18 @@ export type DatabaseColumn = {
   sensitive: boolean;
   largeField: boolean;
   comment: string;
+  sourceHeader?: string;
+  physicalName?: string;
+  businessFieldId?: string;
+  displayNameZh?: string;
+  displayNameEn?: string;
+  logicalType?: string;
+  sqliteType?: string;
+  fieldComment?: string;
+  aliases?: string[];
+  mappingSource?: string;
+  mappingConfidence?: number;
+  mappingStatus?: string;
 };
 
 export type DatabaseIndex = {
@@ -335,13 +347,14 @@ export const workbenchApi = {
     });
   },
 
-  importCsv(accessToken: string, fileId: string) {
+  importCsv(accessToken: string, fileId: string, dictionaryFileId: string, validationMode: "strict" | "quarantine" = "strict") {
     return request<{
       success: true;
-      job: { id: string; status: "completed"; importedTableId: string; dataSourceId: string; importedRows: number };
+      job: { id: string; status: "completed" | "completed_with_warnings"; importedTableId: string; dataSourceId: string; importedRows: number; invalidRows?: number };
     }>(`/csv/files/${encodeURIComponent(fileId)}/import`, {
       method: "POST",
       headers: authHeaders(accessToken),
+      body: JSON.stringify({ dictionaryFileId, validationMode }),
     });
   },
 

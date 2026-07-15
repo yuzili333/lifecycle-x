@@ -2,6 +2,44 @@ import { describe, expect, it } from "vitest";
 import { DataManagementStore } from "./dataManagementStore.js";
 import { ToolContextBuilder, detectToolRequiredTasks } from "./schemaContext/index.js";
 
+type DictionaryTestField = { source: string; zh: string; en: string; businessId: string; logical: string; sqlite: string; nullable?: boolean; unique?: boolean; primary?: boolean; constraints?: string };
+
+function dictionaryCsv(fields: DictionaryTestField[]) {
+  return [
+    "field_order,field_name_zh,field_name_en,business_field_id,source_field_name,logical_type,source_type,sqlite_type,mysql_type,nullable,unique,primary_key,constraints_json,source_example,field_comment,aliases,sensitivity",
+    ...fields.map((field, index) =>
+      [
+        index + 1,
+        field.zh,
+        field.en,
+        field.businessId,
+        field.source,
+        field.logical,
+        field.logical === "decimal" ? "number" : "string",
+        field.sqlite,
+        field.sqlite === "NUMERIC" ? "DECIMAL(18.2)" : "VARCHAR(128)",
+        String(field.nullable ?? true),
+        String(field.unique ?? false),
+        String(field.primary ?? false),
+        `"${(field.constraints ?? "{}").replaceAll('"', '""')}"`,
+        "",
+        field.zh,
+        "",
+        "internal",
+      ].join(","),
+    ),
+  ].join("\n");
+}
+
+function importCsvWithDictionary(store: DataManagementStore, fileId: string, fields: Parameters<typeof dictionaryCsv>[0]) {
+  const dictionary = store.uploadCsv("table_dictionary.csv", dictionaryCsv(fields));
+  const result = store.importCsv(fileId, "usr_admin", dictionary.file.id);
+  if (!result || !result.success) {
+    throw new Error(result?.success === false ? result.error.message : "CSV import failed.");
+  }
+  return result;
+}
+
 function createStoreWithSources() {
   const store = new DataManagementStore();
   const sqlSource = store.createDataSource(
@@ -19,7 +57,12 @@ function createStoreWithSources() {
     "usr_admin",
   );
   const csvUpload = store.uploadCsv("repayment_patch.csv", "customer_id,loan_amount,due_date,remark\nC01,1200,2026-07-01,ok\nC02,,2026-07-02,follow\n");
-  const csvImport = store.importCsv(csvUpload.file.id, "usr_admin");
+  const csvImport = importCsvWithDictionary(store, csvUpload.file.id, [
+    { source: "customer_id", zh: "合同编号", en: "contract_id", businessId: "credit.contract_id", logical: "identifier", sqlite: "TEXT", nullable: false, unique: true, primary: true },
+    { source: "loan_amount", zh: "合同金额", en: "contract_amount", businessId: "credit.contract_amount", logical: "decimal", sqlite: "NUMERIC" },
+    { source: "due_date", zh: "报告日期", en: "report_date", businessId: "credit.report_date", logical: "date", sqlite: "TEXT" },
+    { source: "remark", zh: "产品名称", en: "product_name", businessId: "credit.product_name", logical: "string", sqlite: "TEXT" },
+  ]);
   if (!sqlSource || !csvImport) {
     throw new Error("Failed to create schema context test sources.");
   }
@@ -96,8 +139,16 @@ describe("SchemaContextBuilder integration", () => {
     const store = new DataManagementStore();
     const semicolonUpload = store.uploadCsv("semicolon.csv", "\uFEFFcustomer_id;amount;due_date\nC01;1200;2026-07-01\n");
     const tabUpload = store.uploadCsv("tab.csv", "customer_id\tamount\tstatus\nC02\t900\tok\n");
-    const semicolonImport = store.importCsv(semicolonUpload.file.id, "usr_admin");
-    const tabImport = store.importCsv(tabUpload.file.id, "usr_admin");
+    const semicolonImport = importCsvWithDictionary(store, semicolonUpload.file.id, [
+      { source: "customer_id", zh: "合同编号", en: "contract_id", businessId: "credit.contract_id", logical: "identifier", sqlite: "TEXT", nullable: false, unique: true, primary: true },
+      { source: "amount", zh: "合同金额", en: "contract_amount", businessId: "credit.contract_amount", logical: "decimal", sqlite: "NUMERIC" },
+      { source: "due_date", zh: "报告日期", en: "report_date", businessId: "credit.report_date", logical: "date", sqlite: "TEXT" },
+    ]);
+    const tabImport = importCsvWithDictionary(store, tabUpload.file.id, [
+      { source: "customer_id", zh: "合同编号", en: "contract_id", businessId: "credit.contract_id", logical: "identifier", sqlite: "TEXT", nullable: false, unique: true, primary: true },
+      { source: "amount", zh: "合同金额", en: "contract_amount", businessId: "credit.contract_amount", logical: "decimal", sqlite: "NUMERIC" },
+      { source: "status", zh: "产品名称", en: "product_name", businessId: "credit.product_name", logical: "string", sqlite: "TEXT" },
+    ]);
 
     const result = await store.schemaContext({
       userPermissionContext: {
@@ -108,7 +159,11 @@ describe("SchemaContextBuilder integration", () => {
     const profiles = result.context.dataSourceProfiles.filter((profile) => profile.sourceType === "csv_sqlite_temp");
     expect(profiles.map((profile) => profile.fileInfo?.delimiter)).toEqual(expect.arrayContaining([";", "\t"]));
     expect(profiles.find((profile) => profile.fileInfo?.fileName === "semicolon.csv")?.fileInfo?.encoding).toBe("utf-8-bom");
-    expect(profiles.find((profile) => profile.fileInfo?.fileName === "semicolon.csv")?.tables[0]?.columns.map((column) => column.columnName)).toEqual(["customer_id", "amount", "due_date"]);
+    expect(profiles.find((profile) => profile.fileInfo?.fileName === "semicolon.csv")?.tables[0]?.columns.map((column) => column.businessFieldId)).toEqual([
+      "credit.contract_id",
+      "credit.contract_amount",
+      "credit.report_date",
+    ]);
   });
 
   it("returns tool handle schemas and detects tool-required tasks", () => {

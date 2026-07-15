@@ -27,6 +27,7 @@ import type { DataSourceMenuAction } from "../../preload";
 import {
   workbenchApi,
   type ApiResult,
+  type DatabaseColumn,
   type DatabaseSchema,
   type DatabaseTable,
   type DataSourceInput,
@@ -215,12 +216,23 @@ function CompassEmptyIcon({ icon }: { icon: string }) {
   return <span className="compass-empty-state-icon" style={{ "--compass-empty-icon-url": `url(${icon})` } as CSSProperties} aria-hidden="true" />;
 }
 
-function FieldHeader({ name, type, comment }: { name: string; type: string; comment?: string }) {
+function FieldHeader({ column }: { column: DatabaseColumn }) {
+  const title = column.displayNameZh || column.sourceHeader || column.physicalName || column.name || "未命名字段";
+  const subtitle = `${column.physicalName || column.name} · ${column.logicalType || column.type}`;
+  const tooltip = [
+    `中文名称：${title}`,
+    `物理字段：${column.physicalName || column.name}`,
+    column.businessFieldId ? `业务字段：${column.businessFieldId}` : undefined,
+    `类型：${column.logicalType || column.type}`,
+    column.fieldComment || column.comment ? `注释：${column.fieldComment || column.comment}` : undefined,
+  ]
+    .filter(Boolean)
+    .join("\n");
   return (
-    <span className="compass-field-header">
-      <strong>{name}</strong>
-      <span>{type}</span>
-      <em>{comment?.trim() || "--"}</em>
+    <span className="compass-field-header" title={tooltip}>
+      <strong>{title}</strong>
+      <span>{subtitle}</span>
+      <em>{column.fieldComment?.trim() || column.comment?.trim() || "--"}</em>
     </span>
   );
 }
@@ -234,7 +246,7 @@ export function DataManagementWorkspace({ isActive, canManage, requestWithRefres
   const [dataSources, setDataSources] = useState<DataSourceSummary[]>([]);
   const [schemas, setSchemas] = useState<DatabaseSchema[]>([]);
   const [tables, setTables] = useState<DatabaseTable[]>([]);
-  const [activePage, setActivePage] = useState<DataManagementPage>("database");
+  const [activePage, setActivePage] = useState<DataManagementPage>("csv");
   const [selectedSourceId, setSelectedSourceId] = useState<string | null>(null);
   const [selectedSchema, setSelectedSchema] = useState<string | null>(null);
   const [selectedTableId, setSelectedTableId] = useState<string | null>(null);
@@ -245,6 +257,8 @@ export function DataManagementWorkspace({ isActive, canManage, requestWithRefres
   const [isCsvDialogOpen, setIsCsvDialogOpen] = useState(false);
   const [csvName, setCsvName] = useState("");
   const [csvContent, setCsvContent] = useState("");
+  const [csvDictionaryName, setCsvDictionaryName] = useState("");
+  const [csvDictionaryContent, setCsvDictionaryContent] = useState("");
   const [csvInputVersion, setCsvInputVersion] = useState(0);
   const [isCsvImporting, setIsCsvImporting] = useState(false);
   const [editingCsvSource, setEditingCsvSource] = useState<DataSourceSummary | null>(null);
@@ -261,6 +275,7 @@ export function DataManagementWorkspace({ isActive, canManage, requestWithRefres
   const [sampleDataByTabId, setSampleDataByTabId] = useState<Record<string, SampleDataResult>>({});
   const [loadingSampleTabIds, setLoadingSampleTabIds] = useState<string[]>([]);
   const [connectionTestToast, setConnectionTestToast] = useState<ConnectionTestToast | null>(null);
+  const [csvImportToast, setCsvImportToast] = useState<ConnectionTestToast | null>(null);
   const [databaseContextMenu, setDatabaseContextMenu] = useState<{
     sourceId: string;
     sourceName: string;
@@ -283,6 +298,14 @@ export function DataManagementWorkspace({ isActive, canManage, requestWithRefres
 
   const showConnectionTestToast = useCallback((type: ToastType, body: string) => {
     setConnectionTestToast({
+      id: Date.now(),
+      type,
+      body,
+    });
+  }, []);
+
+  const showCsvImportToast = useCallback((type: ToastType, body: string) => {
+    setCsvImportToast({
       id: Date.now(),
       type,
       body,
@@ -348,10 +371,24 @@ export function DataManagementWorkspace({ isActive, canManage, requestWithRefres
     [toast],
   );
 
+  const showCsvFailure = useCallback(
+    (result: AuthFailure) => {
+      if (result.error.code === "SESSION_EXPIRED") {
+        showFailure(result);
+        return;
+      }
+      showCsvImportToast("error", `${result.error.message} Trace: ${result.error.traceId}`);
+    },
+    [showCsvImportToast, showFailure],
+  );
+
   const resetCsvImportState = useCallback(() => {
     setCsvName("");
     setCsvContent("");
+    setCsvDictionaryName("");
+    setCsvDictionaryContent("");
     setIsCsvImporting(false);
+    setCsvImportToast(null);
     setCsvInputVersion((current) => current + 1);
   }, []);
 
@@ -1058,40 +1095,62 @@ export function DataManagementWorkspace({ isActive, canManage, requestWithRefres
       return;
     }
     if (!file.name.toLowerCase().endsWith(".csv") && file.type !== "text/csv") {
-      toast({
-        type: "error",
-        body: "请选择 CSV 文件。",
-        uniqueID: "csv-file-invalid",
-        collisionBehavior: "overwrite",
-      });
+      showCsvImportToast("error", "请选择 CSV 文件。");
       return;
     }
-    const content = await file.text();
-    setCsvName(file.name);
-    setCsvContent(content);
+    try {
+      const content = await file.text();
+      setCsvName(file.name);
+      setCsvContent(content);
+    } catch {
+      showCsvImportToast("error", "CSV 文件读取失败，请重新选择文件。");
+    }
+  };
+
+  const handleCsvDictionaryFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) {
+      return;
+    }
+    if (!file.name.toLowerCase().endsWith(".csv") && file.type !== "text/csv") {
+      showCsvImportToast("error", "请选择 CSV 格式的表字典文件。");
+      return;
+    }
+    try {
+      const content = await file.text();
+      setCsvDictionaryName(file.name);
+      setCsvDictionaryContent(content);
+    } catch {
+      showCsvImportToast("error", "表字典文件读取失败，请重新选择文件。");
+    }
   };
 
   const importCsv = async () => {
     if (!csvName.trim() || !csvContent.trim()) {
-      toast({
-        type: "error",
-        body: "请先上传 CSV 文件。",
-        uniqueID: "csv-file-empty",
-        collisionBehavior: "overwrite",
-      });
+      showCsvImportToast("error", "请先上传 CSV 文件。");
+      return;
+    }
+    if (!csvDictionaryName.trim() || !csvDictionaryContent.trim()) {
+      showCsvImportToast("error", "请先上传表字典 CSV 文件。");
       return;
     }
     setIsCsvImporting(true);
     const upload = await requestWithRefresh((token) => workbenchApi.uploadCsv(token, csvName, csvContent));
     if (isFailure(upload)) {
       setIsCsvImporting(false);
-      showFailure(upload);
+      showCsvFailure(upload);
       return;
     }
-    const result = await requestWithRefresh((token) => workbenchApi.importCsv(token, upload.file.id));
+    const dictionaryUpload = await requestWithRefresh((token) => workbenchApi.uploadCsv(token, csvDictionaryName, csvDictionaryContent));
+    if (isFailure(dictionaryUpload)) {
+      setIsCsvImporting(false);
+      showCsvFailure(dictionaryUpload);
+      return;
+    }
+    const result = await requestWithRefresh((token) => workbenchApi.importCsv(token, upload.file.id, dictionaryUpload.file.id, "strict"));
     setIsCsvImporting(false);
     if (isFailure(result)) {
-      showFailure(result);
+      showCsvFailure(result);
       return;
     }
     toast({ type: "info", body: `CSV 导入完成，共 ${result.job.importedRows} 行。`, uniqueID: "csv-imported", collisionBehavior: "overwrite" });
@@ -1122,7 +1181,7 @@ export function DataManagementWorkspace({ isActive, canManage, requestWithRefres
     () =>
       (activeTab?.kind === "table" ? sampleDataByTabId[activeTab.id]?.columns : undefined)?.map((column) => ({
         key: column.name,
-        header: <FieldHeader name={column.name} type={column.type} comment={column.comment} />,
+        header: <FieldHeader column={column} />,
         width: proportional(1, { minWidth: 140 }),
       })) ?? [],
     [activeTab, sampleDataByTabId],
@@ -1432,7 +1491,30 @@ export function DataManagementWorkspace({ isActive, canManage, requestWithRefres
             />
             <em>{csvName || "请选择本地 CSV 文件"}</em>
           </label>
+          <label className="csv-file-field">
+            <span>表字典文件</span>
+            <input
+              key={`dictionary-${csvInputVersion}`}
+              type="file"
+              accept=".csv,text/csv"
+              disabled={isCsvImporting}
+              onChange={(event) => void handleCsvDictionaryFileChange(event)}
+            />
+            <em>{csvDictionaryName || "请选择表字典 CSV 文件"}</em>
+          </label>
           {isCsvImporting && <Spinner label="数据导入中...." />}
+          {csvImportToast && (
+            <div className="dialog-local-toast">
+              <Toast
+                key={csvImportToast.id}
+                type={csvImportToast.type}
+                body={csvImportToast.body}
+                isAutoHide
+                autoHideDuration={5000}
+                onDismiss={() => setCsvImportToast(null)}
+              />
+            </div>
+          )}
           <HStack hAlign="end" gap={2}>
             <Button label="取消" variant="secondary" isDisabled={isCsvImporting} onClick={closeCsvDialog} />
             <Button label="确认导入" variant="primary" isDisabled={isCsvImporting} onClick={importCsv} />

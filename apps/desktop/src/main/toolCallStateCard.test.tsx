@@ -1,6 +1,6 @@
 import { renderToString } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { ToolCallStateCard, toolRecordSummary, toolStatusLabel } from "../renderer/src/components/tool-calls";
+import { ReportToolCallCard, ToolCallStateCard, toolRecordSummary, toolStatusLabel } from "../renderer/src/components/tool-calls";
 import { TOOL_NAMES, type ToolCallRecord, type ToolKind } from "./toolOrchestration";
 
 const createdAt = "2026-07-14T00:00:00.000Z";
@@ -63,5 +63,32 @@ describe("ToolCallStateCard", () => {
   it("summarizes version, artifacts and lineage", () => {
     expect(toolStatusLabel("blocked")).toBe("已阻塞");
     expect(toolRecordSummary(record("sql_query", { version: 3, outputArtifactIds: ["a", "b"] }))).toBe("v3 · 已完成 · 2 Artifact · 血缘 2");
+  });
+});
+
+describe("ReportToolCallCard", () => {
+  it("renders dynamic report metadata and creating status", () => {
+    const html = renderToString(
+      <ReportToolCallCard
+        title="整体风险分类分布报告"
+        version={2}
+        generatedAt="2026/07/15 10:00"
+        chartCount={1}
+        dataSourceCount={1}
+        dataSourceLabels={["信贷资产测试数据集 / CSV"]}
+        status="creating"
+        onOpen={() => undefined}
+      />,
+    );
+
+    expect(html).toContain("版本 2");
+    expect(html).toContain("包含 <!-- -->1<!-- --> 张图表");
+    expect(html).toContain("1<!-- --> 个数据来源");
+    expect(html).toContain("数据来源：信贷资产测试数据集 / CSV");
+    expect(html).toContain("creating");
+    expect(html).not.toContain("已生成 Markdown 报告");
+    expect(html).not.toContain("样本笔数");
+    expect(html).not.toContain("数据源：用户选择数据源");
+    expect(html).not.toContain("assistant-report-card-summary");
   });
 });

@@ -195,7 +195,8 @@
           "type": "string"
         },
         "normalInternalStructure": {
-          "type": "string"
+          "type": "string",
+          "description": "【正常类维度】分析文本。必须基于十二级分类/latest_risk_result 中含“正常1”“正常2”“正常3”的数据汇总总计笔数，并说明正常1、正常2、正常3内部结构；不得用 latest_risk 的“正常”粗分类替代。"
         },
         "boundaryRisk": {
           "type": "string"

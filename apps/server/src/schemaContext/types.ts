@@ -50,6 +50,14 @@ export type IndexProfile = {
 export type ColumnProfile = {
   columnName: string;
   displayName?: string;
+  sourceHeader?: string;
+  physicalName?: string;
+  businessFieldId?: string;
+  displayNameZh?: string;
+  logicalType?: string;
+  sqliteType?: string;
+  fieldComment?: string;
+  mappingStatus?: string;
   dataType: string;
   inferredType?: "string" | "number" | "integer" | "boolean" | "date" | "datetime" | "category" | "text" | "unknown";
   nullable?: boolean;

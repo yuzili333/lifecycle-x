@@ -9,11 +9,33 @@
     "dataSourceId": "ds_credit_asset",
     "purpose": "查询整体风险分类分布分析所需基础明细数据",
     "fieldMapping": {
-      "contractId": "合同流水号",
-      "fiveLevelClassification": "最新风险五级分类",
-      "twelveLevelClassification": "最新风险分类结果",
-      "loanBalance": "贷款余额(万元)",
-      "contractAmount": "合同金额(万元)"
+      "contractId": {
+        "businessFieldId": "bf.loan_contract.contract_serial",
+        "physicalName": "contract_serial",
+        "displayNameZh": "合同流水号"
+      },
+      "fiveLevelClassification": {
+        "businessFieldId": "bf.loan_contract.latest_risk",
+        "physicalName": "latest_risk",
+        "displayNameZh": "最新风险分类"
+      },
+      "twelveLevelClassification": {
+        "businessFieldId": "bf.loan_contract.latest_risk_result",
+        "physicalName": "latest_risk_result",
+        "displayNameZh": "最新风险分类结果"
+      },
+      "loanBalance": {
+        "businessFieldId": "bf.loan_contract.loan_balance_10k",
+        "physicalName": "loan_balance_10k",
+        "displayNameZh": "贷款余额(万元)",
+        "amountUnit": "ten_thousand_yuan"
+      },
+      "contractAmount": {
+        "businessFieldId": "bf.loan_contract.contract_amount_10k",
+        "physicalName": "contract_amount_10k",
+        "displayNameZh": "合同金额(万元)",
+        "amountUnit": "ten_thousand_yuan"
+      }
     },
     "filters": {
       "reportDate": "2026-06-30",
@@ -24,6 +46,8 @@
   }
 }
 ```
+
+字段口径：业务术语“十二级分类”必须映射到 `bf.loan_contract.latest_risk_result` / `latest_risk_result`，不得用 `latest_risk` 代替或推断。
 
 ## Python Analysis
 

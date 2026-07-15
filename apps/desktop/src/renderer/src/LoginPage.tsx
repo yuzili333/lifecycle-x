@@ -28,8 +28,8 @@ function isEmail(value: string) {
 
 export function LoginPage({ onPasswordLogin, onSsoComplete, lastError, onError }: LoginPageProps) {
   const [step, setStep] = useState<LoginStep>("credentials");
-  const [identifier, setIdentifier] = useState("");
-  const [password, setPassword] = useState("");
+  const [identifier, setIdentifier] = useState("yuzili");
+  const [password, setPassword] = useState("yuzili");
   const [ssoState, setSsoState] = useState<{ token: string; providerName: string; email: string } | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const toast = useAppToast();
@@ -56,6 +56,11 @@ export function LoginPage({ onPasswordLogin, onSsoComplete, lastError, onError }
     if (!lastError || lastToastTraceId.current === lastError.error.traceId) {
       return;
     }
+    if (lastError.error.code === "SESSION_EXPIRED") {
+      lastToastTraceId.current = lastError.error.traceId;
+      onError(null);
+      return;
+    }
 
     lastToastTraceId.current = lastError.error.traceId;
     toast({
@@ -64,7 +69,7 @@ export function LoginPage({ onPasswordLogin, onSsoComplete, lastError, onError }
       uniqueID: "login-error",
       collisionBehavior: "overwrite",
     });
-  }, [lastError, toast]);
+  }, [lastError, onError, toast]);
 
   const handlePasswordLogin = async () => {
     if (!canPasswordLogin || isLoading) {

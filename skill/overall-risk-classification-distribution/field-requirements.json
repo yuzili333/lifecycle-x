@@ -1,0 +1,138 @@
+{
+  "skillId": "overall-risk-classification-distribution",
+  "dictionaryMode": "uploaded-table-dictionary-first",
+  "requiredFields": [
+    {
+      "semantic": "contract_id",
+      "businessFieldId": "bf.loan_contract.contract_serial",
+      "compatibleBusinessFieldIds": [
+        "bf.loan_contract.contract_no",
+        "credit.contract_id"
+      ],
+      "physicalName": "contract_serial",
+      "displayNameZh": "合同流水号",
+      "required": true,
+      "expectedTypes": ["identifier", "string", "code"],
+      "purpose": "合同唯一标识，用于去重计算笔数。优先使用主键/唯一字段 contract_serial；contract_no 仅作兼容候选。"
+    },
+    {
+      "semantic": "five_level_classification",
+      "businessFieldId": "bf.loan_contract.latest_risk",
+      "compatibleBusinessFieldIds": [
+        "bf.loan_contract.latest_five_level_risk",
+        "credit.five_level_classification"
+      ],
+      "physicalName": "latest_risk",
+      "displayNameZh": "最新风险分类",
+      "required": true,
+      "expectedTypes": ["enum", "category", "string"],
+      "purpose": "整体风险分类统计字段，标准值为正常、关注、不良；兼容五级分类字段正常、关注、次级、可疑、损失。"
+    },
+    {
+      "semantic": "twelve_level_classification",
+      "businessFieldId": "bf.loan_contract.latest_risk_result",
+      "compatibleBusinessFieldIds": [
+        "bf.loan_contract.year_start_risk_detail",
+        "credit.twelve_level_classification"
+      ],
+      "physicalName": "latest_risk_result",
+      "displayNameZh": "最新风险分类结果",
+      "required": false,
+      "expectedTypes": ["enum", "category", "string"],
+      "purpose": "信贷资产业务术语“十二级分类”的标准映射字段；必须使用最新风险分类结果 latest_risk_result，示例值如 0101--正常1、0203--关注3，不得由 latest_risk 推断。"
+    },
+    {
+      "semantic": "loan_balance",
+      "businessFieldId": "bf.loan_contract.loan_balance_10k",
+      "compatibleBusinessFieldIds": [
+        "credit.loan_balance"
+      ],
+      "physicalName": "loan_balance_10k",
+      "displayNameZh": "贷款余额(万元)",
+      "required": true,
+      "expectedTypes": ["amount", "decimal", "integer", "number"],
+      "amountUnit": "ten_thousand_yuan",
+      "purpose": "金额维度默认统计字段，单位为万元。"
+    },
+    {
+      "semantic": "contract_amount",
+      "businessFieldId": "bf.loan_contract.contract_amount_10k",
+      "compatibleBusinessFieldIds": [
+        "credit.contract_amount"
+      ],
+      "physicalName": "contract_amount_10k",
+      "displayNameZh": "合同金额(万元)",
+      "required": false,
+      "expectedTypes": ["amount", "decimal", "integer", "number"],
+      "amountUnit": "ten_thousand_yuan",
+      "purpose": "合同金额合计字段，单位为万元。"
+    }
+  ],
+  "optionalFilterFields": [
+    {
+      "semantic": "report_date",
+      "businessFieldId": "bf.loan_contract.p_date",
+      "compatibleBusinessFieldIds": [
+        "bf.loan_contract.partition_date",
+        "credit.report_date"
+      ],
+      "physicalName": "p_date",
+      "displayNameZh": "数据日期",
+      "expectedTypes": ["date", "string"]
+    },
+    {
+      "semantic": "institution_name",
+      "businessFieldId": "bf.loan_contract.branch_name",
+      "compatibleBusinessFieldIds": [
+        "credit.institution_name"
+      ],
+      "physicalName": "branch_name",
+      "displayNameZh": "一级分行名称",
+      "expectedTypes": ["enum", "name", "string"]
+    },
+    {
+      "semantic": "loan_term_type",
+      "businessFieldId": "bf.loan_contract.loan_term_type",
+      "physicalName": "loan_term_type",
+      "displayNameZh": "短中长期贷款标识",
+      "expectedTypes": ["enum", "string"]
+    },
+    {
+      "semantic": "product_name",
+      "businessFieldId": "bf.loan_contract.product_name",
+      "compatibleBusinessFieldIds": [
+        "credit.product_name"
+      ],
+      "physicalName": "product_name",
+      "displayNameZh": "业务品种名称",
+      "expectedTypes": ["enum", "name", "string"]
+    },
+    {
+      "semantic": "currency",
+      "businessFieldId": "bf.loan_contract.currency",
+      "compatibleBusinessFieldIds": [
+        "credit.currency"
+      ],
+      "physicalName": "currency",
+      "displayNameZh": "货币种类",
+      "expectedTypes": ["enum", "string"]
+    }
+  ],
+  "classificationRules": {
+    "fiveLevelOrder": ["正常", "关注", "次级", "可疑", "损失", "未识别"],
+    "nonPerforming": ["次级", "可疑", "损失"],
+    "attentionPlusNonPerforming": ["关注", "次级", "可疑", "损失"],
+    "boundaryRisk": ["正常3", "关注", "关注1", "关注2", "关注3"],
+    "twelveLevelCodeNameMap": {
+      "0101": "正常1",
+      "0102": "正常2",
+      "0103": "正常3",
+      "0201": "关注1",
+      "0202": "关注2",
+      "0203": "关注3",
+      "0300": "次级",
+      "0400": "可疑",
+      "0500": "损失"
+    }
+  }
+}

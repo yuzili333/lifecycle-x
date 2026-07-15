@@ -81,11 +81,11 @@ const OVERALL_RISK_COLUMN_SCOPES: Array<{ semantic: string; patterns: RegExp[] }
   },
   {
     semantic: "fiveLevelClassification",
-    patterns: [/^latest_five_level_risk$/i, /five.*level.*risk/i, /五级/i, /五.*分类/i],
+    patterns: [/^latest_risk$/i, /^latest_five_level_risk$/i, /^latest_risk_class$/i, /five.*level.*risk/i, /五级/i, /五.*分类/i, /^最新风险分类$/i],
   },
   {
     semantic: "twelveLevelClassification",
-    patterns: [/^latest_risk_result$/i, /^latest_risk$/i, /^latest_risk_class$/i, /twelve/i, /十二/i, /风险分类(结果|名称|明细)?/i],
+    patterns: [/^latest_risk_result$/i, /twelve/i, /十二/i, /风险分类(结果|名称|明细)/i],
   },
   {
     semantic: "loanBalance",
@@ -122,7 +122,7 @@ function normalizeSkillId(value: unknown) {
 }
 
 function columnSearchText(column: DatabaseColumn) {
-  return `${column.name}\n${column.comment ?? ""}`;
+  return `${column.name}\n${column.physicalName ?? ""}\n${column.businessFieldId ?? ""}\n${column.displayNameZh ?? ""}\n${column.comment ?? ""}`;
 }
 
 function matchesColumnScope(column: DatabaseColumn, patterns: RegExp[]) {
@@ -140,7 +140,38 @@ function allowedColumnsForSkill(dataStore: DataManagementStore, dataSourceId: st
       const allowed = new Set<string>();
       for (const scope of OVERALL_RISK_COLUMN_SCOPES) {
         for (const column of table.columns) {
-          if (matchesColumnScope(column, scope.patterns)) {
+          const scopedByBusinessId =
+            column.businessFieldId &&
+            [
+              "bf.loan_contract.contract_serial",
+              "bf.loan_contract.contract_no",
+              "bf.loan_contract.latest_risk",
+              "bf.loan_contract.latest_five_level_risk",
+              "bf.loan_contract.latest_risk_result",
+              "bf.loan_contract.year_start_risk_detail",
+              "bf.loan_contract.loan_balance_10k",
+              "bf.loan_contract.contract_amount_10k",
+              "bf.loan_contract.p_date",
+              "bf.loan_contract.partition_date",
+              "bf.loan_contract.branch_name",
+              "bf.loan_contract.loan_term_type",
+              "bf.loan_contract.product_name",
+              "bf.loan_contract.currency",
+              "bf.loan_contract.contract_status",
+              "credit.contract_id",
+              "credit.five_level_classification",
+              "credit.twelve_level_classification",
+              "credit.loan_balance",
+              "credit.contract_amount",
+              "credit.report_date",
+              "credit.institution_code",
+              "credit.institution_name",
+              "credit.product_code",
+              "credit.product_name",
+              "credit.currency",
+              "credit.business_status",
+            ].includes(column.businessFieldId);
+          if (scopedByBusinessId || matchesColumnScope(column, scope.patterns)) {
             allowed.add(column.name);
           }
         }
@@ -867,9 +898,20 @@ export function createAuthApp(store = new AuthStore(), dataStore = new DataManag
       sendFailure(response, auth.status, auth.code, auth.message, traceId);
       return;
     }
-    const result = dataStore.importCsv(request.params.fileId, auth.resolved.user.id);
+    const { dictionaryFileId, validationMode } = request.body as { dictionaryFileId?: string; validationMode?: "strict" | "quarantine" };
+    const result = dataStore.importCsv(request.params.fileId, auth.resolved.user.id, dictionaryFileId, validationMode ?? "strict");
     if (!result) {
       sendFailure(response, 404, "DATA_SOURCE_UNAVAILABLE", "CSV 文件不存在。", traceId);
+      return;
+    }
+    if (!result.success) {
+      sendFailure(response, 400, "VALIDATION_ERROR", result.error.message, traceId, {
+        detail: {
+          code: result.error.code,
+          errors: result.error.errors,
+          warnings: result.error.warnings,
+        },
+      });
       return;
     }
     response.json(result);
