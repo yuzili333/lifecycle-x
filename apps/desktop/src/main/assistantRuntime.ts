@@ -234,6 +234,29 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function formatReportDateTime(value: string | Date = new Date()) {
+  if (typeof value === "string") {
+    const normalized = value.trim().match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}):(\d{2}):(\d{2})/);
+    if (normalized) {
+      return `${normalized[1]} ${normalized[2]}:${normalized[3]}:${normalized[4]}`;
+    }
+    if (/^\d{4}-\d{2}-\d{2}$/.test(value.trim())) {
+      return `${value.trim()} 00:00:00`;
+    }
+  }
+  const date = typeof value === "string" ? new Date(value) : value;
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  const seconds = String(date.getSeconds()).padStart(2, "0");
+  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+}
+
 function sha256(value: string) {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -661,7 +684,15 @@ function pctText(value: number, total: number) {
   return total > 0 ? `${(value * 100 / total).toFixed(2)}%` : "0.00%";
 }
 
-export function buildOverallRiskDistributionMarkdown(rows: Array<Record<string, unknown>>, context: { title?: string; dataSourceLabel?: string | null; version?: number }) {
+function reportDataSourceName(dataSourceLabel?: string | null) {
+  const trimmed = dataSourceLabel?.trim();
+  if (!trimmed) {
+    return "未选择数据源";
+  }
+  return trimmed.split("/")[0]?.trim() || trimmed;
+}
+
+export function buildOverallRiskDistributionMarkdown(rows: Array<Record<string, unknown>>, context: { title?: string; dataSourceLabel?: string | null; version?: number; generatedAt?: string | Date }) {
   const totalCount = rows.length;
   const idColumn = findColumnByPattern(rows, [/^contract_id$/i, /^contract_serial$/i, /^contract_no$/i, /bf\.loan_contract\.contract_serial/i, /credit\.contract_id/i, /合同.*(号|编号|id|流水)/i, /借据/i, /loan.*id/i, /contract.*(id|serial|no)/i, /^id$/i]);
   const fiveRiskColumn = findRiskClassificationColumn(rows);
@@ -733,10 +764,10 @@ export function buildOverallRiskDistributionMarkdown(rows: Array<Record<string, 
     `# ${context.title ?? "整体风险分类分布报告"}${context.version ? ` v${context.version}` : ""}`,
     "",
     "## 一、分析范围",
-    `- 数据源：${context.dataSourceLabel || "用户选择数据源"}`,
+    `- 数据源：${reportDataSourceName(context.dataSourceLabel)}`,
     `- 样本笔数：${totalCount}`,
     `- 贷款余额(万元)合计：${amountText(totalAmount)}`,
-    `- 生成时间：${nowIso()}`,
+    `- 生成时间：${formatReportDateTime(context.generatedAt)}`,
     "",
     "## 二、整体风险分类分布（笔数+金额）",
     "| 风险分类 | 笔数 | 笔数占比 | 贷款余额(万元) | 金额占比 |",
@@ -2535,6 +2566,8 @@ export class AssistantRuntime {
       request: {
         userRequest: input.prompt,
         purpose: "计算整体风险分类分布、核心指标与数据质量说明。",
+        dataSourceId: input.dataSourceId ?? undefined,
+        dataSourceLabel: input.dataSourceLabel ?? undefined,
         approvalMode: input.approvalMode,
       },
       parentToolCallIds: [sqlRecord.toolCallId],
@@ -2550,6 +2583,8 @@ export class AssistantRuntime {
         userRequest: input.prompt,
         purpose: "根据整体风险分类分布模板生成完整报告。",
         title: "整体风险分类分布报告",
+        dataSourceId: input.dataSourceId ?? undefined,
+        dataSourceLabel: input.dataSourceLabel ?? undefined,
         approvalMode: input.approvalMode,
       },
       parentToolCallIds: [pythonRecord.toolCallId],
@@ -2811,9 +2846,15 @@ export class AssistantRuntime {
     await this.emitToolState(record.conversationId);
     try {
       const rows = await this.rowsForLatestSkillSqlRecord(executing.conversationId);
+      const sourceSql = await this.toolResultRegistry.getLatestSuccessful(executing.conversationId, "sql_query");
+      const dataSourceLabel = typeof executing.request.dataSourceLabel === "string"
+        ? executing.request.dataSourceLabel
+        : typeof sourceSql?.request.dataSourceLabel === "string"
+          ? sourceSql.request.dataSourceLabel
+          : undefined;
       const markdown = buildOverallRiskDistributionMarkdown(rows, {
         title: "整体风险分类分布分析结果",
-        dataSourceLabel: typeof executing.request.dataSourceLabel === "string" ? executing.request.dataSourceLabel : undefined,
+        dataSourceLabel,
         version: executing.version,
       });
       const artifact = await this.toolArtifactManager.createArtifact({
@@ -2824,7 +2865,6 @@ export class AssistantRuntime {
         content: markdown,
         metadata: { toolCallId: executing.toolCallId, rowCount: rows.length },
       });
-      const sourceSql = await this.toolResultRegistry.getLatestSuccessful(executing.conversationId, "sql_query");
       const completed = await this.toolResultRegistry.update(executing.toolCallId, {
         status: "completed",
         result: {
@@ -2871,15 +2911,21 @@ export class AssistantRuntime {
     const executing = await this.toolResultRegistry.update(record.toolCallId, { status: "executing" });
     await this.emitToolState(record.conversationId);
     const analysis = await this.toolResultRegistry.getLatestSuccessful(executing.conversationId, "python_analysis");
+    const sourceSql = await this.toolResultRegistry.getLatestSuccessful(executing.conversationId, "sql_query");
+    const dataSourceLabel = typeof executing.request.dataSourceLabel === "string"
+      ? executing.request.dataSourceLabel
+      : typeof sourceSql?.request.dataSourceLabel === "string"
+        ? sourceSql.request.dataSourceLabel
+        : undefined;
     const analysisArtifactId = analysis?.result?.primaryArtifactId ?? analysis?.outputArtifactIds?.[0];
     const analysisArtifact = analysisArtifactId ? await this.toolArtifactManager.getArtifact(analysisArtifactId) : null;
     const markdown = typeof analysisArtifact?.content === "string"
       ? analysisArtifact.content.replace(/^# .+$/m, `# 整体风险分类分布报告 v${executing.version}`)
-      : buildOverallRiskDistributionMarkdown(await this.rowsForLatestSkillSqlRecord(executing.conversationId), {
-          title: "整体风险分类分布报告",
-          dataSourceLabel: typeof executing.request.dataSourceLabel === "string" ? executing.request.dataSourceLabel : undefined,
-          version: executing.version,
-        });
+        : buildOverallRiskDistributionMarkdown(await this.rowsForLatestSkillSqlRecord(executing.conversationId), {
+            title: "整体风险分类分布报告",
+            dataSourceLabel,
+            version: executing.version,
+          });
     const artifact = await this.toolArtifactManager.createArtifact({
       artifactId: `assistant-report-markdown:${executing.toolCallId}`,
       artifactType: "report_markdown",

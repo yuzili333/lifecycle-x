@@ -1306,12 +1306,17 @@ button {
 }
 
 .assistant-artifact-panel.maximized {
-  max-width: min(920px, 72vw);
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  width: 100vw;
+  max-width: none;
+  height: 100dvh;
+  border-left: 0;
 }
 
 .assistant-artifact-panel.minimized {
-  grid-template-rows: auto;
-  min-width: 280px;
+  grid-template-rows: auto minmax(0, 1fr);
 }
 
 .assistant-artifact-toolbar-title {

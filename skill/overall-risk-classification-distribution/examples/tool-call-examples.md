@@ -116,7 +116,7 @@
         "sourceType": "python",
         "sourceRequestId": "python-call-v1",
         "sourceDatasetId": "python-analysis-v1",
-        "generatedAt": "2026-07-14T00:00:00.000Z"
+        "generatedAt": "2026-07-14 00:00:00"
       },
       "metadata": {
         "businessType": "overall_risk_classification_distribution"

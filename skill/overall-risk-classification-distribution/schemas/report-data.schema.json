@@ -24,14 +24,22 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
+        "dataSourceName",
         "filters"
       ],
       "properties": {
         "dataSourceName": {
-          "type": "string"
+          "type": "string",
+          "minLength": 1,
+          "not": {
+            "const": "用户选择数据源"
+          },
+          "description": "用户当前真实选择的数据源表名称，优先使用客户端选中数据源 name、CSV 导入表名或数据库表名，不得使用固定占位文本。"
         },
         "reportDate": {
-          "type": "string"
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+          "description": "统计日期，格式 YYYY-MM-DD。"
         },
         "filters": {
           "type": "object"
@@ -261,7 +269,9 @@
           }
         },
         "generatedAt": {
-          "type": "string"
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}$",
+          "description": "报告生成时间，格式 YYYY-MM-DD HH:mm:ss。"
         }
       }
     }

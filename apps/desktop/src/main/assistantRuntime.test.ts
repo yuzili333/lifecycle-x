@@ -72,10 +72,13 @@ describe("AssistantRuntime report artifact helpers", () => {
         { contract_id: "c2", 五级分类: "关注", 十二级分类: "关注1", 贷款余额: 50 },
         { contract_id: "c3", 五级分类: "次级", 十二级分类: "次级", 贷款余额: 25 },
       ],
-      { dataSourceLabel: "测试数据源", version: 1 },
+      { dataSourceLabel: "测试数据源 / CSV", version: 1, generatedAt: "2026-07-15 10:00:00" },
     );
 
     expect(markdown).toContain("整体风险分类分布报告 v1");
+    expect(markdown).toContain("- 数据源：测试数据源");
+    expect(markdown).toContain("- 生成时间：2026-07-15 10:00:00");
+    expect(markdown).not.toContain("用户选择数据源");
     expect(markdown).toContain("| 风险分类 | 笔数 | 笔数占比 | 贷款余额(万元) | 金额占比 |");
     expect(markdown).toContain("| 关注 | 1 | 33.33% | 50 | 28.57% |");
     expect(markdown).toContain("贷款余额(万元)合计");

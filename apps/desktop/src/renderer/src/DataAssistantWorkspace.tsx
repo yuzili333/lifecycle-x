@@ -123,13 +123,14 @@ function formatChatTime(value: string) {
 }
 
 function formatArtifactGeneratedAt(value: string) {
-  return new Intl.DateTimeFormat("zh-CN", {
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  }).format(new Date(value));
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return /^\d{4}-\d{2}-\d{2}/.test(value) ? value.slice(0, 10) : value;
+  }
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
 }
 
 function dataSourceLabel(dataSource?: DataSourceSummary) {
@@ -160,7 +161,7 @@ function readArtifactWindowState(): ArtifactWindowState {
     return {
       messageId: typeof parsed?.messageId === "string" ? parsed.messageId : null,
       isOpen: parsed?.isOpen === true,
-      isMinimized: parsed?.isMinimized === true,
+      isMinimized: false,
       isMaximized: parsed?.isMaximized === true,
     };
   } catch {
@@ -1162,7 +1163,7 @@ export function DataAssistantWorkspace({
   }, []);
 
   const toggleArtifactMinimized = useCallback(() => {
-    setArtifactWindow((current) => ({ ...current, isMinimized: !current.isMinimized, isMaximized: false }));
+    setArtifactWindow((current) => ({ ...current, isMinimized: false, isMaximized: false }));
   }, []);
 
   const toggleArtifactMaximized = useCallback(() => {
@@ -1869,21 +1870,24 @@ export function DataAssistantWorkspace({
         </div>
         {activeArtifactMessage && (
           <>
-            <ResizeHandle
-              direction="horizontal"
-              resizable={artifactResize.props}
-              isReversed
-              pillPlacement="start"
-              hasDivider
-              label="调整文档窗口宽度"
-              className="assistant-artifact-resize-handle"
-            />
+            {!artifactWindow.isMaximized && (
+              <ResizeHandle
+                direction="horizontal"
+                resizable={artifactResize.props}
+                isReversed
+                pillPlacement="start"
+                hasDivider
+                label="调整文档窗口宽度"
+                className="assistant-artifact-resize-handle"
+              />
+            )}
             <Card
               variant="transparent"
               height="100%"
               className={`assistant-artifact-panel ${artifactWindow.isMinimized ? "minimized" : ""} ${artifactWindow.isMaximized ? "maximized" : ""}`}
               style={{
-                width: artifactWindow.isMaximized ? "min(920px, 72vw)" : `${artifactResize.size}px`,
+                width: artifactWindow.isMaximized ? "100vw" : `${artifactResize.size}px`,
+                height: artifactWindow.isMaximized ? "100dvh" : "100%",
               }}
             >
               <Toolbar
@@ -1931,7 +1935,7 @@ export function DataAssistantWorkspace({
                       onClick={() => void copyArtifact(activeArtifactMessage)}
                     />
                     <Button
-                      label={artifactWindow.isMinimized ? "还原窗口" : "最小化窗口"}
+                      label="最小化窗口"
                       variant="ghost"
                       size="sm"
                       isIconOnly
@@ -1957,32 +1961,30 @@ export function DataAssistantWorkspace({
                   </HStack>
                 }
               />
-              {!artifactWindow.isMinimized && (
-                <Section variant="transparent" className="assistant-artifact-body">
-                  {activeArtifactContent?.status === "loading" ? (
-                    <HStack gap={2} vAlign="center" className="assistant-artifact-loading">
-                      <Icon icon={LoaderCircle} size="sm" color="secondary" className="assistant-message-status-spinner" />
-                      <Text type="body" color="secondary">报告 Artifact 加载中...</Text>
-                    </HStack>
-                  ) : activeArtifactContent?.status === "error" ? (
-                    <VStack gap={2} hAlign="stretch" className="assistant-artifact-error">
-                      <Text type="label" color="primary">报告 Artifact 加载失败</Text>
-                      <Text type="body" color="secondary">{activeArtifactContent.error}</Text>
-                      <ReportMarkdownViewer
-                        markdown={activeArtifactContent.markdown}
-                        components={markdownComponents}
-                        className="assistant-artifact-markdown"
-                      />
-                    </VStack>
-                  ) : (
+              <Section variant="transparent" className="assistant-artifact-body">
+                {activeArtifactContent?.status === "loading" ? (
+                  <HStack gap={2} vAlign="center" className="assistant-artifact-loading">
+                    <Icon icon={LoaderCircle} size="sm" color="secondary" className="assistant-message-status-spinner" />
+                    <Text type="body" color="secondary">报告 Artifact 加载中...</Text>
+                  </HStack>
+                ) : activeArtifactContent?.status === "error" ? (
+                  <VStack gap={2} hAlign="stretch" className="assistant-artifact-error">
+                    <Text type="label" color="primary">报告 Artifact 加载失败</Text>
+                    <Text type="body" color="secondary">{activeArtifactContent.error}</Text>
                     <ReportMarkdownViewer
-                      markdown={activeArtifactContent?.markdown ?? activeArtifactMessage.content}
+                      markdown={activeArtifactContent.markdown}
                       components={markdownComponents}
                       className="assistant-artifact-markdown"
                     />
-                  )}
-                </Section>
-              )}
+                  </VStack>
+                ) : (
+                  <ReportMarkdownViewer
+                    markdown={activeArtifactContent?.markdown ?? activeArtifactMessage.content}
+                    components={markdownComponents}
+                    className="assistant-artifact-markdown"
+                  />
+                )}
+              </Section>
             </Card>
           </>
         )}
