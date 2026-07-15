@@ -260,6 +260,16 @@ ipcMain.handle("assistant:message:cancel", (_event, messageId: string) => {
   getAssistantRuntime().cancelMessage(messageId);
   return true;
 });
+ipcMain.handle("assistant:chat-csv:import", (_event, input) => getAssistantRuntime().importConversationCsv(input));
+ipcMain.handle("assistant:chat-csv:list", (_event, userId: string, conversationId: string) =>
+  getAssistantRuntime().listConversationCsvAttachments(userId, conversationId),
+);
+ipcMain.handle("assistant:chat-csv:remove", (_event, userId: string, conversationId: string, tempDataSourceId: string) =>
+  getAssistantRuntime().removeConversationCsvAttachment(userId, conversationId, tempDataSourceId),
+);
+ipcMain.handle("assistant:chat-csv:schema-context", (_event, userId: string, conversationId: string, tempDataSourceIds?: string[]) =>
+  getAssistantRuntime().buildConversationTempSchemaContext(userId, conversationId, tempDataSourceIds),
+);
 ipcMain.handle("assistant:tool:approve", (_event, userId: string, toolCallId: string, approved: boolean) =>
   getAssistantRuntime().approveTool(userId, toolCallId, approved),
 );

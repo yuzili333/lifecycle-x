@@ -8,6 +8,7 @@ import type {
   AssistantSendResult,
   AssistantStreamEvent,
 } from "../main/assistantRuntime";
+import type { ChatCsvAttachment, ImportConversationCsvInput } from "../main/chatCsvTempSource";
 import type { ArtifactRecord, ConversationToolState, ToolCallRecord, ToolKind } from "../main/toolOrchestration";
 import type { WorkflowContextSummary, WorkflowDatasetRef } from "../main/workflowRuntime";
 
@@ -42,6 +43,14 @@ const lifecycleXApi = {
       ipcRenderer.invoke("assistant:message:retry", input) as Promise<AssistantRetryResult>,
     cancelMessage: (messageId: string) =>
       ipcRenderer.invoke("assistant:message:cancel", messageId) as Promise<boolean>,
+    importConversationCsv: (input: ImportConversationCsvInput) =>
+      ipcRenderer.invoke("assistant:chat-csv:import", input) as Promise<ChatCsvAttachment>,
+    listConversationCsvAttachments: (userId: string, conversationId: string) =>
+      ipcRenderer.invoke("assistant:chat-csv:list", userId, conversationId) as Promise<ChatCsvAttachment[]>,
+    removeConversationCsvAttachment: (userId: string, conversationId: string, tempDataSourceId: string) =>
+      ipcRenderer.invoke("assistant:chat-csv:remove", userId, conversationId, tempDataSourceId) as Promise<{ success: true; tempDataSourceId: string }>,
+    getConversationTempSchemaContext: (userId: string, conversationId: string, tempDataSourceIds?: string[]) =>
+      ipcRenderer.invoke("assistant:chat-csv:schema-context", userId, conversationId, tempDataSourceIds) as Promise<string | null>,
     approveTool: (userId: string, toolCallId: string, approved: boolean) =>
       ipcRenderer.invoke("assistant:tool:approve", userId, toolCallId, approved) as Promise<{
         success: true;

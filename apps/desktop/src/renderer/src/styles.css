@@ -681,6 +681,98 @@ button {
   min-height: 22px;
 }
 
+.assistant-chat-csv-input {
+  display: none;
+}
+
+.assistant-chat-csv-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  margin-bottom: 8px;
+}
+
+.assistant-chat-csv-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  box-sizing: border-box;
+  max-width: min(100%, 360px);
+  min-width: 0;
+  min-height: 34px;
+  padding: 5px 6px 5px 10px;
+  border: 1px solid color-mix(in srgb, var(--workbench-accent, #65d6d2) 34%, transparent);
+  border-radius: 6px;
+  color: color-mix(in srgb, var(--workbench-foreground, #e6edf6) 90%, transparent);
+  background: color-mix(in srgb, var(--workbench-background, #0f1724) 78%, var(--workbench-accent, #65d6d2));
+}
+
+.assistant-chat-csv-chip.importing,
+.assistant-chat-csv-chip.validating,
+.assistant-chat-csv-chip.parsing {
+  border-color: color-mix(in srgb, var(--workbench-accent, #65d6d2) 46%, transparent);
+  background: color-mix(in srgb, var(--workbench-background, #0f1724) 70%, var(--workbench-accent, #65d6d2));
+}
+
+.assistant-chat-csv-chip.failed {
+  border-color: color-mix(in srgb, #f87171 54%, transparent);
+  background: color-mix(in srgb, var(--workbench-background, #0f1724) 78%, #f87171);
+}
+
+.assistant-chat-csv-chip-main {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.assistant-chat-csv-chip-name,
+.assistant-chat-csv-chip-meta {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.assistant-chat-csv-chip-name {
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.25;
+}
+
+.assistant-chat-csv-chip-meta {
+  color: color-mix(in srgb, var(--workbench-foreground, #e6edf6) 62%, transparent);
+  font-size: 11px;
+  line-height: 1.25;
+}
+
+.assistant-chat-csv-chip-remove {
+  display: inline-grid;
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  place-items: center;
+  border: 0;
+  border-radius: 5px;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+}
+
+.assistant-chat-csv-chip-remove:hover {
+  background: color-mix(in srgb, var(--workbench-foreground, #e6edf6) 12%, transparent);
+}
+
+.assistant-chat-csv-chip-remove:focus-visible {
+  outline: 2px solid var(--workbench-accent, #65d6d2);
+  outline-offset: 2px;
+}
+
 .assistant-bot-avatar {
   display: grid;
   width: 32px;
@@ -1348,15 +1440,28 @@ button {
   max-width: none;
   max-inline-size: none;
   height: 100dvh !important;
+  max-height: 100dvh;
   border-left: 0;
 }
 
 .assistant-artifact-panel.maximized.astryx-stack,
-.assistant-artifact-panel.maximized > .astryx-stack {
-  width: 100%;
-  inline-size: 100%;
-  max-width: 100%;
-  max-inline-size: 100%;
+.assistant-artifact-panel.maximized > .astryx-stack,
+.assistant-artifact-panel.maximized .astryx-stack {
+  width: 100% !important;
+  inline-size: 100% !important;
+  max-width: none !important;
+  max-inline-size: none !important;
+  min-width: 0;
+  min-inline-size: 0;
+}
+
+.assistant-artifact-panel.maximized > *,
+.assistant-artifact-panel.maximized .assistant-artifact-toolbar,
+.assistant-artifact-panel.maximized .assistant-artifact-body {
+  width: 100% !important;
+  inline-size: 100% !important;
+  max-width: none !important;
+  max-inline-size: none !important;
 }
 
 .assistant-artifact-panel.minimized {

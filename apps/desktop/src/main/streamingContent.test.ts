@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { applyChatStreamEvent, isReportMarkdownContentBlock, reportMarkdownContentIndex, ReportTransitionController, StreamSegmentManager, splitReportMarkdownContent } from "../renderer/src/streaming-content";
+import { applyChatStreamEvent, isReportMarkdownContentBlock, reportMarkdownContentIndex, ReportTransitionController, resolveReportCardRenderTransition, StreamSegmentManager, splitReportMarkdownContent } from "../renderer/src/streaming-content";
 
 describe("StreamSegmentManager", () => {
   it("keeps text and report segments independent and deduplicates sequence numbers", () => {
@@ -209,6 +209,35 @@ describe("ReportTransitionController", () => {
     expect(onCardReady).toHaveBeenCalledTimes(1);
     expect(onCardVisible).toHaveBeenCalledTimes(1);
     controller.dispose();
+  });
+});
+
+describe("resolveReportCardRenderTransition", () => {
+  it("renders persisted completed report artifacts as visible cards immediately", () => {
+    expect(resolveReportCardRenderTransition({
+      segmentId: "report:message-1:tool-1:v1",
+      messageStatus: "completed",
+      hasCompletedReportRecord: true,
+      hasReportArtifact: true,
+      hasStreamReportSegment: false,
+    })).toEqual({
+      segmentId: "report:message-1:tool-1:v1",
+      status: "visible",
+    });
+  });
+
+  it("keeps first streaming report transitions controlled by stored stream state", () => {
+    expect(resolveReportCardRenderTransition({
+      segmentId: "report:message-1:tool-1:v1",
+      messageStatus: "completed",
+      hasCompletedReportRecord: true,
+      hasReportArtifact: true,
+      hasStreamReportSegment: true,
+      storedTransition: { segmentId: "report:message-1:tool-1:v1", status: "buffering" },
+    })).toEqual({
+      segmentId: "report:message-1:tool-1:v1",
+      status: "buffering",
+    });
   });
 });
 

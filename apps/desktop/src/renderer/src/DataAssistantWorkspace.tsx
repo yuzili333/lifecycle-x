@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type CSSProperties } from "react";
 import { Avatar } from "@astryxdesign/core/Avatar";
 import { Button } from "@astryxdesign/core/Button";
 import {
@@ -37,6 +37,7 @@ import {
   DEFAULT_REPORT_TRANSITION_POLICY,
   reportMarkdownContentIndex,
   ReportTransitionController,
+  resolveReportCardRenderTransition,
   splitReportMarkdownContent,
   StreamSegmentManager,
   type ChatStreamEvent,
@@ -56,6 +57,7 @@ import type {
   AssistantSkill,
   AssistantStreamEvent,
 } from "../../main/assistantRuntime";
+import type { ChatCsvAttachment } from "../../main/chatCsvTempSource";
 import type { ArtifactRecord, ConversationToolState, ToolCallRecord } from "../../main/toolOrchestration";
 import type { WorkflowContextSummary } from "../../main/workflowRuntime";
 
@@ -86,6 +88,7 @@ const ARTIFACT_WINDOW_STATE_KEY = "cycle-probe:assistant:artifact-window";
 const ARTIFACT_PANEL_WIDTH_KEY = "cycle-probe:assistant:artifact-panel-width";
 const SKILL_TOKEN_PREFIX = "skill_";
 const MAX_CONVERSATION_TITLE_LENGTH = 200;
+const CHAT_CSV_MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024;
 const REPORT_TRANSITION_POLICY: ReportTransitionPolicy = {
   ...DEFAULT_REPORT_TRANSITION_POLICY,
   bufferDelayMs: 1000,
@@ -232,6 +235,16 @@ function dataSourceButtonLabel(dataSource?: DataSourceSummary) {
     return "数据源";
   }
   return dataSource.type === "csv" ? dataSource.name : dataSource.database;
+}
+
+function formatFileSize(bytes: number) {
+  if (bytes >= 1024 * 1024) {
+    return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  }
+  if (bytes >= 1024) {
+    return `${Math.ceil(bytes / 1024)} KB`;
+  }
+  return `${bytes} B`;
 }
 
 function isPythonApprovalPrompt(value: string) {
@@ -719,6 +732,7 @@ export function DataAssistantWorkspace({
   const [messagesByConversation, setMessagesByConversation] = useState<Record<string, AssistantMessage[]>>({});
   const [workflowContextByConversation, setWorkflowContextByConversation] = useState<Record<string, WorkflowContextSummary | null>>({});
   const [toolStateByConversation, setToolStateByConversation] = useState<Record<string, ConversationToolState | null>>({});
+  const [chatCsvAttachmentsByConversation, setChatCsvAttachmentsByConversation] = useState<Record<string, ChatCsvAttachment[]>>({});
   const [activeConversationId, setActiveConversationId] = useState("");
   const [composerValue, setComposerValue] = useState("");
   const [dataSources, setDataSources] = useState<DataSourceSummary[]>([]);
@@ -731,12 +745,14 @@ export function DataAssistantWorkspace({
   const [editingConversation, setEditingConversation] = useState<AssistantConversation | null>(null);
   const [editTitleDraft, setEditTitleDraft] = useState("");
   const [deletingConversation, setDeletingConversation] = useState<AssistantConversation | null>(null);
+  const [isImportingChatCsv, setIsImportingChatCsv] = useState(false);
   const [artifactWindow, setArtifactWindow] = useState<ArtifactWindowState>(() => readArtifactWindowState());
   const [artifactContentByMessage, setArtifactContentByMessage] = useState<Record<string, ArtifactContentState>>({});
   const [reportCardTransitions, setReportCardTransitions] = useState<Record<string, ReportCardTransitionState>>({});
   const [reportTransitionHeights, setReportTransitionHeights] = useState<Record<string, number>>({});
   const [streamContentRevision, setStreamContentRevision] = useState(0);
   const streamSegmentManagerRef = useRef(new StreamSegmentManager());
+  const chatCsvInputRef = useRef<HTMLInputElement | null>(null);
   const pendingMessageDeltasRef = useRef(new Map<string, MessageDeltaStreamEvent>());
   const messageDeltaFlushTimerRef = useRef<number | null>(null);
   const reportTransitionController = useMemo(
@@ -861,6 +877,9 @@ export function DataAssistantWorkspace({
   const activeArtifactReportRecord = activeArtifactMessage ? reportRecordForMessage(activeArtifactMessage, activeToolState) : undefined;
   const isStreaming = activeMessages.some((message) => message.role === "assistant" && (message.status === "receiving" || message.status === "processing"));
   const activeStreamingMessageId = activeMessages.find((message) => message.role === "assistant" && (message.status === "receiving" || message.status === "processing"))?.id;
+  const activeChatCsvAttachments = activeConversation ? chatCsvAttachmentsByConversation[activeConversation.id] ?? [] : [];
+  const readyChatCsvAttachments = activeChatCsvAttachments.filter((attachment) => attachment.status === "ready" && attachment.tempDataSourceId);
+  const activeTempDataSourceIds = readyChatCsvAttachments.map((attachment) => attachment.tempDataSourceId as string);
 
   const connectedDataSources = useMemo(
     () => dataSources.filter((dataSource) => dataSource.status === "online"),
@@ -871,6 +890,8 @@ export function DataAssistantWorkspace({
     () => connectedDataSources.find((dataSource) => dataSource.id === selectedDataSourceId),
     [connectedDataSources, selectedDataSourceId],
   );
+  const messageTempDataSourceIds = selectedDataSource ? [] : activeTempDataSourceIds;
+  const messageTempDataSourceLabels = selectedDataSource ? [] : readyChatCsvAttachments.map((attachment) => attachment.fileName);
 
   const upsertMessage = useCallback((conversationId: string, message: AssistantMessage) => {
     setMessagesByConversation((current) => ({
@@ -1057,11 +1078,41 @@ export function DataAssistantWorkspace({
     writeArtifactWindowState(artifactWindow);
   }, [artifactWindow]);
 
+  useEffect(() => {
+    if (!user?.id || !activeConversation?.id || !window.lifecycleX?.assistant) {
+      return;
+    }
+    let cancelled = false;
+    void window.lifecycleX.assistant
+      .listConversationCsvAttachments(user.id, activeConversation.id)
+      .then((attachments) => {
+        if (cancelled) {
+          return;
+        }
+        setChatCsvAttachmentsByConversation((current) => ({ ...current, [activeConversation.id]: attachments }));
+      })
+      .catch((error) => {
+        if (cancelled) {
+          return;
+        }
+        toast({
+          type: "error",
+          body: error instanceof Error ? error.message : "会话临时 CSV 恢复失败。",
+          uniqueID: "assistant-chat-csv-list-error",
+          collisionBehavior: "overwrite",
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeConversation?.id, toast, user?.id]);
+
   useEffect(() => () => reportTransitionController.dispose(), [reportTransitionController]);
 
   useEffect(() => {
     const activeSegmentIds = new Set<string>();
     const inactiveSegmentIds = new Set<string>();
+    const immediatelyVisibleSegments = new Map<string, ReportCardTransitionState>();
     for (const message of activeMessages) {
       if (message.role !== "assistant" || message.status !== "completed") {
         continue;
@@ -1078,6 +1129,14 @@ export function DataAssistantWorkspace({
         : streamReportSegment?.type === "report" && streamReportSegment.reportTitle
           ? streamReportSegment.reportTitle
           : artifactTitle(message);
+      const isPersistedReportCard = Boolean(reportRecord && segmentId && artifactId && !streamReportSegment);
+      if (isPersistedReportCard && segmentId) {
+        activeSegmentIds.add(segmentId);
+        if (reportCardTransitions[segmentId]?.status !== "visible") {
+          immediatelyVisibleSegments.set(segmentId, { segmentId, status: "visible" });
+        }
+        continue;
+      }
       const markdownStreamCompleted =
         !reportSegment ||
         reportSegment.type !== "report" ||
@@ -1107,7 +1166,7 @@ export function DataAssistantWorkspace({
         inactiveSegmentIds.add(segmentId);
       }
     }
-    if (inactiveSegmentIds.size > 0) {
+    if (inactiveSegmentIds.size > 0 || immediatelyVisibleSegments.size > 0) {
       setReportCardTransitions((current) => {
         let changed = false;
         const next = { ...current };
@@ -1117,6 +1176,12 @@ export function DataAssistantWorkspace({
           }
           if (segmentId in next) {
             delete next[segmentId];
+            changed = true;
+          }
+        }
+        for (const [segmentId, transition] of immediatelyVisibleSegments) {
+          if (next[segmentId]?.status !== "visible") {
+            next[segmentId] = transition;
             changed = true;
           }
         }
@@ -1147,6 +1212,147 @@ export function DataAssistantWorkspace({
     setActiveConversationId(conversation.id);
     setComposerValue("");
   };
+
+  const importChatCsvFile = useCallback(
+    async (file: File) => {
+      if (!user?.id || !window.lifecycleX?.assistant) {
+        toast({
+          type: "error",
+          body: "本地对话服务不可用。",
+          uniqueID: "assistant-chat-csv-ipc-unavailable",
+          collisionBehavior: "overwrite",
+        });
+        return;
+      }
+      const hasCsvExtension = /\.csv$/i.test(file.name);
+      const hasCsvMime = Boolean(file.type && /^(text\/csv|application\/vnd\.ms-excel)$/i.test(file.type));
+      if (!hasCsvExtension && !hasCsvMime) {
+        toast({
+          type: "error",
+          body: "仅支持上传 CSV 文件。",
+          uniqueID: "assistant-chat-csv-type-error",
+          collisionBehavior: "overwrite",
+        });
+        return;
+      }
+      if (file.size > CHAT_CSV_MAX_FILE_SIZE_BYTES) {
+        toast({
+          type: "error",
+          body: "CSV 文件不能超过 10 MB。",
+          uniqueID: "assistant-chat-csv-size-error",
+          collisionBehavior: "overwrite",
+        });
+        return;
+      }
+      if (file.size <= 0) {
+        toast({
+          type: "error",
+          body: "CSV 文件不能为空。",
+          uniqueID: "assistant-chat-csv-empty-error",
+          collisionBehavior: "overwrite",
+        });
+        return;
+      }
+
+      setIsImportingChatCsv(true);
+      try {
+        const conversation = activeConversation ?? await window.lifecycleX.assistant.createConversation(user.id, file.name.replace(/\.csv$/i, "").slice(0, 18) || "CSV 数据分析");
+        setConversations((current) => mergeConversation(current, conversation));
+        setMessagesByConversation((current) => ({ ...current, [conversation.id]: current[conversation.id] ?? [] }));
+        setActiveConversationId(conversation.id);
+
+        const localAttachment: ChatCsvAttachment = {
+          attachmentId: `local-${Date.now()}`,
+          conversationId: conversation.id,
+          fileName: file.name,
+          fileSizeBytes: file.size,
+          mimeType: "text/csv",
+          status: "importing",
+          createdAt: new Date().toISOString(),
+        };
+        setChatCsvAttachmentsByConversation((current) => ({
+          ...current,
+          [conversation.id]: [localAttachment, ...(current[conversation.id] ?? [])],
+        }));
+
+        const buffer = await file.arrayBuffer();
+        const imported = await window.lifecycleX.assistant.importConversationCsv({
+          conversationId: conversation.id,
+          userId: user.id,
+          fileName: file.name,
+          fileSizeBytes: file.size,
+          fileBuffer: new Uint8Array(buffer),
+          mimeType: file.type || "text/csv",
+        });
+        setChatCsvAttachmentsByConversation((current) => ({
+          ...current,
+          [conversation.id]: [imported, ...(current[conversation.id] ?? []).filter((item) => item.attachmentId !== localAttachment.attachmentId && item.tempDataSourceId !== imported.tempDataSourceId)],
+        }));
+        if (imported.status === "failed") {
+          toast({
+            type: "error",
+            body: imported.error?.message ?? "CSV 导入失败。",
+            uniqueID: "assistant-chat-csv-import-error",
+            collisionBehavior: "overwrite",
+          });
+        } else {
+          toast({
+            type: "info",
+            body: imported.warnings?.length
+              ? `CSV 已导入临时表：${imported.warnings[0]}`
+              : `CSV 已导入临时表：${imported.rowCount ?? 0} 行，${imported.columnCount ?? 0} 列。`,
+            uniqueID: "assistant-chat-csv-import-success",
+            collisionBehavior: "overwrite",
+          });
+        }
+      } catch (error) {
+        toast({
+          type: "error",
+          body: error instanceof Error ? error.message : "CSV 导入失败。",
+          uniqueID: "assistant-chat-csv-import-exception",
+          collisionBehavior: "overwrite",
+        });
+      } finally {
+        setIsImportingChatCsv(false);
+      }
+    },
+    [activeConversation, toast, user?.id],
+  );
+
+  const handleChatCsvFileSelect = useCallback(
+    (event: ChangeEvent<HTMLInputElement>) => {
+      const file = event.target.files?.[0];
+      event.target.value = "";
+      if (!file) {
+        return;
+      }
+      void importChatCsvFile(file);
+    },
+    [importChatCsvFile],
+  );
+
+  const removeChatCsvAttachment = useCallback(
+    async (attachment: ChatCsvAttachment) => {
+      if (!user?.id || !activeConversation?.id || !window.lifecycleX?.assistant || !attachment.tempDataSourceId) {
+        return;
+      }
+      try {
+        await window.lifecycleX.assistant.removeConversationCsvAttachment(user.id, activeConversation.id, attachment.tempDataSourceId);
+        setChatCsvAttachmentsByConversation((current) => ({
+          ...current,
+          [activeConversation.id]: (current[activeConversation.id] ?? []).filter((item) => item.attachmentId !== attachment.attachmentId),
+        }));
+      } catch (error) {
+        toast({
+          type: "error",
+          body: error instanceof Error ? error.message : "临时 CSV 移除失败。",
+          uniqueID: "assistant-chat-csv-remove-error",
+          collisionBehavior: "overwrite",
+        });
+      }
+    },
+    [activeConversation?.id, toast, user?.id],
+  );
 
   const openEditConversation = (conversation: AssistantConversation) => {
     setEditingConversation(conversation);
@@ -1342,7 +1548,12 @@ export function DataAssistantWorkspace({
   }, []);
 
   const restoreArtifactWindowWidth = useCallback(() => {
-    setArtifactWindow((current) => ({ ...current, isMinimized: false, isMaximized: false }));
+    setArtifactWindow((current) => {
+      if (!current.isMinimized && !current.isMaximized) {
+        return current;
+      }
+      return { ...current, isMinimized: false, isMaximized: false };
+    });
   }, []);
 
   const toggleArtifactMaximized = useCallback(() => {
@@ -1433,6 +1644,7 @@ export function DataAssistantWorkspace({
           clientRequestId: createClientRequestId(),
           modelName,
           dataSourceLabel: selectedDataSource ? dataSourceLabel(selectedDataSource) : null,
+          selectedTempDataSourceIds: messageTempDataSourceIds,
           schemaContextMarkdown,
           skill: selectedSkill,
           approvalMode,
@@ -1451,7 +1663,7 @@ export function DataAssistantWorkspace({
         });
       }
     },
-    [approvalMode, loadSchemaContextMarkdown, modelName, selectedDataSource, selectedSkill, toast, upsertMessage, user?.id],
+    [approvalMode, loadSchemaContextMarkdown, messageTempDataSourceIds, modelName, selectedDataSource, selectedSkill, toast, upsertMessage, user?.id],
   );
 
   const renderMessageMetadata = useCallback(
@@ -1544,6 +1756,15 @@ export function DataAssistantWorkspace({
       if (!prompt || isStreaming || !user?.id) {
         return;
       }
+      if (activeChatCsvAttachments.some((attachment) => attachment.status === "importing" || attachment.status === "validating" || attachment.status === "parsing")) {
+        toast({
+          type: "error",
+          body: "CSV 正在导入，请等待完成后再发送。",
+          uniqueID: "assistant-chat-csv-importing-submit",
+          collisionBehavior: "overwrite",
+        });
+        return;
+      }
       if (activePendingPythonToolCallId && isPythonApprovalPrompt(prompt)) {
         setComposerValue("");
         await approvePendingPython(true);
@@ -1579,6 +1800,8 @@ export function DataAssistantWorkspace({
         const optimisticContext: AssistantMessage["context"] = {
           dataSourceLabel: selectedDataSource ? dataSourceLabel(selectedDataSource) : null,
           skill: selectedSkill,
+          temporaryDataSourceIds: messageTempDataSourceIds,
+          temporaryDataSourceLabels: messageTempDataSourceLabels,
         };
         const optimisticUserMessage = createOptimisticUserMessage(user.id, conversationId, prompt, optimisticContext);
         optimisticMessageId = optimisticUserMessage.id;
@@ -1594,6 +1817,7 @@ export function DataAssistantWorkspace({
           modelName,
           dataSourceId: selectedDataSource?.id ?? null,
           dataSourceLabel: selectedDataSource ? dataSourceLabel(selectedDataSource) : null,
+          selectedTempDataSourceIds: messageTempDataSourceIds,
           schemaContextMarkdown,
           skill: selectedSkill,
           approvalMode,
@@ -1623,12 +1847,15 @@ export function DataAssistantWorkspace({
     },
     [
       activeConversation,
+      activeChatCsvAttachments,
       activePendingPythonToolCallId,
       approvalMode,
       approvePendingPython,
       isModelConfigured,
       isStreaming,
       loadSchemaContextMarkdown,
+      messageTempDataSourceIds,
+      messageTempDataSourceLabels,
       modelName,
       onRequireModelConfig,
       selectedDataSource,
@@ -1714,13 +1941,17 @@ export function DataAssistantWorkspace({
 
   const renderUserContext = (message: AssistantMessage) => {
     const dataSource = message.context?.dataSourceLabel;
-    if (!dataSource) {
+    const temporaryLabels = message.context?.temporaryDataSourceLabels ?? [];
+    if (!dataSource && temporaryLabels.length === 0) {
       return null;
     }
 
     return (
       <HStack gap={1} wrap="wrap" className="assistant-user-context-tokens">
-        <Token label={dataSource} color="blue" size="sm" />
+        {dataSource && <Token label={dataSource} color="blue" size="sm" />}
+        {temporaryLabels.map((label) => (
+          <Token key={label} label={`CSV：${label}`} color="green" size="sm" />
+        ))}
       </HStack>
     );
   };
@@ -1817,8 +2048,16 @@ export function DataAssistantWorkspace({
       .getMessageSegments(message.id)
       .find((segment) => segment.type === "report" && segment.reportArtifactId);
     const segmentId = toolSegmentId ?? streamReportSegment?.segmentId;
-    const transition = segmentId ? reportCardTransitions[segmentId] : undefined;
     const reportRecord = completedReportRecordForMessage(message, activeToolState);
+    const artifactId = reportArtifactIdForMessage(message, activeToolState);
+    const transition = resolveReportCardRenderTransition({
+      segmentId,
+      messageStatus: message.status,
+      hasCompletedReportRecord: Boolean(reportRecord),
+      hasReportArtifact: Boolean(artifactId),
+      hasStreamReportSegment: Boolean(streamReportSegment),
+      storedTransition: segmentId ? reportCardTransitions[segmentId] : undefined,
+    });
     const reportTitle = typeof reportRecord?.request.title === "string"
       ? reportRecord.request.title
       : streamReportSegment?.type === "report" && streamReportSegment.reportTitle
@@ -1829,7 +2068,7 @@ export function DataAssistantWorkspace({
       Boolean(segmentId) &&
       transition?.status === "visible" &&
       message.status === "completed" &&
-      Boolean(reportArtifactIdForMessage(message, activeToolState));
+      Boolean(artifactId);
     const markdownBlockCandidates = isReportTransitionActive
       ? message.blocks
           .map((block, index) => ({ block, index }))
@@ -2024,6 +2263,47 @@ export function DataAssistantWorkspace({
             emptyState={<AssistantLanding userName={landingUserName} />}
             composer={
               <div className="assistant-composer-shell">
+                {activeChatCsvAttachments.length > 0 && (
+                  <div className="assistant-chat-csv-attachments" aria-label="会话临时 CSV">
+                    {activeChatCsvAttachments.map((attachment) => (
+                      <div
+                        key={attachment.attachmentId}
+                        className={`assistant-chat-csv-chip ${attachment.status}`}
+                        title={attachment.error?.message ?? `${attachment.fileName} · ${attachment.sqliteTableName ?? "导入中"}`}
+                      >
+                        <span className="assistant-chat-csv-chip-main">
+                          <span className="assistant-chat-csv-chip-name">{attachment.fileName}</span>
+                          <span className="assistant-chat-csv-chip-meta">
+                            {attachment.status === "ready"
+                              ? `${attachment.rowCount ?? 0} 行 · ${attachment.columnCount ?? 0} 列`
+                              : attachment.status === "failed"
+                                ? attachment.error?.message ?? "导入失败"
+                                : "导入中"}
+                            {" · "}
+                            {formatFileSize(attachment.fileSizeBytes)}
+                          </span>
+                        </span>
+                        {attachment.status === "ready" && (
+                          <button
+                            type="button"
+                            className="assistant-chat-csv-chip-remove"
+                            aria-label={`移除 ${attachment.fileName}`}
+                            onClick={() => void removeChatCsvAttachment(attachment)}
+                          >
+                            <Icon icon={X} size="xsm" color="inherit" />
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <input
+                  ref={chatCsvInputRef}
+                  type="file"
+                  accept=".csv,text/csv"
+                  className="assistant-chat-csv-input"
+                  onChange={handleChatCsvFileSelect}
+                />
                 <ChatComposer
                   value={composerValue}
                   onChange={setComposerValue}
@@ -2049,13 +2329,22 @@ export function DataAssistantWorkspace({
                         }}
                         items={dataSourceMenuItems}
                       />
+                      <Button
+                        label={isImportingChatCsv ? "CSV导入中" : "上传CSV"}
+                        variant="ghost"
+                        size="sm"
+                        className="assistant-composer-action-button"
+                        icon={<AssistantActionIcon src={attachIcon} />}
+                        isLoading={isImportingChatCsv}
+                        onClick={() => chatCsvInputRef.current?.click()}
+                      />
                       <DropdownMenu
                         hasChevron={false}
                         placement="above"
-	                        menuWidth={190}
-	                        button={{
-	                          label: selectedSkill ? skillLabel(selectedSkill) : "Skill",
-	                          variant: "ghost",
+                        menuWidth={190}
+                        button={{
+                          label: selectedSkill ? skillLabel(selectedSkill) : "Skill",
+                          variant: "ghost",
                           size: "sm",
                           className: "assistant-composer-action-button",
                           icon: <AssistantActionIcon src={mentionIcon} />,

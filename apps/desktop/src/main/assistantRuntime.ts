@@ -35,6 +35,13 @@ import {
   type ToolResultRegistry,
 } from "./toolOrchestration";
 import { createStreamingModelAdapter, type ConversationMessage, type ToolDefinition } from "./streamingModelAdapter";
+import {
+  chatCsvError,
+  ConversationTempSourceManager,
+  type ChatCsvAttachment,
+  type ConversationTempCsvTable,
+  type ImportConversationCsvInput,
+} from "./chatCsvTempSource";
 
 const require = createRequire(import.meta.url);
 const Database = require("better-sqlite3");
@@ -74,6 +81,8 @@ export type AssistantBlock = {
 export type AssistantMessageContext = {
   dataSourceLabel?: string | null;
   skill?: AssistantSkill | null;
+  temporaryDataSourceIds?: string[];
+  temporaryDataSourceLabels?: string[];
 };
 
 export type AssistantConversation = {
@@ -128,6 +137,7 @@ export type AssistantSendInput = {
   modelName: string;
   dataSourceId?: string | null;
   dataSourceLabel?: string | null;
+  selectedTempDataSourceIds?: string[];
   schemaContextMarkdown?: string | null;
   skill?: AssistantSkill | null;
   approvalMode: AssistantApprovalMode;
@@ -139,6 +149,7 @@ export type AssistantRetryInput = {
   clientRequestId: string;
   modelName: string;
   dataSourceLabel?: string | null;
+  selectedTempDataSourceIds?: string[];
   schemaContextMarkdown?: string | null;
   skill?: AssistantSkill | null;
   approvalMode: AssistantApprovalMode;
@@ -891,6 +902,7 @@ export class AssistantRuntime {
   private readonly workflowMemoryBridge: SQLiteWorkflowMemoryBridge;
   private readonly toolResultRegistry: ToolResultRegistry;
   private readonly toolArtifactManager: ArtifactManager;
+  private readonly tempSourceManager: ConversationTempSourceManager;
 
   constructor(options: AssistantRuntimeOptions) {
     this.options = options;
@@ -899,6 +911,9 @@ export class AssistantRuntime {
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
     this.migrate();
+    this.tempSourceManager = new ConversationTempSourceManager(this.db);
+    this.tempSourceManager.migrate();
+    this.tempSourceManager.cleanupExpired();
     this.toolResultRegistry = new SQLiteToolResultRegistry(this.db);
     this.toolArtifactManager = new SQLiteArtifactManager(this.db);
     this.workflowStore = new AuditedWorkflowStateStore(new SQLiteWorkflowStateStore(this.db), new SQLiteWorkflowAuditLogger(this.db));
@@ -976,8 +991,73 @@ export class AssistantRuntime {
     if (!conversation) {
       throw new Error("对话记录不存在。");
     }
+    this.tempSourceManager.cleanupConversation(conversationId, userId);
     this.db.prepare("delete from conversations where id = ? and user_id = ?").run(conversationId, userId);
     return { success: true, conversationId };
+  }
+
+  importConversationCsv(input: ImportConversationCsvInput): ChatCsvAttachment {
+    const conversation = this.findConversation(input.userId, input.conversationId);
+    if (!conversation) {
+      throw new Error("对话记录不存在，无法导入会话临时 CSV。");
+    }
+    try {
+      const attachment = this.tempSourceManager.importCsv(input);
+      this.touchConversation(input.conversationId);
+      return attachment;
+    } catch (error) {
+      return {
+        attachmentId: `failed_${randomUUID()}`,
+        conversationId: input.conversationId,
+        fileName: input.fileName,
+        fileSizeBytes: input.fileSizeBytes,
+        mimeType: "text/csv",
+        status: "failed",
+        createdAt: nowIso(),
+        error: chatCsvError(error),
+      };
+    }
+  }
+
+  listConversationCsvAttachments(userId: string, conversationId: string): ChatCsvAttachment[] {
+    const conversation = this.findConversation(userId, conversationId);
+    if (!conversation) {
+      return [];
+    }
+    return this.tempSourceManager.listByConversation(conversationId, userId).map((source) => ({
+      attachmentId: source.tempDataSourceId,
+      conversationId: source.conversationId,
+      fileName: source.fileName,
+      fileSizeBytes: source.fileSizeBytes,
+      mimeType: "text/csv" as const,
+      status: "ready" as const,
+      tempDataSourceId: source.tempDataSourceId,
+      tempTableId: source.tempTableId,
+      sqliteTableName: source.sqliteTableName,
+      rowCount: source.rowCount,
+      columnCount: source.columnCount,
+      columns: source.columns,
+      createdAt: source.createdAt,
+    }));
+  }
+
+  removeConversationCsvAttachment(userId: string, conversationId: string, tempDataSourceId: string) {
+    this.tempSourceManager.removeTempSource(tempDataSourceId, userId, conversationId);
+    this.touchConversation(conversationId);
+    return { success: true as const, tempDataSourceId };
+  }
+
+  buildConversationTempSchemaContext(userId: string, conversationId: string, tempDataSourceIds?: string[]) {
+    return this.tempSourceManager.buildSchemaContextMarkdown({ userId, conversationId, tempDataSourceIds });
+  }
+
+  private activeTempSources(userId: string, conversationId: string, selectedTempDataSourceIds?: string[]): ConversationTempCsvTable[] {
+    if (selectedTempDataSourceIds?.length) {
+      return selectedTempDataSourceIds
+        .map((tempDataSourceId) => this.tempSourceManager.getTempSource(tempDataSourceId, userId, conversationId))
+        .filter((source): source is ConversationTempCsvTable => Boolean(source && source.status === "ready"));
+    }
+    return this.tempSourceManager.listByConversation(conversationId, userId).slice(0, 1);
   }
 
   async sendMessage(input: AssistantSendInput): Promise<AssistantSendResult> {
@@ -997,6 +1077,18 @@ export class AssistantRuntime {
     const conversation = input.conversationId
       ? this.findConversation(input.userId, input.conversationId) ?? this.createConversation(input.userId)
       : this.createConversation(input.userId, prompt.slice(0, 18) || "新对话");
+    const tempSources = this.activeTempSources(input.userId, conversation.id, input.selectedTempDataSourceIds);
+    const tempSchemaContextMarkdown = this.tempSourceManager.buildSchemaContextMarkdown({
+      userId: input.userId,
+      conversationId: conversation.id,
+      tempDataSourceIds: tempSources.map((source) => source.tempDataSourceId),
+    });
+    const effectiveInput: AssistantSendInput = {
+      ...input,
+      conversationId: conversation.id,
+      selectedTempDataSourceIds: tempSources.map((source) => source.tempDataSourceId),
+      schemaContextMarkdown: [input.schemaContextMarkdown, tempSchemaContextMarkdown].filter(Boolean).join("\n\n") || null,
+    };
 
     if (conversation.title === "新对话") {
       conversation.title = prompt.slice(0, 18) || "新对话";
@@ -1015,6 +1107,8 @@ export class AssistantRuntime {
       context: {
         dataSourceLabel: input.dataSourceLabel ?? null,
         skill: input.skill ?? null,
+        temporaryDataSourceIds: tempSources.map((source) => source.tempDataSourceId),
+        temporaryDataSourceLabels: tempSources.map((source) => source.fileName),
       },
     });
     const assistantMessage = this.insertMessage({
@@ -1031,14 +1125,14 @@ export class AssistantRuntime {
     this.options.emit({ type: "message", conversationId: conversation.id, message: assistantMessage });
 
     const tool = detectTool(prompt);
-    if (!shouldRouteSkillThroughModel(input.skill) && await this.routeOverallRiskSkillWorkflow(input, conversation, assistantMessage)) {
+    if (!shouldRouteSkillThroughModel(effectiveInput.skill) && await this.routeOverallRiskSkillWorkflow(effectiveInput, conversation, assistantMessage)) {
       // Routed to the governed multi-step skill workflow.
     } else if (tool) {
-      void this.handleToolCall(input, conversation, assistantMessage, tool);
-    } else if (await this.routePriorSqlAnalysis(input, conversation, assistantMessage)) {
+      void this.handleToolCall(effectiveInput, conversation, assistantMessage, tool);
+    } else if (await this.routePriorSqlAnalysis(effectiveInput, conversation, assistantMessage)) {
       // Routed to a governed Python tool call.
     } else {
-      void this.streamModelResponse(input, conversation, assistantMessage);
+      void this.streamModelResponse(effectiveInput, conversation, assistantMessage);
     }
 
     return { success: true, conversation, userMessage, assistantMessage };
@@ -1321,15 +1415,22 @@ export class AssistantRuntime {
     const nextConversation = this.findConversation(input.userId, conversation.id) ?? conversation;
     this.options.emit({ type: "conversation", conversation: nextConversation });
     this.options.emit({ type: "message", conversationId: conversation.id, message: assistantMessage });
+    const tempSources = this.activeTempSources(input.userId, conversation.id, input.selectedTempDataSourceIds);
+    const tempSchemaContextMarkdown = this.tempSourceManager.buildSchemaContextMarkdown({
+      userId: input.userId,
+      conversationId: conversation.id,
+      tempDataSourceIds: tempSources.map((source) => source.tempDataSourceId),
+    });
 
-    const retryInput = {
+    const retryInput: AssistantSendInput = {
       userId: input.userId,
       conversationId: conversation.id,
       clientRequestId: input.clientRequestId,
       prompt: sourceUserMessage.content,
       modelName,
       dataSourceLabel: input.dataSourceLabel,
-      schemaContextMarkdown: input.schemaContextMarkdown,
+      selectedTempDataSourceIds: tempSources.map((source) => source.tempDataSourceId),
+      schemaContextMarkdown: [input.schemaContextMarkdown, tempSchemaContextMarkdown].filter(Boolean).join("\n\n") || null,
       skill: input.skill,
       approvalMode: input.approvalMode,
     };
@@ -1634,15 +1735,43 @@ export class AssistantRuntime {
     return /\bwf_[a-z0-9_]+\b/i.test(script) || /\bsqlite3\.connect\s*\(/i.test(script) || /\bimport\s+(pandas|numpy)\b|\bfrom\s+(pandas|numpy)\b/i.test(script);
   }
 
-  private async normalizePythonToolScript(input: { userId: string; conversationId: string; prompt?: string; script: string }) {
-    if (!this.shouldReplacePythonScript(input.script)) {
-      return input.script;
-    }
+  private async normalizePythonToolScript(input: { userId: string; conversationId: string; prompt?: string; script: string; selectedTempDataSourceIds?: string[] }) {
+    const shouldReplaceScript = this.shouldReplacePythonScript(input.script);
     const { latestSqlToolCall, rows } = await this.latestSqlRowsForConversation(input.userId, input.conversationId);
-    if (!latestSqlToolCall || rows.length === 0) {
-      return input.script;
+    if (latestSqlToolCall && rows.length > 0) {
+      return shouldReplaceScript
+        ? this.buildPythonAnalysisScript(input.prompt || this.sourcePromptForToolCall(latestSqlToolCall) || "基于上一轮 SQL 结果输出分析报告。", latestSqlToolCall, rows)
+        : input.script;
     }
-    return this.buildPythonAnalysisScript(input.prompt || this.sourcePromptForToolCall(latestSqlToolCall) || "基于上一轮 SQL 结果输出分析报告。", latestSqlToolCall, rows);
+    const tempCsvAnalysis = this.tempCsvRowsForPythonAnalysis(input.userId, input.conversationId, input.selectedTempDataSourceIds);
+    if (tempCsvAnalysis) {
+      return this.buildPythonAnalysisScript(input.prompt || `基于临时 CSV ${tempCsvAnalysis.source.fileName} 输出分析报告。`, tempCsvAnalysis.toolCall, tempCsvAnalysis.rows);
+    }
+    return input.script;
+  }
+
+  private tempCsvRowsForPythonAnalysis(userId: string, conversationId: string, selectedTempDataSourceIds?: string[]) {
+    const source = this.activeTempSources(userId, conversationId, selectedTempDataSourceIds)[0];
+    if (!source) {
+      return null;
+    }
+    const rows = this.db.prepare(`select * from ${quoteIdentifier(source.sqliteTableName)}`).all() as Array<Record<string, unknown>>;
+    const result = JSON.stringify({ rowCount: rows.length, previewRows: rows.slice(0, 20), previewRowLimit: 20 }, null, 2);
+    const now = nowIso();
+    const toolCall: AssistantToolCall = {
+      id: `temp_csv_python_source_${source.tempDataSourceId}`,
+      conversationId,
+      messageId: "",
+      userId,
+      kind: "sql",
+      status: "completed",
+      script: `select * from ${quoteIdentifier(source.sqliteTableName)}`,
+      result,
+      approvalMode: "request_approval",
+      createdAt: now,
+      updatedAt: now,
+    };
+    return { source, rows, toolCall };
   }
 
   private recentToolContext(userId: string, conversationId: string) {
@@ -2333,6 +2462,7 @@ export class AssistantRuntime {
               conversationId: conversation.id,
               prompt: input.prompt,
               script: tool.script,
+              selectedTempDataSourceIds: input.selectedTempDataSourceIds,
             }),
           }
         : tool;
@@ -3936,6 +4066,11 @@ export class AssistantRuntime {
     if (!isReadonlySql(script)) {
       throw new Error("SQL 安全网已拦截：仅允许单条只读 SELECT / WITH / PRAGMA 查询。");
     }
+    this.tempSourceManager.assertSqlCanAccessTempTables({
+      sql: script,
+      conversationId: toolCall.conversationId,
+      userId: toolCall.userId,
+    });
     const views = this.prepareCsvSqlViews(toolCall);
     let executableScript = normalizeCsvSchemaQualifiedSql(script);
     this.appendToolLog(toolCall, "sql-execute", "info", "开始执行只读 SQL。", {
@@ -4444,6 +4579,7 @@ export class AssistantRuntime {
           "VisualizationSpec 只描述业务语义、图表类型、字段映射、指标格式、交互需求和数据来源。图表数据必须优先引用 SQL/Python/Workflow Artifact；只有系统已给出小型聚合结果且可信时，才允许 inline rows。",
           "当前客户端把受控 VisualizationSpec 作为内部 visualization 节点处理。确需输出图表时，请使用单个 ```visualization JSON 代码块承载 VisualizationSpec；客户端会将其转换为内部图表节点，不会把协议作为普通 Markdown 展示。",
           "VisualizationSpec 中不要指定 rendererId、rendererClass、dynamicImport、importPath、任意颜色、原始 HTML、本地文件路径或可执行代码。系统会根据业务语义和图表类型自动路由 renderer。",
+          "当前会话可能包含用户临时上传的 CSV 数据源。临时 CSV 数据源的 SQLite 表字段可以是中文、英文或中英文混合。生成 SQLite SQL 时必须使用 Schema Context 中给出的真实表名和字段名，并对表名、字段名使用 SQLite 双引号转义。不要假设临时 CSV 字段具备 businessFieldId。需要精确查询、统计、排序、聚合或筛选时，必须调用 SQL 查询工具。",
           TOOL_ORCHESTRATION_SYSTEM_PROMPT,
           "仅在本地脚本调试场景才输出 /sql 或 /python 代码块，客户端会按审批权限处理。",
           `当前数据源：${dataSourceLabel || "未选择"}`,
