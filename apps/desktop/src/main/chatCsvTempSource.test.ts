@@ -172,6 +172,41 @@ describe("ConversationTempSourceManager", () => {
     expect(() => manager.assertSqlCanAccessTempTables({ sql: 'select * from "chat_csv_missing_1"', conversationId: "conversation-1", userId: "user-1" })).toThrow("未授权");
   });
 
+  it("allows SQL access to authorized chat CSV fields after table authorization", () => {
+    const { manager } = createManager();
+    const attachment = manager.importCsv(importInput("合同编号,贷款余额（万元）,客户名称\nHT001,1200.50,客户A"));
+    const balanceColumn = attachment.columns?.find((column) => column.sourceHeader === "贷款余额（万元）")!;
+
+    expect(() =>
+      manager.assertSqlCanAccessTempTables({
+        sql: `select ${quoteSqliteIdentifier(balanceColumn.sqliteColumnName)} from ${quoteSqliteIdentifier(attachment.sqliteTableName!)}`,
+        conversationId: "conversation-1",
+        userId: "user-1",
+      }),
+    ).not.toThrow();
+    expect(() =>
+      manager.assertSqlCanAccessTempTables({
+        sql: `select count(*) from ${quoteSqliteIdentifier(attachment.sqliteTableName!)}`,
+        conversationId: "conversation-1",
+        userId: "user-1",
+      }),
+    ).not.toThrow();
+    expect(() =>
+      manager.assertSqlCanAccessTempTables({
+        sql: `select * from ${quoteSqliteIdentifier(attachment.sqliteTableName!)}`,
+        conversationId: "conversation-1",
+        userId: "user-1",
+      }),
+    ).not.toThrow();
+    expect(() =>
+      manager.assertSqlCanAccessTempTables({
+        sql: `select ${quoteSqliteIdentifier("客户名称")} from ${quoteSqliteIdentifier(attachment.sqliteTableName!)}`,
+        conversationId: "conversation-1",
+        userId: "user-1",
+      }),
+    ).not.toThrow();
+  });
+
   it("cleans up expired sources and drops their SQLite tables", () => {
     const { db, manager } = createManager();
     const attachment = manager.importCsv(importInput("合同编号,金额\nHT001,10", { ttlMs: -1 }));
@@ -195,19 +230,34 @@ describe("ConversationTempSourceManager", () => {
     expect(() => db.prepare(`select count(*) from ${quoteSqliteIdentifier(attachment.sqliteTableName!)}`).get()).toThrow();
   });
 
-  it("builds schema context without exposing full CSV content or local paths", () => {
+  it("builds schema context for all table fields and can fall back to the first 100 fields", () => {
     const { manager } = createManager();
-    const attachment = manager.importCsv(importInput("合同编号,贷款余额（万元）\nHT001,1200.50\nHT002,30"));
+    const attachment = manager.importCsv(importInput("合同编号,贷款余额（万元）,客户名称\nHT001,1200.50,客户A\nHT002,30,客户B"));
     const markdown = manager.buildSchemaContextMarkdown({
       conversationId: "conversation-1",
       userId: "user-1",
       tempDataSourceIds: [attachment.tempDataSourceId!],
     });
+    const limitedAttachment = manager.importCsv(importInput(`${Array.from({ length: 102 }, (_, index) => `字段${index + 1}`).join(",")}\n${Array.from({ length: 102 }, (_, index) => index + 1).join(",")}`));
+    const limitedMarkdown = manager.buildSchemaContextMarkdown({
+      conversationId: "conversation-1",
+      userId: "user-1",
+      tempDataSourceIds: [limitedAttachment.tempDataSourceId!],
+      maxFieldsPerSource: 100,
+    });
 
-    expect(markdown).toContain("## 会话临时数据源");
+    expect(markdown).toContain("## 本轮 CSV 全表字段清单");
     expect(markdown).toContain(`- SQLite 临时表：${attachment.sqliteTableName}`);
+    expect(markdown).toContain("- 表字段总数：3");
+    expect(markdown).toContain("- 本轮注入字段数：3");
     expect(markdown).toContain("| 贷款余额（万元） | 贷款余额（万元） | \"贷款余额（万元）\" | decimal | NUMERIC | 1200.50, 30 |");
+    expect(markdown).toContain("客户名称");
     expect(markdown).not.toContain("/Users/");
     expect(markdown).not.toContain("HT001,1200.50");
+    expect(limitedMarkdown).toContain("仅注入前 100 个字段");
+    expect(limitedMarkdown).toContain("- 表字段总数：102");
+    expect(limitedMarkdown).toContain("- 本轮注入字段数：100");
+    expect(limitedMarkdown).toContain("字段100");
+    expect(limitedMarkdown).not.toContain("字段101");
   });
 });

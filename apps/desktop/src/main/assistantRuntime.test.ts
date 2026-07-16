@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildOverallRiskDistributionMarkdown, generalStreamSegmentId, generalTextStreamSegmentId, inferReportTitle, isReportGenerationContent, reportStreamSegmentId, shouldAutoStartPythonReport, shouldRouteSkillThroughModel, shouldStartOverallRiskWorkflowAfterModelText } from "./assistantRuntime";
+import { buildGenericSqlResultAnalysisPythonScript, buildOverallRiskDistributionMarkdown, generalStreamSegmentId, generalTextStreamSegmentId, inferReportTitle, isReportGenerationContent, reportStreamSegmentId, shouldAutoStartPythonReport, shouldRouteSkillThroughModel, shouldStartOverallRiskWorkflowAfterModelText } from "./assistantRuntime";
 
 describe("AssistantRuntime workflow intent", () => {
   it("starts Python report flow for one-shot SQL, chart, and report requests", () => {
@@ -12,6 +12,10 @@ describe("AssistantRuntime workflow intent", () => {
 
   it("does not start Python report flow for plain data lookup requests", () => {
     expect(shouldAutoStartPythonReport("查询最近风险等级为不良的前 20 条明细数据。")).toBe(false);
+  });
+
+  it("continues with Python analysis for SQL summary and analysis requests", () => {
+    expect(shouldAutoStartPythonReport("查询各个分行 #一级分行名称 的 #短中长期贷款标识 中“中期”和“长期”的数据汇总和分析。")).toBe(true);
   });
 
   it("routes selected overall risk skill through model orchestration instead of local history fallback", () => {
@@ -53,6 +57,47 @@ describe("AssistantRuntime workflow intent", () => {
         "我将打开已有报告版本。",
       ),
     ).toBe(false);
+  });
+
+  it("does not hijack ad-hoc branch and term analysis into the overall risk skill workflow", () => {
+    expect(
+      shouldStartOverallRiskWorkflowAfterModelText(
+        {
+          skill: "overall-risk-classification-distribution",
+          prompt: "查询各个分行 #一级分行名称 的 #短中长期贷款标识 中“中期”和“长期”的数据汇总和分析。",
+        },
+        "我将基于当前数据源生成整体风险分类分布报告。",
+      ),
+    ).toBe(false);
+  });
+
+  it("does not start local skill workflow when no skill is selected", () => {
+    expect(
+      shouldStartOverallRiskWorkflowAfterModelText(
+        {
+          skill: null,
+          prompt: "查询各分行数据并分析占比。",
+        },
+        "我将基于当前数据源生成整体风险分类分布报告。",
+      ),
+    ).toBe(false);
+  });
+
+  it("builds generic Python analysis without business-field hardcoding or fallback skill templates", () => {
+    const script = buildGenericSqlResultAnalysisPythonScript("请根据查询结果分析 #一级分行名称 和 #短中长期贷款标识 的占比。", [
+      { 一级分行名称: "杭州分行", 短中长期贷款标识: "中期", 数量: 3 },
+      { 一级分行名称: "宁波分行", 短中长期贷款标识: "长期", 数量: 2 },
+    ]);
+
+    expect(script).toContain("match_requested_fields");
+    expect(script).not.toContain("loan_term_type");
+    expect(script).not.toContain("branch_name");
+    expect(script).not.toContain("latest_risk_result");
+    expect(script).not.toContain("loan_balance_10k");
+    expect(script).not.toContain("contract_amount_10k");
+    expect(script).not.toContain("整体风险分类分布");
+    expect(script).not.toContain("核心风险指标");
+    expect(script).not.toContain("数据质量与口径说明");
   });
 });
 

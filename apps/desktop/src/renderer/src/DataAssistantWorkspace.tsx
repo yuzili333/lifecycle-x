@@ -1,20 +1,25 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type CSSProperties } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type CSSProperties, type FocusEvent } from "react";
 import { Avatar } from "@astryxdesign/core/Avatar";
+import { Badge } from "@astryxdesign/core/Badge";
 import { Button } from "@astryxdesign/core/Button";
 import {
   ChatComposer,
   ChatLayout,
   ChatMessage,
   ChatMessageBubble,
+  ChatComposerInput,
   ChatMessageList,
   ChatMessageMetadata,
   ChatTokenizedText,
   ChatToolCalls,
   type ChatToolCallItem,
+  type ChatComposerToken,
+  type ChatComposerInputHandle,
+  type ChatComposerTrigger,
 } from "@astryxdesign/core/Chat";
 import { CodeBlock } from "@astryxdesign/core/CodeBlock";
 import { Dialog } from "@astryxdesign/core/Dialog";
-import { DropdownMenu, type DropdownMenuOption } from "@astryxdesign/core/DropdownMenu";
+import { DropdownMenu, DropdownMenuItem, type DropdownMenuOption } from "@astryxdesign/core/DropdownMenu";
 import { Icon } from "@astryxdesign/core/Icon";
 import { Card, HStack, VStack } from "@astryxdesign/core/Layout";
 import { Markdown, type MarkdownComponents } from "@astryxdesign/core/Markdown";
@@ -25,10 +30,38 @@ import { Text } from "@astryxdesign/core/Text";
 import { Token } from "@astryxdesign/core/Token";
 import { Toolbar } from "@astryxdesign/core/Toolbar";
 import { Tooltip } from "@astryxdesign/core/Tooltip";
+import type { SearchableItem, SearchSource } from "@astryxdesign/core/Typeahead";
 import { CircleAlert, Clock, Copy, FileText, LoaderCircle, Maximize2, Minimize2, Pencil, Plus, RotateCcw, Sparkles, Trash2, X, type LucideIcon } from "lucide-react";
 import type { AuthFailure, AuthUser } from "./auth";
 import { useAppToast } from "./useAppToast";
 import { workbenchApi, type ApiResult, type DataSourceSummary } from "./workbenchApi";
+import {
+  createEmptyChatComposerDraft,
+  removeChatComposerDraft,
+  type ChatComposerDraftState,
+} from "./chat-composer-draft";
+import {
+  chatFieldMentionKey,
+  createChatFieldToken,
+  fieldsFromChatCsvAttachment,
+  findChatFieldMention,
+  insertFieldTokenText,
+  selectConversationCsvFields,
+  upsertFieldToken,
+  type ChatFieldMention,
+  type ConversationCsvField,
+} from "./chat-field-selector";
+import {
+  buildChatToolSelectorSections,
+  chatToolMentionKey,
+  findChatToolMention,
+  isSuppressedChatToolMention,
+  removeChatToolMention,
+  type ChatToolDataSourceKind,
+  type ChatToolDataSourceOption,
+  type ChatToolMention,
+  type ChatToolSelectorItem,
+} from "./chat-tool-selector";
 import { VisualizationRenderer } from "./components/VisualizationRenderer";
 import { ReportMarkdownViewer, toolKindLabel, toolStatusLabel } from "./components/tool-calls";
 import { StreamingReportSegment } from "./components/streaming-content";
@@ -46,8 +79,6 @@ import {
 } from "./streaming-content";
 import { parseVisualizationSpecJson } from "../../shared/visualization";
 import approveIcon from "./assets/approve.svg";
-import attachIcon from "./assets/attach.svg";
-import mentionIcon from "./assets/mention.svg";
 import type {
   AssistantApprovalMode,
   AssistantBlock,
@@ -57,7 +88,7 @@ import type {
   AssistantSkill,
   AssistantStreamEvent,
 } from "../../main/assistantRuntime";
-import type { ChatCsvAttachment } from "../../main/chatCsvTempSource";
+import type { ChatCsvAttachment, ChatCsvSelectedFieldRef } from "../../main/chatCsvTempSource";
 import type { ArtifactRecord, ConversationToolState, ToolCallRecord } from "../../main/toolOrchestration";
 import type { WorkflowContextSummary } from "../../main/workflowRuntime";
 
@@ -86,9 +117,9 @@ const skillOptions: Array<{ label: string; value: AssistantSkill }> = [
 
 const ARTIFACT_WINDOW_STATE_KEY = "cycle-probe:assistant:artifact-window";
 const ARTIFACT_PANEL_WIDTH_KEY = "cycle-probe:assistant:artifact-panel-width";
-const SKILL_TOKEN_PREFIX = "skill_";
 const MAX_CONVERSATION_TITLE_LENGTH = 200;
 const CHAT_CSV_MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024;
+const FULL_FIELD_CONTEXT_APPROVAL_THRESHOLD = 100;
 const REPORT_TRANSITION_POLICY: ReportTransitionPolicy = {
   ...DEFAULT_REPORT_TRANSITION_POLICY,
   bufferDelayMs: 1000,
@@ -114,7 +145,38 @@ type ReportCardTransitionState = {
   segmentId: string;
 };
 
+type ToolSelectorTrigger = "button" | "at_symbol";
+
 type MessageDeltaStreamEvent = Extract<AssistantStreamEvent, { type: "message-delta" }>;
+
+type ContextTokenInput = {
+  files?: string[];
+  skill?: AssistantSkill | null;
+  dataSourceLabel?: string | null;
+};
+
+type ContextTokenDisplay = {
+  tokens: ChatComposerToken[];
+  values: string[];
+};
+
+type CsvFieldSearchItem = SearchableItem<ConversationCsvField>;
+
+type AssistantComposerDraft = ChatComposerDraftState<AssistantSkill, ChatCsvSelectedFieldRef>;
+
+type AssistantComposerDraftSnapshot = {
+  conversationId: string;
+  draft: AssistantComposerDraft;
+};
+
+type FullFieldContextApprovalSource = {
+  fileName: string;
+  fieldCount: number;
+};
+
+type FullFieldContextApprovalRequest = {
+  sources: FullFieldContextApprovalSource[];
+};
 
 const defaultArtifactWindowState: ArtifactWindowState = {
   messageId: null,
@@ -173,8 +235,152 @@ function skillLabel(skill?: AssistantSkill | null) {
   return skillOptions.find((item) => item.value === skill)?.label ?? skill;
 }
 
-function skillTokenValue(skill: AssistantSkill) {
-  return `${SKILL_TOKEN_PREFIX}${skill.replace(/[^a-zA-Z0-9_]/g, "_")}`;
+function contextTokenValue(kind: "file" | "skill" | "data_source", index: number) {
+  const prefix = kind === "data_source" ? "datasource" : kind;
+  return `assistant${prefix}${index}`;
+}
+
+function dataSourceTableLabel(dataSourceLabel?: string | null) {
+  const trimmed = dataSourceLabel?.trim();
+  if (!trimmed) {
+    return "";
+  }
+  return trimmed.split("/")[0]?.trim() || trimmed;
+}
+
+function buildContextTokenDisplay(input: ContextTokenInput): ContextTokenDisplay {
+  const tokens: ChatComposerToken[] = [];
+  const values: string[] = [];
+  let tokenIndex = 0;
+
+  for (const fileName of input.files ?? []) {
+    const value = contextTokenValue("file", tokenIndex++);
+    values.push(value);
+    tokens.push({
+      value,
+      label: `#${fileName}`,
+      variant: "green",
+    });
+  }
+
+  if (input.skill) {
+    const value = contextTokenValue("skill", tokenIndex++);
+    values.push(value);
+    tokens.push({
+      value,
+      label: `@${skillLabel(input.skill)}`,
+      variant: "purple",
+    });
+  }
+
+  const sourceLabel = dataSourceTableLabel(input.dataSourceLabel);
+  if (sourceLabel) {
+    const value = contextTokenValue("data_source", tokenIndex++);
+    values.push(value);
+    tokens.push({
+      value,
+      label: `#${sourceLabel}`,
+      variant: "blue",
+    });
+  }
+
+  return { tokens, values };
+}
+
+function isNativeChatComposerFieldMention(value: string, mention: ChatFieldMention) {
+  if (mention.start === 0) {
+    return true;
+  }
+  const previous = value[mention.start - 1];
+  return previous === " " || previous === "\n";
+}
+
+function childNodeIndex(node: ChildNode) {
+  return node.parentNode ? Array.prototype.indexOf.call(node.parentNode.childNodes, node) as number : 0;
+}
+
+function serializedTokenLength(node: HTMLElement) {
+  return node.getAttribute("data-astryx-token-value")?.length ?? node.textContent?.length ?? 0;
+}
+
+function findSerializedDomPosition(root: HTMLElement, targetOffset: number): { node: Node; offset: number } | null {
+  let currentOffset = 0;
+  let result: { node: Node; offset: number } | null = null;
+  const visit = (node: Node) => {
+    if (result) {
+      return;
+    }
+    if (node.nodeType === Node.TEXT_NODE) {
+      const length = node.textContent?.length ?? 0;
+      if (targetOffset <= currentOffset + length) {
+        result = { node, offset: Math.max(0, targetOffset - currentOffset) };
+        return;
+      }
+      currentOffset += length;
+      return;
+    }
+    if (node instanceof HTMLBRElement) {
+      if (targetOffset <= currentOffset + 1) {
+        result = { node: node.parentNode ?? root, offset: childNodeIndex(node) };
+        return;
+      }
+      currentOffset += 1;
+      return;
+    }
+    if (node instanceof HTMLElement && node.hasAttribute("data-astryx-token")) {
+      const length = serializedTokenLength(node);
+      if (targetOffset <= currentOffset + length) {
+        result = {
+          node: node.parentNode ?? root,
+          offset: childNodeIndex(node) + (targetOffset - currentOffset > 0 ? 1 : 0),
+        };
+        return;
+      }
+      currentOffset += length;
+      return;
+    }
+    for (const child of Array.from(node.childNodes)) {
+      visit(child);
+      if (result) {
+        return;
+      }
+    }
+  };
+  visit(root);
+  return result ?? { node: root, offset: root.childNodes.length };
+}
+
+function selectSerializedComposerRange(root: HTMLElement, start: number, end: number) {
+  const startPosition = findSerializedDomPosition(root, start);
+  const endPosition = findSerializedDomPosition(root, end);
+  const selection = window.getSelection();
+  if (!startPosition || !endPosition || !selection) {
+    return false;
+  }
+  const range = document.createRange();
+  range.setStart(startPosition.node, startPosition.offset);
+  range.setEnd(endPosition.node, endPosition.offset);
+  selection.removeAllRanges();
+  selection.addRange(range);
+  return true;
+}
+
+function toolDataSourceKind(dataSource: DataSourceSummary): ChatToolDataSourceKind {
+  return dataSource.type === "csv" ? "csv" : "database";
+}
+
+function toolDataSourceBadgeLabel(kind: ChatToolDataSourceKind) {
+  if (kind === "temporary_csv") {
+    return "临时 CSV";
+  }
+  return kind === "csv" ? "CSV" : "数据库";
+}
+
+function toolDataSourceBadgeVariant(kind: ChatToolDataSourceKind) {
+  if (kind === "temporary_csv") {
+    return "purple";
+  }
+  return kind === "csv" ? "blue" : "info";
 }
 
 function readArtifactWindowState(): ArtifactWindowState {
@@ -228,13 +434,6 @@ function isAssistantArtifactMessage(message: AssistantMessage, toolState?: Conve
     !message.blocks.some((block) => block.toolCallId) &&
     Boolean(reportRecordForMessage(message, toolState))
   );
-}
-
-function dataSourceButtonLabel(dataSource?: DataSourceSummary) {
-  if (!dataSource) {
-    return "数据源";
-  }
-  return dataSource.type === "csv" ? dataSource.name : dataSource.database;
 }
 
 function formatFileSize(bytes: number) {
@@ -631,6 +830,15 @@ function toolFileStats(block: AssistantBlock) {
   );
 }
 
+function toolResultPreview(record: ToolCallRecord) {
+  const preview = record.result?.metadata?.resultPreview;
+  return typeof preview === "string" && preview.trim() ? preview : null;
+}
+
+function toolResultPreviewLanguage(record: ToolCallRecord) {
+  return record.result?.metadata?.resultPreviewFormat === "json" ? "json" : "text";
+}
+
 function toolCallsFromMessage(message: AssistantMessage): ChatToolCallItem[] {
   return message.blocks
     .filter((block) => block.toolCallId)
@@ -673,6 +881,7 @@ function toolCallsFromToolState(
     .map((record) => {
       const artifactIds = record.outputArtifactIds ?? record.result?.artifactIds ?? [];
       const requestPreview = JSON.stringify(record.request ?? {}, null, 2);
+      const resultPreview = toolResultPreview(record);
       const errorMessage = record.error?.message;
       return {
         key: record.toolCallId,
@@ -698,6 +907,18 @@ function toolCallsFromToolState(
               <Text type="supporting" color="secondary">
                 Artifact：{artifactIds.join(", ")}
               </Text>
+            )}
+            {resultPreview && (
+              <CodeBlock
+                code={toolResultPreviewLanguage(record) === "json" ? renderJson(resultPreview) : resultPreview}
+                language={toolResultPreviewLanguage(record)}
+                hasCopyButton
+                hasLanguageLabel
+                isWrapped
+                width="100%"
+                size="sm"
+                className="assistant-code-block"
+              />
             )}
             <CodeBlock
               code={requestPreview}
@@ -737,14 +958,28 @@ export function DataAssistantWorkspace({
   const [composerValue, setComposerValue] = useState("");
   const [dataSources, setDataSources] = useState<DataSourceSummary[]>([]);
   const [selectedDataSourceId, setSelectedDataSourceId] = useState<string | null>(null);
+  const [disabledTempDataSourceIds, setDisabledTempDataSourceIds] = useState<string[]>([]);
   const [selectedSkill, setSelectedSkill] = useState<AssistantSkill | null>(null);
   const [approvalMode, setApprovalMode] = useState<AssistantApprovalMode>("request_approval");
+  const [composerDraftsByConversation, setComposerDraftsByConversation] = useState<Record<string, AssistantComposerDraft>>({});
+  const [toolSelectorOpen, setToolSelectorOpen] = useState(false);
+  const [toolSelectorTrigger, setToolSelectorTrigger] = useState<ToolSelectorTrigger | null>(null);
+  const [toolMention, setToolMention] = useState<ChatToolMention | null>(null);
+  const [suppressedToolMentionKey, setSuppressedToolMentionKey] = useState<string | null>(null);
+  const [suppressedToolMentionAnchor, setSuppressedToolMentionAnchor] = useState<number | null>(null);
+  const [fieldSelectorOpen, setFieldSelectorOpen] = useState(false);
+  const [fieldMention, setFieldMention] = useState<ChatFieldMention | null>(null);
+  const [suppressedFieldMentionKey, setSuppressedFieldMentionKey] = useState<string | null>(null);
+  const [selectedFieldRefs, setSelectedFieldRefs] = useState<ChatCsvSelectedFieldRef[]>([]);
+  const [recentFieldIds, setRecentFieldIds] = useState<string[]>([]);
+  const [isComposerComposing, setIsComposerComposing] = useState(false);
   const [isLoadingDataSources, setIsLoadingDataSources] = useState(false);
   const [isLoadingConversations, setIsLoadingConversations] = useState(false);
   const [metadataNow, setMetadataNow] = useState(() => Date.now());
   const [editingConversation, setEditingConversation] = useState<AssistantConversation | null>(null);
   const [editTitleDraft, setEditTitleDraft] = useState("");
   const [deletingConversation, setDeletingConversation] = useState<AssistantConversation | null>(null);
+  const [fullFieldContextApprovalRequest, setFullFieldContextApprovalRequest] = useState<FullFieldContextApprovalRequest | null>(null);
   const [isImportingChatCsv, setIsImportingChatCsv] = useState(false);
   const [artifactWindow, setArtifactWindow] = useState<ArtifactWindowState>(() => readArtifactWindowState());
   const [artifactContentByMessage, setArtifactContentByMessage] = useState<Record<string, ArtifactContentState>>({});
@@ -753,6 +988,11 @@ export function DataAssistantWorkspace({
   const [streamContentRevision, setStreamContentRevision] = useState(0);
   const streamSegmentManagerRef = useRef(new StreamSegmentManager());
   const chatCsvInputRef = useRef<HTMLInputElement | null>(null);
+  const composerInputRef = useRef<ChatComposerInputHandle | null>(null);
+  const composerShellRef = useRef<HTMLDivElement | null>(null);
+  const composerBlurTimerRef = useRef<number | null>(null);
+  const fullFieldContextApprovalResolverRef = useRef<((approved: boolean) => void) | null>(null);
+  const latestComposerDraftRef = useRef<AssistantComposerDraftSnapshot | null>(null);
   const pendingMessageDeltasRef = useRef(new Map<string, MessageDeltaStreamEvent>());
   const messageDeltaFlushTimerRef = useRef<number | null>(null);
   const reportTransitionController = useMemo(
@@ -834,6 +1074,15 @@ export function DataAssistantWorkspace({
     [flushPendingMessageDeltas],
   );
 
+  useEffect(() => () => {
+    if (composerBlurTimerRef.current !== null) {
+      window.clearTimeout(composerBlurTimerRef.current);
+      composerBlurTimerRef.current = null;
+    }
+    fullFieldContextApprovalResolverRef.current?.(false);
+    fullFieldContextApprovalResolverRef.current = null;
+  }, []);
+
   const measureReportTransitionHeight = useCallback((segmentId: string, node: HTMLDivElement | null) => {
     if (!node) {
       return;
@@ -860,6 +1109,64 @@ export function DataAssistantWorkspace({
     () => conversations.find((conversation) => conversation.id === activeConversationId) ?? conversations[0],
     [activeConversationId, conversations],
   );
+  const activeConversationDraftId = activeConversation?.id ?? "";
+  const buildCurrentComposerDraft = useCallback(
+    (updatedAt = new Date().toISOString()): AssistantComposerDraft => ({
+      value: composerValue,
+      selectedSkill,
+      selectedDataSourceId,
+      disabledTempDataSourceIds,
+      selectedFieldRefs,
+      updatedAt,
+    }),
+    [composerValue, disabledTempDataSourceIds, selectedDataSourceId, selectedFieldRefs, selectedSkill],
+  );
+
+  useEffect(() => {
+    const previousSnapshot = latestComposerDraftRef.current;
+    if (previousSnapshot?.conversationId && previousSnapshot.conversationId !== activeConversationDraftId) {
+      setComposerDraftsByConversation((current) => ({
+        ...current,
+        [previousSnapshot.conversationId]: previousSnapshot.draft,
+      }));
+    }
+
+    const nextDraft = activeConversationDraftId
+      ? composerDraftsByConversation[activeConversationDraftId] ?? createEmptyChatComposerDraft<AssistantSkill, ChatCsvSelectedFieldRef>()
+      : createEmptyChatComposerDraft<AssistantSkill, ChatCsvSelectedFieldRef>();
+    setComposerValue(nextDraft.value);
+    setSelectedSkill(nextDraft.selectedSkill);
+    setSelectedDataSourceId(nextDraft.selectedDataSourceId);
+    setDisabledTempDataSourceIds(nextDraft.disabledTempDataSourceIds);
+    setSelectedFieldRefs(nextDraft.selectedFieldRefs);
+    setToolSelectorOpen(false);
+    setToolSelectorTrigger(null);
+    setToolMention(null);
+    setFieldSelectorOpen(false);
+    setFieldMention(null);
+    setSuppressedToolMentionKey(null);
+    setSuppressedToolMentionAnchor(null);
+    setSuppressedFieldMentionKey(null);
+    latestComposerDraftRef.current = {
+      conversationId: activeConversationDraftId,
+      draft: nextDraft,
+    };
+    // Draft restoration intentionally runs only when the active conversation changes.
+    // composerDraftsByConversation is read from the switching render and should not
+    // retrigger restoration on every keystroke or token edit.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeConversationDraftId]);
+
+  useEffect(() => {
+    if (!activeConversationDraftId) {
+      latestComposerDraftRef.current = null;
+      return;
+    }
+    latestComposerDraftRef.current = {
+      conversationId: activeConversationDraftId,
+      draft: buildCurrentComposerDraft(),
+    };
+  }, [activeConversationDraftId, buildCurrentComposerDraft]);
 
   const activeMessages = activeConversation ? messagesByConversation[activeConversation.id] ?? [] : [];
   const activeToolState = activeConversation ? toolStateByConversation[activeConversation.id] ?? null : null;
@@ -880,6 +1187,7 @@ export function DataAssistantWorkspace({
   const activeChatCsvAttachments = activeConversation ? chatCsvAttachmentsByConversation[activeConversation.id] ?? [] : [];
   const readyChatCsvAttachments = activeChatCsvAttachments.filter((attachment) => attachment.status === "ready" && attachment.tempDataSourceId);
   const activeTempDataSourceIds = readyChatCsvAttachments.map((attachment) => attachment.tempDataSourceId as string);
+  const selectedTempDataSourceIds = activeTempDataSourceIds.filter((tempDataSourceId) => !disabledTempDataSourceIds.includes(tempDataSourceId));
 
   const connectedDataSources = useMemo(
     () => dataSources.filter((dataSource) => dataSource.status === "online"),
@@ -890,8 +1198,142 @@ export function DataAssistantWorkspace({
     () => connectedDataSources.find((dataSource) => dataSource.id === selectedDataSourceId),
     [connectedDataSources, selectedDataSourceId],
   );
-  const messageTempDataSourceIds = selectedDataSource ? [] : activeTempDataSourceIds;
-  const messageTempDataSourceLabels = selectedDataSource ? [] : readyChatCsvAttachments.map((attachment) => attachment.fileName);
+  const messageTempDataSourceIds = selectedDataSource ? [] : selectedTempDataSourceIds;
+  const messageTempDataSourceLabels = selectedDataSource
+    ? []
+    : readyChatCsvAttachments
+        .filter((attachment) => attachment.tempDataSourceId && selectedTempDataSourceIds.includes(attachment.tempDataSourceId))
+        .map((attachment) => attachment.fileName);
+  const activeFieldCsvAttachment = useMemo(
+    () => readyChatCsvAttachments.find((attachment) => attachment.tempDataSourceId && selectedTempDataSourceIds.includes(attachment.tempDataSourceId)),
+    [readyChatCsvAttachments, selectedTempDataSourceIds],
+  );
+  const activeCsvFields = useMemo(
+    () => fieldsFromChatCsvAttachment(activeFieldCsvAttachment),
+    [activeFieldCsvAttachment],
+  );
+  const fieldSelectorQuery = fieldMention?.query ?? "";
+  const selectedFieldIds = useMemo(
+    () => new Set(selectedFieldRefs.filter((field) => field.status === "valid").map((field) => field.fieldId)),
+    [selectedFieldRefs],
+  );
+  const filteredCsvFields = useMemo(
+    () =>
+      selectConversationCsvFields({
+        fields: activeCsvFields,
+        query: fieldSelectorQuery,
+        selectedFieldIds,
+        recentFieldIds,
+      }),
+    [activeCsvFields, fieldSelectorQuery, recentFieldIds, selectedFieldIds],
+  );
+  const csvFieldSearchSource = useMemo<SearchSource<CsvFieldSearchItem>>(() => {
+    const fieldItems = (query: string) =>
+      selectConversationCsvFields({
+        fields: activeCsvFields,
+        query,
+        selectedFieldIds,
+        recentFieldIds,
+      })
+        .map((field) => ({
+          id: field.fieldId,
+          label: field.displayName,
+          auxiliaryData: field,
+        }));
+    return {
+      bootstrap: () => fieldItems(""),
+      search: (query: string) => fieldItems(query),
+    };
+  }, [activeCsvFields, recentFieldIds, selectedFieldIds]);
+  const fieldComposerTriggers = useMemo<ChatComposerTrigger[]>(
+    () =>
+      activeCsvFields.length > 0 && !isComposerComposing
+        ? [
+            {
+              character: "#",
+              searchSource: csvFieldSearchSource,
+              menuLabel: "选择 CSV 字段",
+              emptySearchResultsText: "未找到匹配字段",
+              loadingText: "正在查找字段...",
+              renderItem: (item) => {
+                const field = item.auxiliaryData as ConversationCsvField | undefined;
+                return (
+                  <span className="assistant-tool-selector-item-label">
+                    <span className="assistant-tool-selector-item-title">
+                      {field && selectedFieldIds.has(field.fieldId) ? "✓ " : ""}
+                      {item.label}
+                    </span>
+                    {field && <Badge label={field.sqliteType} variant="neutral" />}
+                  </span>
+                );
+              },
+              onSelect: (item) => {
+                const field = item.auxiliaryData as ConversationCsvField | undefined;
+                if (!field) {
+                  return item.label;
+                }
+                const valueBeforeInsert = composerInputRef.current?.getValue() ?? composerValue;
+                const mention = findChatFieldMention(valueBeforeInsert) ?? {
+                  start: valueBeforeInsert.length,
+                  end: valueBeforeInsert.length,
+                  query: "",
+                };
+                const fieldToken = createChatFieldToken(field, mention);
+                setSelectedFieldRefs((current) => upsertFieldToken(current, fieldToken));
+                setRecentFieldIds((current) => [field.fieldId, ...current.filter((fieldId) => fieldId !== field.fieldId)].slice(0, 20));
+                setSuppressedFieldMentionKey(null);
+                setFieldSelectorOpen(false);
+                setFieldMention(null);
+                return {
+                  value: fieldToken.rawText,
+                  label: fieldToken.rawText,
+                  variant: "teal",
+                };
+              },
+            },
+          ]
+        : [],
+    [activeCsvFields.length, composerValue, csvFieldSearchSource, isComposerComposing, selectedFieldIds],
+  );
+  const composerContextTokenDisplay = useMemo(
+    () =>
+      buildContextTokenDisplay({
+        files: messageTempDataSourceLabels,
+        skill: selectedSkill,
+        dataSourceLabel: selectedDataSource ? dataSourceLabel(selectedDataSource) : null,
+      }),
+    [messageTempDataSourceLabels, selectedDataSource, selectedSkill],
+  );
+  const toolSelectorQuery = toolSelectorTrigger === "at_symbol" && toolMention ? toolMention.query : "";
+  const toolDataSources = useMemo<ChatToolDataSourceOption[]>(
+    () => [
+      ...connectedDataSources.map((dataSource) => ({
+        id: dataSource.id,
+        label: dataSource.type === "csv" ? dataSource.name : dataSourceLabel(dataSource),
+        description: dataSource.type === "csv" ? dataSource.database : `${dataSource.host}:${dataSource.port}`,
+        kind: toolDataSourceKind(dataSource),
+        isSelected: selectedDataSourceId === dataSource.id,
+      })),
+      ...readyChatCsvAttachments.map((attachment) => ({
+        id: `temp:${attachment.tempDataSourceId}`,
+        label: attachment.fileName,
+        description: `${attachment.rowCount ?? 0} 行 · ${attachment.columnCount ?? 0} 列`,
+        kind: "temporary_csv" as const,
+        isSelected: Boolean(attachment.tempDataSourceId && selectedTempDataSourceIds.includes(attachment.tempDataSourceId)),
+      })),
+    ],
+    [connectedDataSources, readyChatCsvAttachments, selectedDataSourceId, selectedTempDataSourceIds],
+  );
+  const toolSelectorSections = useMemo(
+    () =>
+      buildChatToolSelectorSections<AssistantSkill>({
+        query: toolSelectorQuery,
+        skills: skillOptions,
+        dataSources: toolDataSources,
+        selectedSkill,
+      }),
+    [selectedSkill, toolDataSources, toolSelectorQuery],
+  );
 
   const upsertMessage = useCallback((conversationId: string, message: AssistantMessage) => {
     setMessagesByConversation((current) => ({
@@ -1198,6 +1640,113 @@ export function DataAssistantWorkspace({
     return () => window.clearInterval(timer);
   }, [isStreaming]);
 
+  useEffect(() => {
+    const mention = findChatToolMention(composerValue);
+    if (mention) {
+      if (suppressedToolMentionAnchor !== null) {
+        if (
+          isSuppressedChatToolMention({
+            value: composerValue,
+            mention,
+            suppressedKey: suppressedToolMentionKey,
+            suppressedAnchor: suppressedToolMentionAnchor,
+          })
+        ) {
+          return;
+        }
+        setSuppressedToolMentionAnchor(null);
+      } else if (
+        isSuppressedChatToolMention({
+          value: composerValue,
+          mention,
+          suppressedKey: suppressedToolMentionKey,
+          suppressedAnchor: suppressedToolMentionAnchor,
+        })
+      ) {
+        return;
+      }
+      setToolMention(mention);
+      setToolSelectorTrigger("at_symbol");
+      setToolSelectorOpen(true);
+      setFieldSelectorOpen(false);
+      setFieldMention(null);
+      return;
+    }
+    if (suppressedToolMentionKey) {
+      setSuppressedToolMentionKey(null);
+    }
+    if (suppressedToolMentionAnchor !== null) {
+      setSuppressedToolMentionAnchor(null);
+    }
+    if (toolSelectorTrigger === "at_symbol") {
+      setToolMention(null);
+      setToolSelectorTrigger(null);
+      setToolSelectorOpen(false);
+    }
+  }, [composerValue, suppressedToolMentionAnchor, suppressedToolMentionKey, toolSelectorTrigger]);
+
+  useEffect(() => {
+    if (isComposerComposing) {
+      if (fieldSelectorOpen) {
+        setFieldSelectorOpen(false);
+        setFieldMention(null);
+      }
+      return;
+    }
+    const mention = findChatFieldMention(composerValue);
+    if (mention && activeCsvFields.length > 0) {
+      if (isNativeChatComposerFieldMention(composerValue, mention)) {
+        if (fieldSelectorOpen) {
+          setFieldSelectorOpen(false);
+          setFieldMention(null);
+        }
+        return;
+      }
+      if (chatFieldMentionKey(composerValue, mention) === suppressedFieldMentionKey) {
+        return;
+      }
+      setFieldMention(mention);
+      setFieldSelectorOpen(true);
+      setToolSelectorOpen(false);
+      setToolSelectorTrigger(null);
+      setToolMention(null);
+      return;
+    }
+    if (suppressedFieldMentionKey) {
+      setSuppressedFieldMentionKey(null);
+    }
+    if (fieldSelectorOpen) {
+      setFieldMention(null);
+      setFieldSelectorOpen(false);
+    }
+  }, [activeCsvFields.length, composerValue, fieldSelectorOpen, isComposerComposing, suppressedFieldMentionKey]);
+
+  useEffect(() => {
+    if (selectedFieldRefs.length === 0) {
+      return;
+    }
+    const activeFieldsById = new Map(activeCsvFields.map((field) => [field.fieldId, field]));
+    setSelectedFieldRefs((current) => {
+      let changed = false;
+      const next = current.map((field) => {
+        const status: ChatCsvSelectedFieldRef["status"] = activeFieldsById.has(field.fieldId) ? "valid" : "missing";
+        if (field.status === status) {
+          return field;
+        }
+        changed = true;
+        return { ...field, status };
+      });
+      return changed ? next : current;
+    });
+  }, [activeCsvFields, selectedFieldRefs.length]);
+
+  useEffect(() => {
+    if (selectedFieldRefs.length === 0) {
+      return;
+    }
+    setSelectedFieldRefs((current) => current.filter((field) => composerValue.includes(field.rawText)));
+  }, [composerValue, selectedFieldRefs.length]);
+
   const startConversation = async () => {
     if (!user?.id || !window.lifecycleX?.assistant) {
       return;
@@ -1296,6 +1845,10 @@ export function DataAssistantWorkspace({
             collisionBehavior: "overwrite",
           });
         } else {
+          setSelectedDataSourceId(null);
+          if (imported.tempDataSourceId) {
+            setDisabledTempDataSourceIds((current) => current.filter((id) => id !== imported.tempDataSourceId));
+          }
           toast({
             type: "info",
             body: imported.warnings?.length
@@ -1329,6 +1882,173 @@ export function DataAssistantWorkspace({
       void importChatCsvFile(file);
     },
     [importChatCsvFile],
+  );
+
+  const closeToolSelector = useCallback(() => {
+    setToolSelectorOpen(false);
+    setToolSelectorTrigger(null);
+    setToolMention(null);
+  }, []);
+
+  const closeFieldSelector = useCallback(() => {
+    setFieldSelectorOpen(false);
+    setFieldMention(null);
+  }, []);
+
+  const clearActiveToolMention = useCallback(() => {
+    setComposerValue((current) => removeChatToolMention(current, toolMention));
+  }, [toolMention]);
+
+  const openToolSelectorByButton = useCallback(() => {
+    setToolSelectorTrigger("button");
+    setToolMention(null);
+    setToolSelectorOpen(true);
+    closeFieldSelector();
+  }, [closeFieldSelector]);
+
+  const handleToolSelectorOpenChange = useCallback((isOpen: boolean) => {
+    setToolSelectorOpen(isOpen);
+    if (!isOpen) {
+      if (toolSelectorTrigger === "at_symbol" && toolMention) {
+        setSuppressedToolMentionKey(chatToolMentionKey(composerValue, toolMention));
+        setSuppressedToolMentionAnchor(toolMention.start);
+      }
+      setToolSelectorTrigger(null);
+      setToolMention(null);
+    } else if (!toolSelectorTrigger) {
+      setToolSelectorTrigger("button");
+    }
+  }, [composerValue, toolMention, toolSelectorTrigger]);
+
+  const handleComposerFocusCapture = useCallback(() => {
+    if (composerBlurTimerRef.current !== null) {
+      window.clearTimeout(composerBlurTimerRef.current);
+      composerBlurTimerRef.current = null;
+    }
+  }, []);
+
+  const handleComposerBlurCapture = useCallback((event: FocusEvent<HTMLDivElement>) => {
+    const nextTarget = event.relatedTarget;
+    if (nextTarget && event.currentTarget.contains(nextTarget)) {
+      return;
+    }
+    if (composerBlurTimerRef.current !== null) {
+      window.clearTimeout(composerBlurTimerRef.current);
+    }
+    composerBlurTimerRef.current = window.setTimeout(() => {
+      composerBlurTimerRef.current = null;
+      const activeElement = document.activeElement;
+      if (activeElement && composerShellRef.current?.contains(activeElement)) {
+        return;
+      }
+      if (toolSelectorTrigger !== "at_symbol") {
+        return;
+      }
+      const activeMention = toolMention ?? findChatToolMention(composerValue);
+      if (activeMention) {
+        setSuppressedToolMentionKey(chatToolMentionKey(composerValue, activeMention));
+        setSuppressedToolMentionAnchor(activeMention.start);
+      }
+      setToolSelectorOpen(false);
+      setToolSelectorTrigger(null);
+      setToolMention(null);
+    }, 0);
+  }, [composerValue, toolMention, toolSelectorTrigger]);
+
+  const selectSkillFromToolSelector = useCallback(
+    (skill: AssistantSkill) => {
+      setSelectedSkill((current) => (current === skill ? null : skill));
+      clearActiveToolMention();
+      closeToolSelector();
+    },
+    [clearActiveToolMention, closeToolSelector],
+  );
+
+  const selectDataSourceFromToolSelector = useCallback(
+    (item: ChatToolSelectorItem<AssistantSkill>) => {
+      if (item.type !== "data_source") {
+        return;
+      }
+      if (item.kind === "temporary_csv") {
+        const tempDataSourceId = item.id.replace(/^temp:/u, "");
+        setSelectedDataSourceId(null);
+        setDisabledTempDataSourceIds((current) =>
+          current.includes(tempDataSourceId)
+            ? current.filter((id) => id !== tempDataSourceId)
+            : [...current, tempDataSourceId],
+        );
+      } else {
+        setDisabledTempDataSourceIds([]);
+        setSelectedDataSourceId((current) => (current === item.id ? null : item.id));
+      }
+      clearActiveToolMention();
+      closeToolSelector();
+    },
+    [clearActiveToolMention, closeToolSelector],
+  );
+
+  const selectAddCsvFromToolSelector = useCallback(() => {
+    clearActiveToolMention();
+    closeToolSelector();
+    chatCsvInputRef.current?.click();
+  }, [clearActiveToolMention, closeToolSelector]);
+
+  const handleFieldSelectorOpenChange = useCallback((isOpen: boolean) => {
+    setFieldSelectorOpen(isOpen);
+    if (!isOpen) {
+      if (fieldMention) {
+        setSuppressedFieldMentionKey(chatFieldMentionKey(composerValue, fieldMention));
+      }
+      setFieldMention(null);
+    }
+  }, [composerValue, fieldMention]);
+
+  const selectCsvField = useCallback(
+    (field: ConversationCsvField) => {
+      if (!fieldMention) {
+        return;
+      }
+      const token = createChatFieldToken(field, fieldMention);
+      const editable = composerShellRef.current?.querySelector<HTMLElement>('[contenteditable="true"]');
+      const insertedInlineToken =
+        Boolean(editable && selectSerializedComposerRange(editable, fieldMention.start, fieldMention.end)) &&
+        Boolean(composerInputRef.current?.insertToken({
+          value: token.rawText,
+          label: token.rawText,
+          variant: "teal",
+        }));
+      if (insertedInlineToken) {
+        setComposerValue(composerInputRef.current?.getValue() ?? insertFieldTokenText(composerValue, fieldMention, token));
+      } else {
+        setComposerValue((current) => insertFieldTokenText(current, fieldMention, token));
+      }
+      setSelectedFieldRefs((current) => upsertFieldToken(current, token));
+      setRecentFieldIds((current) => [field.fieldId, ...current.filter((fieldId) => fieldId !== field.fieldId)].slice(0, 20));
+      setSuppressedFieldMentionKey(null);
+      closeFieldSelector();
+    },
+    [closeFieldSelector, composerValue, fieldMention],
+  );
+
+  const clearComposerContextSelection = useCallback(
+    (tempDataSourceIds: string[] = [], conversationId = activeConversationDraftId) => {
+      setSelectedSkill(null);
+      setSelectedDataSourceId(null);
+      setDisabledTempDataSourceIds(tempDataSourceIds);
+      setSelectedFieldRefs([]);
+      if (conversationId) {
+        const draft: AssistantComposerDraft = {
+          ...createEmptyChatComposerDraft<AssistantSkill, ChatCsvSelectedFieldRef>(),
+          disabledTempDataSourceIds: tempDataSourceIds,
+        };
+        latestComposerDraftRef.current = { conversationId, draft };
+        setComposerDraftsByConversation((current) => ({
+          ...current,
+          [conversationId]: draft,
+        }));
+      }
+    },
+    [activeConversationDraftId],
   );
 
   const removeChatCsvAttachment = useCallback(
@@ -1428,6 +2148,7 @@ export function DataAssistantWorkspace({
         delete next[deletingConversation.id];
         return next;
       });
+      setComposerDraftsByConversation((current) => removeChatComposerDraft(current, deletingConversation.id));
       if (artifactWindow.messageId && deletingConversation.id === activeConversation?.id) {
         closeArtifact();
       }
@@ -1601,19 +2322,26 @@ export function DataAssistantWorkspace({
   );
 
   const loadSchemaContextMarkdown = useCallback(
-    async (conversationId: string, question: string) => {
-      if (!selectedDataSource) {
+    async (
+      conversationId: string,
+      question: string,
+      contextOverride?: { dataSource?: DataSourceSummary | null; skill?: AssistantSkill | null; maxColumnsPerTable?: number },
+    ) => {
+      const contextDataSource = contextOverride?.dataSource ?? selectedDataSource;
+      const contextSkill = contextOverride?.skill ?? selectedSkill;
+      if (!contextDataSource) {
         return null;
       }
-      const isOverallRiskSkill = selectedSkill === "overall-risk-classification-distribution";
+      const isOverallRiskSkill = contextSkill === "overall-risk-classification-distribution";
       const result = await requestWithRefresh((token) =>
         workbenchApi.schemaContext(token, {
           conversationId,
           question,
-          dataSourceId: selectedDataSource.id,
-          skill: selectedSkill,
+          dataSourceId: contextDataSource.id,
+          skill: contextSkill,
           purpose: isOverallRiskSkill ? "risk_analysis" : "data_exploration",
-          maxChars: 16_000,
+          maxChars: 120_000,
+          maxColumnsPerTable: contextOverride?.maxColumnsPerTable ?? FULL_FIELD_CONTEXT_APPROVAL_THRESHOLD,
         }),
       );
       if (!result.success) {
@@ -1645,6 +2373,7 @@ export function DataAssistantWorkspace({
           modelName,
           dataSourceLabel: selectedDataSource ? dataSourceLabel(selectedDataSource) : null,
           selectedTempDataSourceIds: messageTempDataSourceIds,
+          selectedFieldRefs: message.context?.selectedFieldRefs,
           schemaContextMarkdown,
           skill: selectedSkill,
           approvalMode,
@@ -1750,6 +2479,85 @@ export function DataAssistantWorkspace({
     [activePendingPythonToolCallId, approveTool, toast],
   );
 
+  const resolveFullFieldContextApproval = useCallback((approved: boolean) => {
+    const resolver = fullFieldContextApprovalResolverRef.current;
+    fullFieldContextApprovalResolverRef.current = null;
+    setFullFieldContextApprovalRequest(null);
+    resolver?.(approved);
+  }, []);
+
+  const requestFullFieldContextApproval = useCallback((sources: FullFieldContextApprovalSource[]) => {
+    if (sources.length === 0) {
+      return Promise.resolve(true);
+    }
+    fullFieldContextApprovalResolverRef.current?.(false);
+    return new Promise<boolean>((resolve) => {
+      fullFieldContextApprovalResolverRef.current = resolve;
+      setFullFieldContextApprovalRequest({ sources });
+    });
+  }, []);
+
+  const resolveTempSchemaFieldLimit = useCallback(
+    async (attachments: ChatCsvAttachment[]) => {
+      const oversizedSources = attachments
+        .map((attachment) => ({
+          fileName: attachment.fileName,
+          fieldCount: attachment.columns?.length ?? attachment.columnCount ?? 0,
+        }))
+        .filter((source) => source.fieldCount > FULL_FIELD_CONTEXT_APPROVAL_THRESHOLD);
+      if (oversizedSources.length === 0) {
+        return undefined;
+      }
+      const approved = await requestFullFieldContextApproval(oversizedSources);
+      return approved ? undefined : FULL_FIELD_CONTEXT_APPROVAL_THRESHOLD;
+    },
+    [requestFullFieldContextApproval],
+  );
+
+  const resolveDataSourceSchemaColumnLimit = useCallback(
+    async (conversationId: string, question: string, dataSource: DataSourceSummary | null, skill: AssistantSkill | null) => {
+      if (!dataSource) {
+        return undefined;
+      }
+      const result = await requestWithRefresh((token) =>
+        workbenchApi.schemaContext(token, {
+          conversationId,
+          question,
+          dataSourceId: dataSource.id,
+          skill,
+          purpose: skill === "overall-risk-classification-distribution" ? "risk_analysis" : "data_exploration",
+          maxChars: 120_000,
+          maxColumnsPerTable: FULL_FIELD_CONTEXT_APPROVAL_THRESHOLD + 1,
+        }),
+      );
+      if (!result.success) {
+        toast({
+          type: "error",
+          body: `数据源字段预检失败：${result.error.message}`,
+          uniqueID: "assistant-schema-context-preflight-error",
+          collisionBehavior: "overwrite",
+        });
+        return FULL_FIELD_CONTEXT_APPROVAL_THRESHOLD;
+      }
+      const tableSources = (result.context.dataSourceProfiles ?? []).flatMap((profile) =>
+        (profile.tables ?? []).map((table) => ({
+          fileName: `${profile.displayName ?? dataSourceLabel(dataSource)} / ${table.tableName}`,
+          fieldCount: table.columnCount ?? table.columns?.length ?? 0,
+        })),
+      );
+      const oversizedSources = tableSources.filter((source) => source.fieldCount > FULL_FIELD_CONTEXT_APPROVAL_THRESHOLD);
+      if (oversizedSources.length === 0) {
+        return FULL_FIELD_CONTEXT_APPROVAL_THRESHOLD;
+      }
+      const approved = await requestFullFieldContextApproval(oversizedSources);
+      if (!approved) {
+        return FULL_FIELD_CONTEXT_APPROVAL_THRESHOLD;
+      }
+      return Math.max(...oversizedSources.map((source) => source.fieldCount));
+    },
+    [requestFullFieldContextApproval, requestWithRefresh, toast],
+  );
+
   const handleSubmit = useCallback(
     async (value: string) => {
       const prompt = value.trim();
@@ -1768,6 +2576,16 @@ export function DataAssistantWorkspace({
       if (activePendingPythonToolCallId && isPythonApprovalPrompt(prompt)) {
         setComposerValue("");
         await approvePendingPython(true);
+        return;
+      }
+      const invalidFieldRefs = selectedFieldRefs.filter((field) => field.status !== "valid" || !composerValue.includes(field.rawText));
+      if (invalidFieldRefs.length > 0) {
+        toast({
+          type: "error",
+          body: `字段“${invalidFieldRefs[0].displayName}”所属的临时 CSV 已失效或已从输入中删除，请重新选择字段。`,
+          uniqueID: "assistant-chat-field-token-invalid",
+          collisionBehavior: "overwrite",
+        });
         return;
       }
       let optimisticConversationId: string | null = null;
@@ -1791,35 +2609,53 @@ export function DataAssistantWorkspace({
       }
 
       try {
+        const submitDataSource = selectedDataSource ?? null;
+        const submitSkill = selectedSkill;
+        const submitTempDataSourceIds = messageTempDataSourceIds;
+        const submitTempDataSourceLabels = messageTempDataSourceLabels;
+        const submitTempAttachments = readyChatCsvAttachments.filter((attachment) =>
+          attachment.tempDataSourceId && submitTempDataSourceIds.includes(attachment.tempDataSourceId),
+        );
+        const tempSchemaFieldLimit = await resolveTempSchemaFieldLimit(submitTempAttachments);
+        const submitFieldRefs = selectedFieldRefs.filter((field) => field.status === "valid" && prompt.includes(field.rawText));
         const conversation =
           activeConversation ?? await window.lifecycleX.assistant.createConversation(user.id, prompt.slice(0, 18) || "新对话");
         setConversations((current) => mergeConversation(current, conversation));
         setMessagesByConversation((current) => ({ ...current, [conversation.id]: current[conversation.id] ?? [] }));
         const conversationId = conversation.id;
         optimisticConversationId = conversationId;
+        const dataSourceSchemaColumnLimit = await resolveDataSourceSchemaColumnLimit(conversationId, prompt, submitDataSource, submitSkill);
         const optimisticContext: AssistantMessage["context"] = {
-          dataSourceLabel: selectedDataSource ? dataSourceLabel(selectedDataSource) : null,
-          skill: selectedSkill,
-          temporaryDataSourceIds: messageTempDataSourceIds,
-          temporaryDataSourceLabels: messageTempDataSourceLabels,
+          dataSourceLabel: submitDataSource ? dataSourceLabel(submitDataSource) : null,
+          skill: submitSkill,
+          temporaryDataSourceIds: submitTempDataSourceIds,
+          temporaryDataSourceLabels: submitTempDataSourceLabels,
+          selectedFieldRefs: submitFieldRefs,
         };
         const optimisticUserMessage = createOptimisticUserMessage(user.id, conversationId, prompt, optimisticContext);
         optimisticMessageId = optimisticUserMessage.id;
         upsertMessage(conversationId, optimisticUserMessage);
         setActiveConversationId(conversationId);
         setComposerValue("");
-        const schemaContextMarkdown = await loadSchemaContextMarkdown(conversationId, prompt);
+        clearComposerContextSelection([], conversationId);
+        const schemaContextMarkdown = await loadSchemaContextMarkdown(conversationId, prompt, {
+          dataSource: submitDataSource,
+          skill: submitSkill,
+          maxColumnsPerTable: dataSourceSchemaColumnLimit,
+        });
         const result = await window.lifecycleX.assistant.sendMessage({
           userId: user.id,
           conversationId,
           clientRequestId: createClientRequestId(),
           prompt,
           modelName,
-          dataSourceId: selectedDataSource?.id ?? null,
-          dataSourceLabel: selectedDataSource ? dataSourceLabel(selectedDataSource) : null,
-          selectedTempDataSourceIds: messageTempDataSourceIds,
+          dataSourceId: submitDataSource?.id ?? null,
+          dataSourceLabel: submitDataSource ? dataSourceLabel(submitDataSource) : null,
+          selectedTempDataSourceIds: submitTempDataSourceIds,
+          selectedFieldRefs: submitFieldRefs,
+          tempSchemaFieldLimit,
           schemaContextMarkdown,
-          skill: selectedSkill,
+          skill: submitSkill,
           approvalMode,
         });
         setConversations((current) => mergeConversation(current, result.conversation));
@@ -1851,6 +2687,7 @@ export function DataAssistantWorkspace({
       activePendingPythonToolCallId,
       approvalMode,
       approvePendingPython,
+      clearComposerContextSelection,
       isModelConfigured,
       isStreaming,
       loadSchemaContextMarkdown,
@@ -1858,6 +2695,10 @@ export function DataAssistantWorkspace({
       messageTempDataSourceLabels,
       modelName,
       onRequireModelConfig,
+      readyChatCsvAttachments,
+      resolveDataSourceSchemaColumnLimit,
+      resolveTempSchemaFieldLimit,
+      selectedFieldRefs,
       selectedDataSource,
       selectedSkill,
       toast,
@@ -1907,29 +2748,6 @@ export function DataAssistantWorkspace({
     [toast],
   );
 
-  const dataSourceMenuItems = useMemo<DropdownMenuOption[]>(
-    () =>
-      connectedDataSources.length > 0
-        ? connectedDataSources.map((dataSource) => ({
-          label: `${selectedDataSourceId === dataSource.id ? "✓ " : ""}${dataSourceLabel(dataSource)}`,
-          onClick: () =>
-            setSelectedDataSourceId((current) => (current === dataSource.id ? null : dataSource.id)),
-        }))
-        : [{ label: canReadDataSources ? "暂无已连通数据源" : "无数据源权限", isDisabled: true }],
-    [canReadDataSources, connectedDataSources, selectedDataSourceId],
-  );
-
-  const skillMenuItems = useMemo<DropdownMenuOption[]>(
-    () =>
-      skillOptions.length > 0
-        ? skillOptions.map((skill) => ({
-          label: `${selectedSkill === skill.value ? "✓ " : ""}${skill.label}`,
-          onClick: () => setSelectedSkill((current) => (current === skill.value ? null : skill.value)),
-        }))
-        : [{ label: "暂无已安装 Skill", isDisabled: true }],
-    [selectedSkill],
-  );
-
   const approvalMenuItems = useMemo<DropdownMenuOption[]>(
     () =>
       approvalOptions.map((approval) => ({
@@ -1939,33 +2757,72 @@ export function DataAssistantWorkspace({
     [approvalMode],
   );
 
-  const renderUserContext = (message: AssistantMessage) => {
-    const dataSource = message.context?.dataSourceLabel;
-    const temporaryLabels = message.context?.temporaryDataSourceLabels ?? [];
-    if (!dataSource && temporaryLabels.length === 0) {
+  const renderToolSelectorLabel = (item: ChatToolSelectorItem<AssistantSkill>) => (
+    <span className="assistant-tool-selector-item-label">
+      <span className="assistant-tool-selector-item-title">
+        {item.type !== "add_csv" && item.isSelected ? "✓ " : ""}
+        {item.label}
+      </span>
+    </span>
+  );
+
+  const renderToolSelectorEndContent = (item: ChatToolSelectorItem<AssistantSkill>) => {
+    if (item.type !== "data_source") {
+      return undefined;
+    }
+    return (
+      <Badge
+        label={toolDataSourceBadgeLabel(item.kind)}
+        variant={toolDataSourceBadgeVariant(item.kind)}
+      />
+    );
+  };
+
+  const handleToolSelectorItemClick = (item: ChatToolSelectorItem<AssistantSkill>) => {
+    if (item.type === "add_csv") {
+      selectAddCsvFromToolSelector();
+      return;
+    }
+    if (item.type === "skill") {
+      selectSkillFromToolSelector(item.value);
+      return;
+    }
+    selectDataSourceFromToolSelector(item);
+  };
+
+  const renderUserContextTokens = (message: AssistantMessage) => {
+    const fileLabels = message.context?.temporaryDataSourceLabels ?? [];
+    const skill = message.context?.skill;
+    const sourceLabel = dataSourceTableLabel(message.context?.dataSourceLabel);
+    if (fileLabels.length === 0 && !skill && !sourceLabel) {
       return null;
     }
 
     return (
       <HStack gap={1} wrap="wrap" className="assistant-user-context-tokens">
-        {dataSource && <Token label={dataSource} color="blue" size="sm" />}
-        {temporaryLabels.map((label) => (
-          <Token key={label} label={`CSV：${label}`} color="green" size="sm" />
+        {fileLabels.map((fileName) => (
+          <Token key={`file:${fileName}`} label={`#${fileName}`} color="green" size="sm" />
         ))}
+        {skill && <Token label={`@${skillLabel(skill)}`} color="purple" size="sm" />}
+        {sourceLabel && <Token label={`#${sourceLabel}`} color="blue" size="sm" />}
       </HStack>
     );
   };
 
   const renderUserMessageBody = (message: AssistantMessage) => {
-    const skill = message.context?.skill;
-    if (!skill) {
+    const fieldRefs = message.context?.selectedFieldRefs?.filter((field) => field.status === "valid") ?? [];
+    if (fieldRefs.length === 0) {
       return <p>{message.content}</p>;
     }
-
-    const value = skillTokenValue(skill);
     return (
-      <ChatTokenizedText tokens={[{ value, label: skillLabel(skill), variant: "purple" }]}>
-        {`${value} ${message.content}`}
+      <ChatTokenizedText
+        tokens={fieldRefs.map((field) => ({
+          value: field.rawText,
+          label: field.rawText,
+          variant: "teal",
+        }))}
+      >
+        {message.content}
       </ChatTokenizedText>
     );
   };
@@ -2262,7 +3119,12 @@ export function DataAssistantWorkspace({
             className="assistant-chat-layout"
             emptyState={<AssistantLanding userName={landingUserName} />}
             composer={
-              <div className="assistant-composer-shell">
+              <div
+                ref={composerShellRef}
+                className="assistant-composer-shell"
+                onBlurCapture={handleComposerBlurCapture}
+                onFocusCapture={handleComposerFocusCapture}
+              >
                 {activeChatCsvAttachments.length > 0 && (
                   <div className="assistant-chat-csv-attachments" aria-label="会话临时 CSV">
                     {activeChatCsvAttachments.map((attachment) => (
@@ -2304,6 +3166,13 @@ export function DataAssistantWorkspace({
                   className="assistant-chat-csv-input"
                   onChange={handleChatCsvFileSelect}
                 />
+                {composerContextTokenDisplay.tokens.length > 0 && (
+                  <div className="assistant-composer-context-tokens" aria-label="当前已选工具上下文">
+                    <ChatTokenizedText tokens={composerContextTokenDisplay.tokens}>
+                      {composerContextTokenDisplay.values.join(" ")}
+                    </ChatTokenizedText>
+                  </div>
+                )}
                 <ChatComposer
                   value={composerValue}
                   onChange={setComposerValue}
@@ -2312,46 +3181,100 @@ export function DataAssistantWorkspace({
                   isStopShown={isStreaming}
                   placeholder="问问数据助手"
                   density="compact"
+                  input={
+                    <ChatComposerInput
+                      handleRef={composerInputRef}
+                      triggers={fieldComposerTriggers}
+                      debounceMs={0}
+                      maxRows={8}
+                      onCompositionStart={() => setIsComposerComposing(true)}
+                      onCompositionEnd={() => setIsComposerComposing(false)}
+                    />
+                  }
                   footerActions={
                     <div className="assistant-composer-actions" aria-label="数据助手工具栏">
                       <DropdownMenu
                         hasChevron={false}
+                        isMenuOpen={fieldSelectorOpen}
+                        onOpenChange={handleFieldSelectorOpenChange}
                         placement="above"
-                        menuWidth={240}
+                        menuWidth={340}
                         button={{
-                          label: dataSourceButtonLabel(selectedDataSource),
+                          label: "CSV字段",
                           variant: "ghost",
                           size: "sm",
-                          className: "assistant-composer-action-button",
-                          icon: <AssistantActionIcon src={attachIcon} />,
-                          tooltip: "数据库",
-                          isLoading: isLoadingDataSources,
+                          className: "assistant-field-selector-anchor",
+                          isIconOnly: true,
                         }}
-                        items={dataSourceMenuItems}
-                      />
-                      <Button
-                        label={isImportingChatCsv ? "CSV导入中" : "上传CSV"}
-                        variant="ghost"
-                        size="sm"
-                        className="assistant-composer-action-button"
-                        icon={<AssistantActionIcon src={attachIcon} />}
-                        isLoading={isImportingChatCsv}
-                        onClick={() => chatCsvInputRef.current?.click()}
-                      />
+                      >
+                        <div className="assistant-field-selector-menu" role="presentation">
+                          <div className="assistant-field-selector-heading">
+                            <strong>选择 CSV 字段</strong>
+                            {activeFieldCsvAttachment?.fileName && <span>{activeFieldCsvAttachment.fileName}</span>}
+                          </div>
+                          {activeCsvFields.length === 0 ? (
+                            <div className="assistant-tool-selector-empty">当前 CSV 文件没有可用字段</div>
+                          ) : filteredCsvFields.length === 0 ? (
+                            <div className="assistant-tool-selector-empty">未找到匹配字段</div>
+                          ) : (
+                            <div className="assistant-field-selector-results" role="listbox" aria-label="CSV 字段列表">
+                              {filteredCsvFields.map((field) => (
+                                <DropdownMenuItem
+                                  key={field.fieldId}
+                                  className="assistant-tool-selector-menu-item"
+                                  label={
+                                    <span className="assistant-tool-selector-item-label">
+                                      <span className="assistant-tool-selector-item-title">
+                                        {selectedFieldIds.has(field.fieldId) ? "✓ " : ""}
+                                        {field.displayName}
+                                      </span>
+                                    </span>
+                                  }
+                                  endContent={<Badge label={field.sqliteType} variant="neutral" />}
+                                  onClick={() => selectCsvField(field)}
+                                />
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      </DropdownMenu>
                       <DropdownMenu
                         hasChevron={false}
+                        isMenuOpen={toolSelectorOpen}
+                        onOpenChange={handleToolSelectorOpenChange}
+                        onClick={openToolSelectorByButton}
                         placement="above"
-                        menuWidth={190}
+                        menuWidth={340}
                         button={{
-                          label: selectedSkill ? skillLabel(selectedSkill) : "Skill",
+                          label: "选择工具",
                           variant: "ghost",
                           size: "sm",
-                          className: "assistant-composer-action-button",
-                          icon: <AssistantActionIcon src={mentionIcon} />,
-                          tooltip: "Skill",
+                          className: "assistant-composer-action-button assistant-tool-selector-button",
+                          icon: <Icon icon={Plus} size="xsm" color="inherit" />,
+                          tooltip: "选择工具",
+                          isIconOnly: true,
+                          isLoading: isLoadingDataSources || isImportingChatCsv,
                         }}
-                        items={skillMenuItems}
-                      />
+                      >
+                        {toolSelectorSections.length > 0 ? (
+                          toolSelectorSections.map((section) => (
+                            <div key={section.id} className="assistant-tool-selector-section" role="presentation">
+                              <div className="assistant-tool-selector-section-label">{section.title}</div>
+                              {section.items.map((item) => (
+                                <DropdownMenuItem
+                                  key={`${item.type}:${item.id}`}
+                                  className="assistant-tool-selector-menu-item"
+                                  label={renderToolSelectorLabel(item)}
+                                  endContent={renderToolSelectorEndContent(item)}
+                                  onClick={() => handleToolSelectorItemClick(item)}
+                                />
+                              ))}
+                            </div>
+                          ))
+                        ) : (
+                          <div className="assistant-tool-selector-empty">未找到匹配的工具、Skill 或数据源</div>
+                        )}
+                      </DropdownMenu>
                       <DropdownMenu
                         hasChevron={false}
                         placement="above"
@@ -2394,7 +3317,7 @@ export function DataAssistantWorkspace({
                         )
                       }
                     >
-                      {sender === "user" && renderUserContext(message)}
+                      {sender === "user" && renderUserContextTokens(message)}
                       <ChatMessageBubble
                         variant={sender === "assistant" ? "ghost" : "filled"}
                         metadata={renderMessageMetadata(message)}
@@ -2545,6 +3468,33 @@ export function DataAssistantWorkspace({
           </>
         )}
       </div>
+
+      <Dialog isOpen={fullFieldContextApprovalRequest !== null} onOpenChange={(open) => !open && resolveFullFieldContextApproval(false)} width={480} purpose="info" padding={5}>
+        <VStack gap={4} hAlign="stretch">
+          <div className="dialog-copy-stack">
+            <Text type="display-3" as="h2" display="block">
+              确认导入全表字段清单
+            </Text>
+            <Text type="body" color="secondary" display="block">
+              当前临时 CSV 字段数超过 {FULL_FIELD_CONTEXT_APPROVAL_THRESHOLD} 个。全量导入字段清单可提升 SQL 和 Python 脚本推理准确性，但会增加本轮大模型上下文长度。
+            </Text>
+          </div>
+          {fullFieldContextApprovalRequest?.sources.length ? (
+            <VStack gap={1} hAlign="stretch" className="assistant-field-context-approval-list">
+              {fullFieldContextApprovalRequest.sources.map((source) => (
+                <HStack key={source.fileName} hAlign="between" gap={3}>
+                  <Text type="body" display="block">{source.fileName}</Text>
+                  <Badge label={`${source.fieldCount} 个字段`} variant="neutral" />
+                </HStack>
+              ))}
+            </VStack>
+          ) : null}
+          <HStack hAlign="end" gap={2}>
+            <Button label={`仅导入前 ${FULL_FIELD_CONTEXT_APPROVAL_THRESHOLD} 个字段`} variant="secondary" onClick={() => resolveFullFieldContextApproval(false)} />
+            <Button label="导入全表字段" variant="primary" onClick={() => resolveFullFieldContextApproval(true)} />
+          </HStack>
+        </VStack>
+      </Dialog>
 
       <Dialog isOpen={editingConversation !== null} onOpenChange={(open) => !open && closeEditConversation()} width={460} purpose="form" padding={5}>
         <VStack gap={4} hAlign="stretch">

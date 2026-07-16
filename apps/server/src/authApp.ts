@@ -985,7 +985,8 @@ export function createAuthApp(store = new AuthStore(), dataStore = new DataManag
     }
     const dataSourceId = typeof request.query.dataSourceId === "string" ? request.query.dataSourceId : undefined;
     const skillId = normalizeSkillId(request.query.skill);
-    const allowedColumns = dataSourceId ? allowedColumnsForSkill(dataStore, dataSourceId, skillId) : undefined;
+    const fieldScope = typeof request.query.fieldScope === "string" ? request.query.fieldScope : "all";
+    const allowedColumns = dataSourceId && fieldScope === "skill" ? allowedColumnsForSkill(dataStore, dataSourceId, skillId) : undefined;
     const context = await dataStore.schemaContext({
       conversationId: typeof request.query.conversationId === "string" ? request.query.conversationId : undefined,
       userQuestion: typeof request.query.question === "string" ? request.query.question : undefined,

@@ -42,6 +42,24 @@ export type ChatCsvColumnMetadata = {
   suggestedBusinessFieldId?: string;
 };
 
+export type ChatCsvSelectedFieldRef = {
+  tokenId: string;
+  type: "csv_field";
+  tempDataSourceId: string;
+  tempTableId: string;
+  fieldId: string;
+  sourceHeader: string;
+  physicalName: string;
+  displayName: string;
+  logicalType: ChatCsvLogicalType;
+  sqliteType: ChatCsvSqliteType;
+  rawText: string;
+  start: number;
+  end: number;
+  createdAt: string;
+  status: "valid" | "expired" | "missing";
+};
+
 export type ChatCsvAttachment = {
   attachmentId: string;
   conversationId: string;
@@ -560,7 +578,7 @@ export class ConversationTempSourceManager {
     }
   }
 
-  assertSqlCanAccessTempTables(input: { sql: string; conversationId: string; userId: string }) {
+  assertSqlCanAccessTempTables(input: { sql: string; conversationId: string; userId: string; selectedFieldRefs?: ChatCsvSelectedFieldRef[] }) {
     const references = Array.from(input.sql.matchAll(/["'`]?((?:chat_csv_)[a-z0-9_]+)["'`]?/gi)).map((match) => match[1]);
     for (const tableName of new Set(references)) {
       const row = this.db.prepare("select * from conversation_temp_data_sources where sqlite_table_name = ?").get(tableName) as Record<string, unknown> | undefined;
@@ -578,7 +596,7 @@ export class ConversationTempSourceManager {
     }
   }
 
-  buildSchemaContextMarkdown(input: { conversationId: string; userId: string; tempDataSourceIds?: string[] }) {
+  buildSchemaContextMarkdown(input: { conversationId: string; userId: string; tempDataSourceIds?: string[]; selectedFieldRefs?: ChatCsvSelectedFieldRef[]; maxFieldsPerSource?: number }) {
     const sources = input.tempDataSourceIds?.length
       ? input.tempDataSourceIds
         .map((id) => this.getTempSource(id, input.userId, input.conversationId))
@@ -587,27 +605,43 @@ export class ConversationTempSourceManager {
     if (sources.length === 0) {
       return null;
     }
+    const maxFieldsPerSource = Number.isFinite(input.maxFieldsPerSource)
+      ? Math.max(0, Math.floor(input.maxFieldsPerSource as number))
+      : undefined;
+    const selectedSources = sources
+      .map((source) => ({
+        source,
+        fields: typeof maxFieldsPerSource === "number" ? source.columns.slice(0, maxFieldsPerSource) : source.columns,
+      }))
+      .filter((item) => item.fields.length > 0);
+    if (selectedSources.length === 0) {
+      return null;
+    }
     return [
-      "## 会话临时数据源",
+      "## 本轮 CSV 全表字段清单",
       "",
-      "当前会话包含用户临时上传的 CSV 数据源。临时 CSV 字段可以是中文、英文或中英文混合。生成 SQLite SQL 时必须使用下方真实表名和字段名，并对表名、字段名使用 SQLite 双引号转义。不要假设临时 CSV 字段具备 businessFieldId。",
+      "用户在自然语言中通过 # 选择的字段主要用于表达查询条件或关注维度；实际 SQL、Python、图表和报告分析可使用本节列出的当前临时 CSV 表字段。生成 SQLite SQL 时必须使用 SQLite 双引号安全引用表名和字段名。",
+      typeof maxFieldsPerSource === "number"
+        ? `字段注入策略：用户拒绝全量字段导入，本轮每个临时 CSV 仅注入前 ${maxFieldsPerSource} 个字段。`
+        : "字段注入策略：已注入当前临时 CSV 的全表字段清单。",
       "",
-      ...sources.flatMap((source) => [
+      ...selectedSources.flatMap(({ source, fields }) => [
         `### ${source.fileName}`,
         "",
         `- 临时数据源 ID：${source.tempDataSourceId}`,
         `- SQLite 临时表：${source.sqliteTableName}`,
         `- SQLite 临时表（已转义）：${quoteSqliteIdentifier(source.sqliteTableName)}`,
         `- 行数：${source.rowCount}`,
-        `- 列数：${source.columnCount}`,
+        `- 表字段总数：${source.columns.length}`,
+        `- 本轮注入字段数：${fields.length}`,
         "- 数据范围：当前会话",
         "- 生命周期：临时",
         `- 过期时间：${source.expiresAt ?? "--"}`,
-        "- Skill 兼容性：不承诺兼容预置 Skill；可用于通用 SQL、Python、图表和报告工具。",
+        "- Python 分析时可使用当前临时 CSV 表字段清单中明确存在的字段及工具返回结果中明确存在的字段，不得自行猜测或改写字段名称。",
         "",
-        "| 字段名 | SQLite 字段 | SQLite 字段（已转义） | 推断类型 | SQLite 类型 | 示例 |",
+        "| 展示名称 | 实际字段名 | SQLite 字段（已转义） | 推断类型 | SQLite 类型 | 脱敏样例 |",
         "|---|---|---|---|---|---|",
-        ...source.columns.map((column) =>
+        ...fields.map((column) =>
           `| ${escapeMarkdownTable(column.displayName)} | ${escapeMarkdownTable(column.sqliteColumnName)} | ${escapeMarkdownTable(quoteSqliteIdentifier(column.sqliteColumnName))} | ${column.inferredLogicalType} | ${column.sqliteType} | ${escapeMarkdownTable((column.sampleValues ?? []).join(", ")) || "--"} |`
         ),
         "",

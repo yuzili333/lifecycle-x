@@ -13,6 +13,12 @@ let refreshToken: string | null = null;
 let currentDockIcon = nativeImage.createFromPath(defaultDockIconPath);
 let assistantRuntime: AssistantRuntime | null = null;
 
+const e2eCdpPort = (process.env.LIFECYCLE_X_E2E_CDP_PORT ?? (app.isPackaged ? "" : "9333")).trim();
+if (e2eCdpPort && /^\d{2,5}$/.test(e2eCdpPort)) {
+  app.commandLine.appendSwitch("remote-debugging-port", e2eCdpPort);
+  app.commandLine.appendSwitch("remote-allow-origins", "*");
+}
+
 type SecretStore = {
   modelApiKeys?: Record<string, string>;
 };

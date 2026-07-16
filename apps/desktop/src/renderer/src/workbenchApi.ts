@@ -157,6 +157,14 @@ export type SchemaContextResult = {
     conversationId?: string;
     dataSourceIds: string[];
     systemInstruction: string;
+    dataSourceProfiles?: Array<{
+      displayName?: string;
+      tables?: Array<{
+        tableName: string;
+        columnCount?: number;
+        columns?: unknown[];
+      }>;
+    }>;
     markdown: string;
     warnings: Array<{ code: string; message: string; dataSourceId?: string; tableName?: string }>;
     generatedAt: string;

@@ -773,6 +773,25 @@ button {
   outline-offset: 2px;
 }
 
+.assistant-composer-context-tokens {
+  display: flex;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  margin-bottom: 8px;
+}
+
+.assistant-composer-context-tokens > span {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.assistant-user-context-tokens {
+  margin-bottom: 6px;
+}
+
 .assistant-bot-avatar {
   display: grid;
   width: 32px;
@@ -791,10 +810,6 @@ button {
   display: grid;
   gap: 8px;
   min-width: 0;
-}
-
-.assistant-user-context-tokens {
-  margin-bottom: 6px;
 }
 
 .assistant-tool-call-list {
@@ -1368,6 +1383,122 @@ button {
   overflow: hidden !important;
   text-overflow: ellipsis !important;
   white-space: nowrap !important;
+}
+
+.assistant-tool-selector-button {
+  width: 28px !important;
+  min-width: 28px !important;
+  max-width: 28px !important;
+  padding: 0 !important;
+}
+
+.assistant-field-selector-anchor {
+  width: 1px !important;
+  min-width: 1px !important;
+  max-width: 1px !important;
+  height: 1px !important;
+  min-height: 1px !important;
+  padding: 0 !important;
+  overflow: hidden !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
+.assistant-field-selector-menu {
+  min-width: 0;
+}
+
+.assistant-field-selector-results {
+  max-height: min(42vh, 360px);
+  min-width: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.assistant-field-selector-heading {
+  display: grid;
+  gap: 2px;
+  padding: 8px 10px 6px;
+  border-bottom: 1px solid color-mix(in srgb, var(--workbench-foreground, #e6edf6) 12%, transparent);
+}
+
+.assistant-field-selector-heading strong {
+  color: var(--workbench-foreground, #e6edf6);
+  font-size: 12px;
+  line-height: 1.3;
+}
+
+.assistant-field-selector-heading span {
+  min-width: 0;
+  overflow: hidden;
+  color: color-mix(in srgb, var(--workbench-foreground, #e6edf6) 62%, transparent);
+  font-size: 11px;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.assistant-field-context-approval-list {
+  max-height: 180px;
+  min-width: 0;
+  overflow-y: auto;
+}
+
+.assistant-field-context-approval-list [class*="astryx-text"] {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.assistant-tool-selector-section {
+  min-width: 0;
+}
+
+.assistant-tool-selector-section + .assistant-tool-selector-section {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid color-mix(in srgb, var(--workbench-foreground, #e6edf6) 12%, transparent);
+}
+
+.assistant-tool-selector-section-label {
+  padding: 5px 10px 4px;
+  color: color-mix(in srgb, var(--workbench-foreground, #e6edf6) 62%, transparent);
+  font-size: 11px;
+  line-height: 1.2;
+  font-weight: 700;
+}
+
+.assistant-tool-selector-menu-item {
+  min-width: 0;
+  font-size: 12px;
+}
+
+.assistant-tool-selector-item-label,
+.assistant-tool-selector-item-title,
+.assistant-tool-selector-item-description {
+  display: block;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.assistant-tool-selector-item-title {
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.assistant-tool-selector-item-description {
+  color: color-mix(in srgb, var(--workbench-foreground, #e6edf6) 62%, transparent);
+}
+
+.assistant-tool-selector-empty {
+  padding: 10px 12px;
+  color: color-mix(in srgb, var(--workbench-foreground, #e6edf6) 62%, transparent);
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .assistant-action-icon {

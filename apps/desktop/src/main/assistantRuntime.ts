@@ -39,6 +39,7 @@ import {
   chatCsvError,
   ConversationTempSourceManager,
   type ChatCsvAttachment,
+  type ChatCsvSelectedFieldRef,
   type ConversationTempCsvTable,
   type ImportConversationCsvInput,
 } from "./chatCsvTempSource";
@@ -83,6 +84,7 @@ export type AssistantMessageContext = {
   skill?: AssistantSkill | null;
   temporaryDataSourceIds?: string[];
   temporaryDataSourceLabels?: string[];
+  selectedFieldRefs?: ChatCsvSelectedFieldRef[];
 };
 
 export type AssistantConversation = {
@@ -114,6 +116,11 @@ export type AssistantMessage = {
 export type AssistantToolKind = "sql" | "python";
 export type AssistantToolStatus = "pending_approval" | "running" | "completed" | "declined" | "blocked" | "error";
 
+export type AssistantToolCallMetadata = {
+  selectedTempDataSourceIds?: string[];
+  selectedFieldRefs?: ChatCsvSelectedFieldRef[];
+};
+
 export type AssistantToolCall = {
   id: string;
   conversationId: string;
@@ -127,6 +134,7 @@ export type AssistantToolCall = {
   approvalMode: AssistantApprovalMode;
   createdAt: string;
   updatedAt: string;
+  metadata?: AssistantToolCallMetadata;
 };
 
 export type AssistantSendInput = {
@@ -138,6 +146,8 @@ export type AssistantSendInput = {
   dataSourceId?: string | null;
   dataSourceLabel?: string | null;
   selectedTempDataSourceIds?: string[];
+  selectedFieldRefs?: ChatCsvSelectedFieldRef[];
+  tempSchemaFieldLimit?: number;
   schemaContextMarkdown?: string | null;
   skill?: AssistantSkill | null;
   approvalMode: AssistantApprovalMode;
@@ -150,6 +160,8 @@ export type AssistantRetryInput = {
   modelName: string;
   dataSourceLabel?: string | null;
   selectedTempDataSourceIds?: string[];
+  selectedFieldRefs?: ChatCsvSelectedFieldRef[];
+  tempSchemaFieldLimit?: number;
   schemaContextMarkdown?: string | null;
   skill?: AssistantSkill | null;
   approvalMode: AssistantApprovalMode;
@@ -270,6 +282,7 @@ function selectedSkillSystemPrompt(skill: AssistantSkill | null | undefined) {
     "目标：基于用户选择的数据源，分析信贷资产五级和十二级风险分类的笔数、贷款余额、关注率、不良率、关注加不良率和正常3+关注类风险边界，并生成图表和 Markdown 报告。",
     "执行顺序：先确认数据源和字段映射；需要真实数据时调用 request_sql_query_execution；统计计算、分类标准化、占比和数据质量校验调用 request_python_analysis_execution；需要图表时调用 request_chart_rendering；完整报告调用 request_markdown_report_generation。",
     "SQL 和 Python 执行前必须遵守当前审批权限；不得绕过安全校验、权限校验或用户审批。",
+    "如果当前用户请求明确是其他字段或维度的查询、汇总、占比或分析，且未提及整体风险分类、风险分类分布、五级分类或十二级分类，则不得强行套用本 Skill 模板；应优先按用户自然语言请求生成 SQL 和后续 Python 分析。",
     "当用户说“根据/据选择的数据源生成报告”“生成一份整体风险分类分布报告”等新建报告请求时，必须重新进行意图识别并发起 SQL 查询和 Python 分析工具调用；不得直接返回最近一次或历史版本报告。",
     "只有用户明确说“基于上一轮/刚才/已有报告/历史版本继续修改或查看”时，才允许复用最近报告 Artifact。",
     "字段契约：优先使用上传表字典的 businessFieldId 理解字段，SQL 必须使用 BusinessFieldResolver 解析出的 physicalName，报告和结论使用 displayNameZh。",
@@ -340,6 +353,15 @@ function normalizeCsvSchemaQualifiedSql(sql: string) {
   return sql.replace(/\b(from|join)\s+csv_imports\.([`"[]?[\w.-]+[`"\]]?)/gi, (_match, keyword: string, tableName: string) => {
     return `${keyword} ${tableName}`;
   });
+}
+
+function isJsonContent(value: string) {
+  try {
+    JSON.parse(value);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function parseCsvAliasJson(value: string | undefined) {
@@ -416,8 +438,8 @@ function shouldAnalyzePriorSqlResult(prompt: string) {
 export function shouldAutoStartPythonReport(prompt: string) {
   const asksForReport = /(输出|生成|形成|给出|撰写|渲染|绘制|展示|放入|放到).{0,24}(分析)?报告|分析报告|报告输出|报告中/i.test(prompt);
   const asksForChart = /(柱状图|条形图|折线图|饼图|图表|可视化)/i.test(prompt);
-  const asksForAnalysis = /(统计|计数|总计|数量|占比|比例|分布|排序|倒序|排名|对比|分析)/i.test(prompt);
-  return asksForReport || (asksForChart && asksForAnalysis) || (/分析/i.test(prompt) && /(占比|比例|分布|统计|对比)/i.test(prompt));
+  const asksForAnalysis = /(统计|汇总|计数|总计|数量|占比|比例|分布|排序|倒序|排名|对比|分析)/i.test(prompt);
+  return asksForReport || (asksForChart && asksForAnalysis) || (/分析/i.test(prompt) && /(汇总|占比|比例|分布|统计|对比)/i.test(prompt));
 }
 
 function parseSqlToolRows(result: string | undefined) {
@@ -430,6 +452,179 @@ function parseSqlToolRows(result: string | undefined) {
   } catch {
     return [];
   }
+}
+
+export function buildGenericSqlResultAnalysisPythonScript(prompt: string, rows: Array<Record<string, unknown>>) {
+  const rowsJson = JSON.stringify(rows);
+  const promptJson = JSON.stringify(prompt);
+  return [
+    "import json, re, math",
+    "from collections import Counter",
+    "",
+    `rows = json.loads(${JSON.stringify(rowsJson)})`,
+    `question = ${promptJson}`,
+    "",
+    "def pct(value, total):",
+    "    return round(value * 100.0 / total, 2) if total else 0.0",
+    "",
+    "def to_number(value):",
+    "    if isinstance(value, bool) or value is None or value == '':",
+    "        return None",
+    "    if isinstance(value, (int, float)):",
+    "        return float(value) if math.isfinite(float(value)) else None",
+    "    text = str(value).strip().replace(',', '').replace('%', '')",
+    "    try:",
+    "        number = float(text)",
+    "        return number if math.isfinite(number) else None",
+    "    except (TypeError, ValueError):",
+    "        return None",
+    "",
+    "def normalize_text(value):",
+    "    text = str(value or '').strip()",
+    "    return text if text else '--'",
+    "",
+    "def match_requested_fields(keys):",
+    "    requested = [item.strip() for item in re.findall(r'#([^#\\s，,。；;：:、“”\"「」『』()（）]+)', question) if item.strip()]",
+    "    matched = []",
+    "    lowered = {str(key).lower(): key for key in keys}",
+    "    for token in requested:",
+    "        token_lower = token.lower()",
+    "        match = lowered.get(token_lower)",
+    "        if not match:",
+    "            match = next((key for key in keys if token_lower in str(key).lower() or str(key).lower() in token_lower), None)",
+    "        if match and match not in matched:",
+    "            matched.append(match)",
+    "    return matched",
+    "",
+    "def column_profile(rows_data, key):",
+    "    values = [row.get(key) for row in rows_data if row.get(key) not in (None, '')]",
+    "    numeric_values = [to_number(value) for value in values]",
+    "    numeric_values = [value for value in numeric_values if value is not None]",
+    "    non_empty = len(values)",
+    "    unique_count = len(set(normalize_text(value) for value in values))",
+    "    numeric_ratio = len(numeric_values) / non_empty if non_empty else 0",
+    "    return {'key': key, 'non_empty': non_empty, 'unique_count': unique_count, 'numeric_values': numeric_values, 'is_numeric': non_empty > 0 and numeric_ratio >= 0.9}",
+    "",
+    "def choose_dimensions(profiles, requested, total_rows):",
+    "    requested_dimensions = [field for field in requested if not profiles[field]['is_numeric']]",
+    "    inferred_dimensions = [",
+    "        item['key'] for item in sorted(profiles.values(), key=lambda p: (p['unique_count'], -p['non_empty'], str(p['key'])))",
+    "        if not item['is_numeric'] and 1 < item['unique_count'] <= max(30, int(total_rows * 0.7))",
+    "    ]",
+    "    dimensions = []",
+    "    for field in requested_dimensions + inferred_dimensions:",
+    "        if field not in dimensions:",
+    "            dimensions.append(field)",
+    "    return dimensions[:3]",
+    "",
+    "def choose_measures(profiles, requested):",
+    "    requested_measures = [field for field in requested if profiles[field]['is_numeric']]",
+    "    inferred_measures = [",
+    "        item['key'] for item in sorted(profiles.values(), key=lambda p: (-len(p['numeric_values']), str(p['key'])))",
+    "        if item['is_numeric']",
+    "    ]",
+    "    measures = []",
+    "    for field in requested_measures + inferred_measures:",
+    "        if field not in measures:",
+    "            measures.append(field)",
+    "    return measures[:3]",
+    "",
+    "def requested_values():",
+    "    quoted = re.findall(r'[“\"「『]([^”\"」』]+)[”\"」』]', question)",
+    "    return [value.strip() for value in quoted if value.strip()]",
+    "",
+    "def filter_rows_by_requested_values(rows_data, dimensions):",
+    "    values = requested_values()",
+    "    if not values or not dimensions:",
+    "        return rows_data",
+    "    filtered = []",
+    "    for row in rows_data:",
+    "        if any(normalize_text(row.get(field)) in values for field in dimensions):",
+    "            filtered.append(row)",
+    "    return filtered or rows_data",
+    "",
+    "total_rows = len(rows)",
+    "keys = list(rows[0].keys()) if rows else []",
+    "lines = []",
+    "lines.append('# SQL 查询结果分析')",
+    "lines.append('')",
+    "lines.append(f'- 分析对象：上一轮 SQL 工具调用返回结果')",
+    "lines.append(f'- 返回行数：{total_rows}')",
+    "lines.append('- 说明：以下计算仅基于已返回的 SQL 结果字段，不注入本地 Skill 模板。')",
+    "lines.append('')",
+    "",
+    "if not rows:",
+    "    lines.append('上一轮 SQL 工具调用未返回可分析数据。')",
+    "else:",
+    "    profiles = {key: column_profile(rows, key) for key in keys}",
+    "    requested = match_requested_fields(keys)",
+    "    dimensions = choose_dimensions(profiles, requested, total_rows)",
+    "    measures = choose_measures(profiles, requested)",
+    "    analysis_rows = filter_rows_by_requested_values(rows, dimensions)",
+    "    analysis_total = len(analysis_rows)",
+    "    weight_measure = measures[0] if measures else None",
+    "    weight_total = sum((to_number(row.get(weight_measure)) or 0) for row in analysis_rows) if weight_measure else 0",
+    "    if requested:",
+    "        lines.append('- 已匹配用户指定字段：' + '、'.join(str(field) for field in requested))",
+    "    if len(analysis_rows) != len(rows):",
+    "        lines.append(f'- 已按用户描述中的引号取值筛选分析样本：{analysis_total} 行。')",
+    "    lines.append('')",
+    "    if dimensions:",
+    "        for dimension in dimensions[:2]:",
+    "            counter = Counter(normalize_text(row.get(dimension)) for row in analysis_rows)",
+    "            weighted = Counter()",
+    "            if weight_measure:",
+    "                for row in analysis_rows:",
+    "                    weighted[normalize_text(row.get(dimension))] += to_number(row.get(weight_measure)) or 0",
+    "            lines.append(f'## 按 {dimension} 分布')",
+    "            if weight_measure:",
+    "                lines.append(f'| {dimension} | 行数 | 行数占比 | {weight_measure}合计 | {weight_measure}占比 |')",
+    "                lines.append('|---|---:|---:|---:|---:|')",
+    "            else:",
+    "                lines.append(f'| {dimension} | 行数 | 占比 |')",
+    "                lines.append('|---|---:|---:|')",
+    "            for value, count in counter.most_common(20):",
+    "                if weight_measure:",
+    "                    measure_sum = weighted[value]",
+    "                    lines.append(f'| {value} | {count} | {pct(count, analysis_total)}% | {round(measure_sum, 4)} | {pct(measure_sum, weight_total)}% |')",
+    "                else:",
+    "                    lines.append(f'| {value} | {count} | {pct(count, analysis_total)}% |')",
+    "            lines.append('')",
+    "    if len(dimensions) >= 2:",
+    "        first, second = dimensions[0], dimensions[1]",
+    "        combo = Counter((normalize_text(row.get(first)), normalize_text(row.get(second))) for row in analysis_rows)",
+    "        parent_totals = Counter()",
+    "        for (first_value, _second_value), count in combo.items():",
+    "            parent_totals[first_value] += count",
+    "        lines.append(f'## {first} 与 {second} 交叉分布')",
+    "        lines.append(f'| {first} | {second} | 行数 | {first}内占比 | 全量占比 |')",
+    "        lines.append('|---|---|---:|---:|---:|')",
+    "        for (first_value, second_value), count in combo.most_common(50):",
+    "            lines.append(f'| {first_value} | {second_value} | {count} | {pct(count, parent_totals[first_value])}% | {pct(count, analysis_total)}% |')",
+    "        lines.append('')",
+    "    if measures:",
+    "        lines.append('## 数值字段汇总')",
+    "        lines.append('| 字段 | 非空数值数 | 合计 | 平均值 | 最小值 | 最大值 |')",
+    "        lines.append('|---|---:|---:|---:|---:|---:|')",
+    "        for measure in measures:",
+    "            values = [to_number(row.get(measure)) for row in analysis_rows]",
+    "            values = [value for value in values if value is not None]",
+    "            if values:",
+    "                lines.append(f'| {measure} | {len(values)} | {round(sum(values), 4)} | {round(sum(values) / len(values), 4)} | {round(min(values), 4)} | {round(max(values), 4)} |')",
+    "        lines.append('')",
+    "    if not dimensions and not measures:",
+    "        lines.append('当前 SQL 结果未包含可自动统计的分类字段或数值字段。')",
+    "        lines.append('')",
+    "    lines.append('## 字段概览')",
+    "    lines.append('| 字段 | 非空样本数 | 去重值数量 | 类型判断 |')",
+    "    lines.append('|---|---:|---:|---|')",
+    "    for key in keys:",
+    "        profile = profiles[key]",
+    "        kind = '数值' if profile['is_numeric'] else '分类/文本'",
+    "        lines.append(f\"| {key} | {profile['non_empty']} | {profile['unique_count']} | {kind} |\")",
+    "",
+    "print('\\n'.join(lines))",
+  ].join("\n");
 }
 
 function parseSqlToolPreviewRows(result: string | undefined) {
@@ -634,6 +829,11 @@ export function shouldRouteSkillThroughModel(skill: AssistantSkill | null | unde
 
 export function shouldStartOverallRiskWorkflowAfterModelText(input: { skill?: AssistantSkill | null; prompt: string }, assistantContent: string) {
   if (!isOverallRiskSkill(input.skill)) {
+    return false;
+  }
+  const userPromptAsksOverallRisk = /整体风险分类|风险分类分布|五级分类|十二级分类|最新风险分类|latest_risk|latest_risk_result/i.test(input.prompt);
+  const userPromptAsksDifferentAnalysis = /(短中长期|中期|长期|一级分行|分行|期限|占比|比例|汇总|统计|查询|分析)/i.test(input.prompt) && !userPromptAsksOverallRisk;
+  if (userPromptAsksDifferentAnalysis) {
     return false;
   }
   const combined = `${input.prompt}\n${assistantContent}`;
@@ -1082,11 +1282,15 @@ export class AssistantRuntime {
       userId: input.userId,
       conversationId: conversation.id,
       tempDataSourceIds: tempSources.map((source) => source.tempDataSourceId),
+      selectedFieldRefs: input.selectedFieldRefs,
+      maxFieldsPerSource: input.tempSchemaFieldLimit,
     });
     const effectiveInput: AssistantSendInput = {
       ...input,
       conversationId: conversation.id,
       selectedTempDataSourceIds: tempSources.map((source) => source.tempDataSourceId),
+      selectedFieldRefs: input.selectedFieldRefs,
+      tempSchemaFieldLimit: input.tempSchemaFieldLimit,
       schemaContextMarkdown: [input.schemaContextMarkdown, tempSchemaContextMarkdown].filter(Boolean).join("\n\n") || null,
     };
 
@@ -1109,6 +1313,7 @@ export class AssistantRuntime {
         skill: input.skill ?? null,
         temporaryDataSourceIds: tempSources.map((source) => source.tempDataSourceId),
         temporaryDataSourceLabels: tempSources.map((source) => source.fileName),
+        selectedFieldRefs: input.selectedFieldRefs ?? [],
       },
     });
     const assistantMessage = this.insertMessage({
@@ -1416,10 +1621,13 @@ export class AssistantRuntime {
     this.options.emit({ type: "conversation", conversation: nextConversation });
     this.options.emit({ type: "message", conversationId: conversation.id, message: assistantMessage });
     const tempSources = this.activeTempSources(input.userId, conversation.id, input.selectedTempDataSourceIds);
+    const retrySelectedFieldRefs = input.selectedFieldRefs ?? sourceUserMessage.context?.selectedFieldRefs;
     const tempSchemaContextMarkdown = this.tempSourceManager.buildSchemaContextMarkdown({
       userId: input.userId,
       conversationId: conversation.id,
       tempDataSourceIds: tempSources.map((source) => source.tempDataSourceId),
+      selectedFieldRefs: retrySelectedFieldRefs,
+      maxFieldsPerSource: input.tempSchemaFieldLimit,
     });
 
     const retryInput: AssistantSendInput = {
@@ -1430,6 +1638,8 @@ export class AssistantRuntime {
       modelName,
       dataSourceLabel: input.dataSourceLabel,
       selectedTempDataSourceIds: tempSources.map((source) => source.tempDataSourceId),
+      selectedFieldRefs: retrySelectedFieldRefs,
+      tempSchemaFieldLimit: input.tempSchemaFieldLimit,
       schemaContextMarkdown: [input.schemaContextMarkdown, tempSchemaContextMarkdown].filter(Boolean).join("\n\n") || null,
       skill: input.skill,
       approvalMode: input.approvalMode,
@@ -1489,6 +1699,7 @@ export class AssistantRuntime {
         approval_mode text not null,
         created_at text not null,
         updated_at text not null,
+        metadata_json text,
         integrity_hash text not null
       );
       create table if not exists tool_call_logs (
@@ -1509,6 +1720,11 @@ export class AssistantRuntime {
     `);
     try {
       this.db.prepare("alter table messages add column context_json text").run();
+    } catch {
+      // Column already exists in migrated local databases.
+    }
+    try {
+      this.db.prepare("alter table tool_calls add column metadata_json text").run();
     } catch {
       // Column already exists in migrated local databases.
     }
@@ -1689,6 +1905,7 @@ export class AssistantRuntime {
       approvalMode: row.approval_mode as AssistantApprovalMode,
       createdAt: row.created_at as string,
       updatedAt: row.updated_at as string,
+      metadata: row.metadata_json ? (JSON.parse(row.metadata_json as string) as AssistantToolCallMetadata) : undefined,
     };
   }
 
@@ -1735,7 +1952,7 @@ export class AssistantRuntime {
     return /\bwf_[a-z0-9_]+\b/i.test(script) || /\bsqlite3\.connect\s*\(/i.test(script) || /\bimport\s+(pandas|numpy)\b|\bfrom\s+(pandas|numpy)\b/i.test(script);
   }
 
-  private async normalizePythonToolScript(input: { userId: string; conversationId: string; prompt?: string; script: string; selectedTempDataSourceIds?: string[] }) {
+  private async normalizePythonToolScript(input: { userId: string; conversationId: string; prompt?: string; script: string; selectedTempDataSourceIds?: string[]; selectedFieldRefs?: ChatCsvSelectedFieldRef[] }) {
     const shouldReplaceScript = this.shouldReplacePythonScript(input.script);
     const { latestSqlToolCall, rows } = await this.latestSqlRowsForConversation(input.userId, input.conversationId);
     if (latestSqlToolCall && rows.length > 0) {
@@ -1755,7 +1972,12 @@ export class AssistantRuntime {
     if (!source) {
       return null;
     }
-    const rows = this.db.prepare(`select * from ${quoteIdentifier(source.sqliteTableName)}`).all() as Array<Record<string, unknown>>;
+    const selectedColumns = source.columns;
+    if (selectedColumns.length === 0) {
+      return null;
+    }
+    const selectColumns = selectedColumns.map((column) => quoteIdentifier(column.sqliteColumnName)).join(", ");
+    const rows = this.db.prepare(`select ${selectColumns} from ${quoteIdentifier(source.sqliteTableName)}`).all() as Array<Record<string, unknown>>;
     const result = JSON.stringify({ rowCount: rows.length, previewRows: rows.slice(0, 20), previewRowLimit: 20 }, null, 2);
     const now = nowIso();
     const toolCall: AssistantToolCall = {
@@ -1765,7 +1987,7 @@ export class AssistantRuntime {
       userId,
       kind: "sql",
       status: "completed",
-      script: `select * from ${quoteIdentifier(source.sqliteTableName)}`,
+      script: `select ${selectColumns} from ${quoteIdentifier(source.sqliteTableName)}`,
       result,
       approvalMode: "request_approval",
       createdAt: now,
@@ -1853,375 +2075,7 @@ export class AssistantRuntime {
 
   private buildPythonAnalysisScript(prompt: string, sqlToolCall: AssistantToolCall, rowsOverride?: Array<Record<string, unknown>>) {
     const rows = rowsOverride?.length ? rowsOverride : parseSqlToolRows(sqlToolCall.result);
-    const rowsJson = JSON.stringify(rows);
-    const promptJson = JSON.stringify(prompt);
-    return [
-      "import json, re",
-      "from collections import Counter, defaultdict",
-      "from datetime import datetime, timezone",
-      "",
-      `rows = json.loads(${JSON.stringify(rowsJson)})`,
-      `question = ${promptJson}`,
-      "",
-      "def pct(value, total):",
-      "    return round(value * 100.0 / total, 2) if total else 0.0",
-      "",
-      "def number(row, key):",
-      "    try:",
-      "        return float(row.get(key) or 0)",
-      "    except (TypeError, ValueError):",
-      "        return 0.0",
-      "",
-      "def pick_field(keys, candidates):",
-      "    risk_candidates = any('risk' in candidate.lower() or '分类' in candidate for candidate in candidates)",
-      "    lowered = {str(key).lower(): key for key in keys}",
-      "    for candidate in candidates:",
-      "        if candidate.lower() in lowered:",
-      "            matched = lowered[candidate.lower()]",
-      "            if not risk_candidates or not re.search(r'date|time|classified_at|日期|时间|p_date|partition_date', str(matched), re.I):",
-      "                return matched",
-      "    for key in keys:",
-      "        text = str(key).lower()",
-      "        if risk_candidates and re.search(r'date|time|classified_at|日期|时间|p_date|partition_date', str(key), re.I):",
-      "            continue",
-      "        if any(candidate.lower() in text for candidate in candidates):",
-      "            return key",
-      "    return None",
-      "",
-      "def five_bucket(value):",
-      "    text = str(value or '').strip()",
-      "    if '损失' in text:",
-      "        return '损失'",
-      "    if '可疑' in text:",
-      "        return '可疑'",
-      "    if '次级' in text:",
-      "        return '次级'",
-      "    if '关注' in text:",
-      "        return '关注'",
-      "    if '正常' in text:",
-      "        return '正常'",
-      "    if '不良' in text:",
-      "        return '不良'",
-      "    return text or '未分类'",
-      "",
-      "total_rows = len(rows)",
-      "keys = set(rows[0].keys()) if rows else set()",
-      "raw_risk_field = pick_field(keys, ['five_level_classification', 'latest_risk', 'latest_five_level_risk', 'latest_five_level_risk_class', 'risk_classification', 'risk_level', '最新风险分类', '五级分类', '最新风险五级分类'])",
-      "raw_balance_field = pick_field(keys, ['loan_balance_10k', 'loan_balance', 'balance', '贷款余额(万元)', '贷款余额', '本金余额'])",
-      "raw_amount_field = pick_field(keys, ['contract_amount_10k', 'contract_amount', '合同金额(万元)', '合同金额', '授信金额'])",
-      "term_field = 'loan_term_type'",
-      "branch_field = 'branch_name'",
-      "preferred_terms = ['短期', '中期', '长期']",
-      "lines = []",
-      "lines.append('# SQL查询结果统计分析报告')",
-      "lines.append('')",
-      "lines.append(f'- 分析对象：上一轮 SQL 工具调用返回结果')",
-      "lines.append(f'- 样本行数：{total_rows}')",
-      "lines.append(f'- 说明：以下结论仅基于已返回的 SQL 工具结果数据，不重新查询数据源。')",
-      "lines.append('')",
-      "",
-      "if not rows:",
-      "    lines.append('## 结论')",
-      "    lines.append('上一轮 SQL 工具调用未返回可分析行数据。')",
-      "elif {'five_level', 'contract_count'}.issubset(set(rows[0].keys())):",
-      "    def number(row, key):",
-      "        try:",
-      "            return float(row.get(key) or 0)",
-      "        except (TypeError, ValueError):",
-      "            return 0.0",
-      "    total_count = sum(int(number(row, 'contract_count')) for row in rows)",
-      "    total_balance = sum(number(row, 'total_balance') for row in rows)",
-      "    total_amount = sum(number(row, 'total_amount') for row in rows)",
-      "    lines.append('## 整体风险分类分布（笔数+金额）')",
-      "    lines.append('| 风险分类 | 笔数 | 笔数占比 | 贷款余额(万元) | 余额占比 | 合同金额(万元) | 金额占比 |')",
-      "    lines.append('|---|---:|---:|---:|---:|---:|---:|')",
-      "    risk_order = {'正常': 1, '关注': 2, '不良': 3, '次级': 4, '可疑': 5, '损失': 6}",
-      "    ordered_rows = sorted(rows, key=lambda row: risk_order.get(str(row.get('five_level') or ''), 99))",
-      "    for row in ordered_rows:",
-      "        count = int(number(row, 'contract_count'))",
-      "        balance = number(row, 'total_balance')",
-      "        amount = number(row, 'total_amount')",
-      "        lines.append(f\"| {row.get('five_level') or '--'} | {count} | {pct(count, total_count)}% | {round(balance, 2)} | {pct(balance, total_balance)}% | {round(amount, 2)} | {pct(amount, total_amount)}% |\")",
-      "    lines.append(f\"| 合计 | {total_count} | 100.0% | {round(total_balance, 2)} | {100.0 if total_balance else 0.0}% | {round(total_amount, 2)} | {100.0 if total_amount else 0.0}% |\")",
-      "    attention_count = sum(int(number(row, 'contract_count')) for row in rows if '关注' in str(row.get('five_level') or ''))",
-      "    npl_count = sum(int(number(row, 'contract_count')) for row in rows if any(key in str(row.get('five_level') or '') for key in ['不良', '次级', '可疑', '损失']))",
-      "    attention_balance = sum(number(row, 'total_balance') for row in rows if '关注' in str(row.get('five_level') or ''))",
-      "    npl_balance = sum(number(row, 'total_balance') for row in rows if any(key in str(row.get('five_level') or '') for key in ['不良', '次级', '可疑', '损失']))",
-      "    lines.append('')",
-      "    lines.append('## 核心风险指标')",
-      "    lines.append(f'- 关注类占比：{pct(attention_count, total_count)}%（笔数），{pct(attention_balance, total_balance)}%（余额）。')",
-      "    lines.append(f'- 不良率：{pct(npl_count, total_count)}%（笔数），{pct(npl_balance, total_balance)}%（余额）。')",
-      "    lines.append(f'- 关注+不良占比：{pct(attention_count + npl_count, total_count)}%（笔数），{pct(attention_balance + npl_balance, total_balance)}%（余额）。')",
-      "    lines.append('')",
-      "    lines.append('## 数据质量与口径说明')",
-      "    lines.append('- 本次 SQL 已返回风险分类聚合结果，报告基于聚合结果计算。')",
-      "    lines.append('- 不良类口径：次级、可疑、损失；关注加不良口径：关注、次级、可疑、损失。')",
-      "elif raw_risk_field and (raw_balance_field or raw_amount_field):",
-      "    stats = defaultdict(lambda: {'count': 0, 'balance': 0.0, 'amount': 0.0})",
-      "    for row in rows:",
-      "        bucket = five_bucket(row.get(raw_risk_field))",
-      "        stats[bucket]['count'] += 1",
-      "        if raw_balance_field:",
-      "            stats[bucket]['balance'] += number(row, raw_balance_field)",
-      "        if raw_amount_field:",
-      "            stats[bucket]['amount'] += number(row, raw_amount_field)",
-      "    total_count = sum(item['count'] for item in stats.values())",
-      "    total_balance = sum(item['balance'] for item in stats.values())",
-      "    total_amount = sum(item['amount'] for item in stats.values())",
-      "    risk_order = {'正常': 1, '关注': 2, '不良': 3, '次级': 4, '可疑': 5, '损失': 6, '未分类': 99}",
-      "    ordered = sorted(stats.items(), key=lambda item: risk_order.get(item[0], 50))",
-      "    lines.append('## 整体风险分类分布（笔数+金额）')",
-      "    lines.append('| 风险分类 | 笔数 | 笔数占比 | 贷款余额(万元) | 余额占比 | 合同金额(万元) | 金额占比 |')",
-      "    lines.append('|---|---:|---:|---:|---:|---:|---:|')",
-      "    for bucket, item in ordered:",
-      "        lines.append(f\"| {bucket} | {item['count']} | {pct(item['count'], total_count)}% | {round(item['balance'], 2)} | {pct(item['balance'], total_balance)}% | {round(item['amount'], 2)} | {pct(item['amount'], total_amount)}% |\")",
-      "    lines.append(f\"| 合计 | {total_count} | 100.0% | {round(total_balance, 2)} | {100.0 if total_balance else 0.0}% | {round(total_amount, 2)} | {100.0 if total_amount else 0.0}% |\")",
-      "    attention_count = stats.get('关注', {}).get('count', 0)",
-      "    npl_count = sum(stats.get(key, {}).get('count', 0) for key in ['不良', '次级', '可疑', '损失'])",
-      "    attention_balance = stats.get('关注', {}).get('balance', 0.0)",
-      "    npl_balance = sum(stats.get(key, {}).get('balance', 0.0) for key in ['不良', '次级', '可疑', '损失'])",
-      "    lines.append('')",
-      "    lines.append('## 核心风险指标')",
-      "    lines.append(f'- 关注类占比：{pct(attention_count, total_count)}%（笔数），{pct(attention_balance, total_balance)}%（余额）。')",
-      "    lines.append(f'- 不良率：{pct(npl_count, total_count)}%（笔数），{pct(npl_balance, total_balance)}%（余额）。')",
-      "    lines.append(f'- 关注+不良占比：{pct(attention_count + npl_count, total_count)}%（笔数），{pct(attention_balance + npl_balance, total_balance)}%（余额）。')",
-      "    lines.append('')",
-      "    lines.append('## 数据质量与口径说明')",
-      "    lines.append(f'- 风险分类字段：{raw_risk_field}；贷款余额(万元)字段：{raw_balance_field or \"未提供\"}；合同金额(万元)字段：{raw_amount_field or \"未提供\"}。')",
-      "    lines.append('- 不良类口径：次级、可疑、损失；关注加不良口径：关注、次级、可疑、损失。')",
-      "elif 'accounting_org_name' in rows[0] and 'latest_risk_result' in rows[0] and ('柱状图' in question or '条形图' in question or '图表' in question or '可视化' in question or '报告' in question):",
-      "    branch_field = 'accounting_org_name'",
-      "    risk_result_field = 'latest_risk_result'",
-      "    def requested_value_for(field_name):",
-      "        position = question.find(field_name)",
-      "        if position < 0:",
-      "            return None",
-      "        segment = question[position:position + 120]",
-      "        quoted = re.findall(r'[“\"「『]([^”\"」』]+)[”\"」』]', segment)",
-      "        for value in quoted:",
-      "            if value != field_name:",
-      "                return value",
-      "        match = re.search(r'为\\s*([^，,。；;\\s]+)', segment)",
-      "        return match.group(1) if match else None",
-      "    target_value = requested_value_for(risk_result_field) or ('0300--次级' if '0300--次级' in question else None)",
-      "    count_field = next((key for key in ['record_count', 'cnt', 'count', 'total_count', '总计数量'] if key in rows[0]), None)",
-      "    filtered = []",
-      "    for row in rows:",
-      "        if target_value and str(row.get(risk_result_field) or '').strip() != target_value:",
-      "            continue",
-      "        filtered.append(row)",
-      "    counter = Counter()",
-      "    for row in filtered:",
-      "        branch = row.get(branch_field) or '--'",
-      "        if count_field:",
-      "            try:",
-      "                counter[branch] += int(float(row.get(count_field) or 0))",
-      "            except (TypeError, ValueError):",
-      "                counter[branch] += 0",
-      "        else:",
-      "            counter[branch] += 1",
-      "    chart_rows = [{'accounting_org_name': branch, 'record_count': count} for branch, count in counter.most_common()]",
-      "    total_count = sum(item['record_count'] for item in chart_rows)",
-      "    lines.append('## 分行最近风险结果统计')",
-      "    lines.append(f'- 统计口径：{risk_result_field} = {target_value or \"全部\"}')",
-      "    lines.append(f'- 命中记录总数：{total_count}')",
-      "    lines.append('')",
-      "    lines.append('| 排名 | 分行 | 总计数量 | 占比 |')",
-      "    lines.append('|---:|---|---:|---:|')",
-      "    for rank, item in enumerate(chart_rows, start=1):",
-      "        lines.append(f\"| {rank} | {item['accounting_org_name']} | {item['record_count']} | {pct(item['record_count'], total_count)}% |\")",
-      "    lines.append('')",
-      "    if chart_rows:",
-      "        top_item = chart_rows[0]",
-      "        lines.append('## 分析结论')",
-      "        lines.append(f\"- {target_value or '目标风险结果'}记录主要集中在 {top_item['accounting_org_name']}，总计 {top_item['record_count']} 条，占比 {pct(top_item['record_count'], total_count)}%。\")",
-      "        lines.append('- 建议优先复核排名靠前分行的客户结构、风险迁徙原因和贷后处置进度。')",
-      "    else:",
-      "        lines.append('## 分析结论')",
-      "        lines.append('- 当前 SQL 结果中未命中指定风险结果，暂无可绘制的分行柱状图。')",
-      "    if chart_rows:",
-      "        chart_rows_for_spec = chart_rows[:200]",
-      "        spec = {",
-      "            'specVersion': '1.0',",
-      "            'visualizationId': 'viz_latest_risk_result_by_branch',",
-      "            'type': 'bar',",
-      "            'title': f\"各分行{target_value or '目标风险结果'}总计数量\",",
-      "            'subtitle': '基于已审批 SQL 工具调用结果生成',",
-      "            'businessSemantic': 'institution_risk_comparison',",
-      "            'data': {'mode': 'inline', 'rows': chart_rows_for_spec, 'rowCount': len(chart_rows_for_spec), 'trusted': True},",
-      "            'dimensions': [{'field': 'accounting_org_name', 'label': '分行', 'dataType': 'category', 'role': 'x', 'sort': 'none'}],",
-      "            'measures': [{'field': 'record_count', 'label': '总计数量', 'dataType': 'count', 'role': 'y', 'aggregation': 'sum', 'format': {'type': 'integer'}}],",
-      "            'encoding': {'x': 'accounting_org_name', 'y': ['record_count']},",
-      "            'interaction': {'tooltip': True, 'legend': False, 'exportable': True},",
-      "            'display': {'height': 320, 'responsive': True, 'showDataSource': True},",
-      "            'theme': {'mode': 'dark', 'palette': 'neutral'},",
-      "            'provenance': {'sourceType': 'python', 'sourceExecutionId': 'local-python', 'generatedAt': datetime.now(timezone.utc).isoformat(), 'truncated': len(chart_rows_for_spec) < len(chart_rows)},",
-      "        }",
-      "        lines.append('')",
-      "        lines.append('```visualization')",
-      "        lines.append(json.dumps(spec, ensure_ascii=False, indent=2))",
-      "        lines.append('```')",
-      "elif {'stat_type', 'dimension', 'record_count'}.issubset(set(rows[0].keys())):",
-      "    def number(row, key):",
-      "        try:",
-      "            return float(row.get(key) or 0)",
-      "        except (TypeError, ValueError):",
-      "            return 0.0",
-      "    branch_rows = [row for row in rows if row.get('stat_type') in ('branch', '分行占比')]",
-      "    term_business_rows = [row for row in rows if row.get('stat_type') in ('term_business', '组合分布')]",
-      "    total_rows_data = [row for row in rows if row.get('stat_type') in ('total', '总计')]",
-      "    total_count = int(number(total_rows_data[0], 'record_count')) if total_rows_data else int(sum(number(row, 'record_count') for row in branch_rows))",
-      "    lines.append('## 总体概况')",
-      "    lines.append(f'- 本次 SQL 查询结果共返回 {len(rows)} 条统计记录。')",
-      "    if total_count:",
-      "        lines.append(f'- 不良数据总计：{total_count}。')",
-      "    lines.append('')",
-      "    if branch_rows:",
-      "        lines.append('## 分行占比')",
-      "        lines.append('| 排名 | 分行 | 记录数 | 占比 |')",
-      "        lines.append('|---:|---|---:|---:|')",
-      "        for rank, row in enumerate(sorted(branch_rows, key=lambda item: number(item, 'record_count'), reverse=True), start=1):",
-      "            count = int(number(row, 'record_count'))",
-      "            percentage = number(row, 'percentage') or pct(count, total_count)",
-      "            lines.append(f\"| {rank} | {row.get('dimension') or '--'} | {count} | {percentage}% |\")",
-      "        top_branch = max(branch_rows, key=lambda item: number(item, 'record_count'))",
-      "        lines.append('')",
-      "        lines.append(f\"- 分行维度最高的是 {top_branch.get('dimension') or '--'}，记录数 {int(number(top_branch, 'record_count'))}，占比 {number(top_branch, 'percentage') or pct(number(top_branch, 'record_count'), total_count)}%。\")",
-      "    if term_business_rows:",
-      "        lines.append('')",
-      "        lines.append('## 贷款类型与业务分类组合分布')",
-      "        lines.append('| 排名 | 贷款类型 + 业务分类 | 记录数 | 占比 |')",
-      "        lines.append('|---:|---|---:|---:|')",
-      "        for rank, row in enumerate(sorted(term_business_rows, key=lambda item: number(item, 'record_count'), reverse=True), start=1):",
-      "            count = int(number(row, 'record_count'))",
-      "            percentage = number(row, 'percentage') or pct(count, total_count)",
-      "            lines.append(f\"| {rank} | {row.get('dimension') or '--'} | {count} | {percentage}% |\")",
-      "        top_combo = max(term_business_rows, key=lambda item: number(item, 'record_count'))",
-      "        lines.append('')",
-      "        lines.append(f\"- 组合分布最高的是 {top_combo.get('dimension') or '--'}，记录数 {int(number(top_combo, 'record_count'))}，占比 {number(top_combo, 'percentage') or pct(number(top_combo, 'record_count'), total_count)}%。\")",
-      "    lines.append('')",
-      "    lines.append('## 分析结论')",
-      "    if branch_rows and term_business_rows:",
-      "        lines.append('- 不良样本呈现出可识别的分行集中度和产品期限/业务分类结构差异，建议优先对占比最高的分行及组合维度做穿透复核。')",
-      "    elif branch_rows:",
-      "        lines.append('- 当前结果可支撑分行集中度判断，但缺少贷款类型与业务分类组合维度。')",
-      "    else:",
-      "        lines.append('- 当前结果可支撑组合分布判断，但缺少分行维度占比。')",
-      "elif term_field in rows[0] and branch_field in rows[0] and 'cnt' in rows[0]:",
-      "    normalized = []",
-      "    for row in rows:",
-      "        try:",
-      "            count = int(float(row.get('cnt') or 0))",
-      "        except (TypeError, ValueError):",
-      "            count = 0",
-      "        normalized.append({",
-      "            'term': row.get(term_field) or '--',",
-      "            'branch': row.get(branch_field) or '--',",
-      "            'count': count,",
-      "            'term_total': int(float(row.get('term_cnt') or 0)) if str(row.get('term_cnt') or '').replace('.', '', 1).isdigit() else 0,",
-      "            'total': int(float(row.get('total_cnt') or 0)) if str(row.get('total_cnt') or '').replace('.', '', 1).isdigit() else 0,",
-      "        })",
-      "    term_counts = Counter()",
-      "    branch_by_term = defaultdict(Counter)",
-      "    for item in normalized:",
-      "        term_counts[item['term']] += item['count']",
-      "        branch_by_term[item['term']][item['branch']] += item['count']",
-      "    total_rows = max([item['total'] for item in normalized] + [sum(term_counts.values())])",
-      "    lines.append('## 期限类型总量')",
-      "    lines.append('| 期限类型 | 总计个数 | 占样本比例 |')",
-      "    lines.append('|---|---:|---:|')",
-      "    for term in preferred_terms:",
-      "        count = term_counts.get(term, 0)",
-      "        lines.append(f'| {term} | {count} | {pct(count, total_rows)}% |')",
-      "    lines.append('')",
-      "    lines.append('## 各分行占比')",
-      "    lines.append('| 期限类型 | 分行 | 个数 | 类型内占比 | 总样本占比 |')",
-      "    lines.append('|---|---|---:|---:|---:|')",
-      "    for term in preferred_terms:",
-      "        term_total = term_counts.get(term, 0)",
-      "        for branch, count in branch_by_term.get(term, Counter()).most_common():",
-      "            lines.append(f'| {term} | {branch} | {count} | {pct(count, term_total)}% | {pct(count, total_rows)}% |')",
-      "    lines.append('')",
-      "    lines.append('## 中期与长期占比最高前三分行')",
-      "    lines.append('| 期限类型 | 排名 | 分行 | 个数 | 类型内占比 | 总样本占比 |')",
-      "    lines.append('|---|---:|---|---:|---:|---:|')",
-      "    for term in ['中期', '长期']:",
-      "        term_total = term_counts.get(term, 0)",
-      "        for rank, (branch, count) in enumerate(branch_by_term.get(term, Counter()).most_common(3), start=1):",
-      "            lines.append(f'| {term} | {rank} | {branch} | {count} | {pct(count, term_total)}% | {pct(count, total_rows)}% |')",
-      "    lines.append('')",
-      "    lines.append('## 分析结论')",
-      "    mid_top = branch_by_term.get('中期', Counter()).most_common(1)",
-      "    long_top = branch_by_term.get('长期', Counter()).most_common(1)",
-      "    if mid_top:",
-      "        branch, count = mid_top[0]",
-      "        lines.append(f'- 中期占比最高分行为 {branch}，数量 {count}，类型内占比 {pct(count, term_counts.get(\"中期\", 0))}%。')",
-      "    if long_top:",
-      "        branch, count = long_top[0]",
-      "        lines.append(f'- 长期占比最高分行为 {branch}，数量 {count}，类型内占比 {pct(count, term_counts.get(\"长期\", 0))}%。')",
-      "    if mid_top and long_top and mid_top[0][0] == long_top[0][0]:",
-      "        lines.append(f'- {mid_top[0][0]}同时位于中期和长期最高分行，建议重点复核该分行风险合同期限结构。')",
-      "    else:",
-      "        lines.append('- 中期与长期头部分行不同，建议分别拆解分行客户结构、授信品类与期限配置差异。')",
-      "elif term_field in rows[0] and branch_field in rows[0]:",
-      "    term_counts = Counter((row.get(term_field) or '--') for row in rows)",
-      "    lines.append('## 期限类型总量')",
-      "    lines.append('| 期限类型 | 总计个数 | 占样本比例 |')",
-      "    lines.append('|---|---:|---:|')",
-      "    for term in preferred_terms:",
-      "        count = term_counts.get(term, 0)",
-      "        lines.append(f'| {term} | {count} | {pct(count, total_rows)}% |')",
-      "    other_count = sum(count for term, count in term_counts.items() if term not in preferred_terms)",
-      "    if other_count:",
-      "        lines.append(f'| 其他 | {other_count} | {pct(other_count, total_rows)}% |')",
-      "    lines.append('')",
-      "    branch_by_term = defaultdict(Counter)",
-      "    for row in rows:",
-      "        term = row.get(term_field) or '--'",
-      "        branch = row.get(branch_field) or '--'",
-      "        branch_by_term[term][branch] += 1",
-      "    lines.append('## 各分行占比')",
-      "    lines.append('| 期限类型 | 分行 | 个数 | 类型内占比 | 总样本占比 |')",
-      "    lines.append('|---|---|---:|---:|---:|')",
-      "    for term in preferred_terms:",
-      "        term_total = term_counts.get(term, 0)",
-      "        for branch, count in branch_by_term.get(term, Counter()).most_common():",
-      "            lines.append(f'| {term} | {branch} | {count} | {pct(count, term_total)}% | {pct(count, total_rows)}% |')",
-      "    lines.append('')",
-      "    lines.append('## 中期与长期占比最高前三分行')",
-      "    lines.append('| 期限类型 | 排名 | 分行 | 个数 | 类型内占比 | 总样本占比 |')",
-      "    lines.append('|---|---:|---|---:|---:|---:|')",
-      "    for term in ['中期', '长期']:",
-      "        term_total = term_counts.get(term, 0)",
-      "        for rank, (branch, count) in enumerate(branch_by_term.get(term, Counter()).most_common(3), start=1):",
-      "            lines.append(f'| {term} | {rank} | {branch} | {count} | {pct(count, term_total)}% | {pct(count, total_rows)}% |')",
-      "    lines.append('')",
-      "    lines.append('## 分析结论')",
-      "    mid_top = branch_by_term.get('中期', Counter()).most_common(1)",
-      "    long_top = branch_by_term.get('长期', Counter()).most_common(1)",
-      "    if mid_top:",
-      "        branch, count = mid_top[0]",
-      "        lines.append(f'- 中期样本中，{branch}数量最高，为 {count} 笔，占中期样本 {pct(count, term_counts.get(\"中期\", 0))}%。')",
-      "    if long_top:",
-      "        branch, count = long_top[0]",
-      "        lines.append(f'- 长期样本中，{branch}数量最高，为 {count} 笔，占长期样本 {pct(count, term_counts.get(\"长期\", 0))}%。')",
-      "    if mid_top and long_top and mid_top[0][0] == long_top[0][0]:",
-      "        lines.append(f'- {mid_top[0][0]}同时位于中期和长期最高分行，建议优先复核该分行相关合同风险迁徙原因。')",
-      "    else:",
-      "        lines.append('- 中期与长期高占比分行存在差异，建议分别从区域行业集中度、客户结构和授信期限配置进行对比复核。')",
-      "else:",
-      "    lines.append('## 数据概览')",
-      "    lines.append('上一轮 SQL 工具结果未识别到整体风险分类分布所需字段组合，无法直接生成笔数与金额分布。请确认 SQL 至少返回风险分类字段以及 loan_balance_10k 或 contract_amount_10k。')",
-      "    lines.append('')",
-      "    lines.append('| 字段 | 非空样本数 | 去重值数量 |')",
-      "    lines.append('|---|---:|---:|')",
-      "    keys = list(rows[0].keys()) if rows else []",
-      "    for key in keys:",
-      "        values = [row.get(key) for row in rows if row.get(key) not in (None, '')]",
-      "        lines.append(f'| {key} | {len(values)} | {len(set(map(str, values)))} |')",
-      "",
-      "print('\\n'.join(lines))",
-    ].join("\n");
+    return buildGenericSqlResultAnalysisPythonScript(prompt, rows);
   }
 
   private insertToolCall(input: {
@@ -2233,6 +2087,7 @@ export class AssistantRuntime {
     approvalMode: AssistantApprovalMode;
     status: AssistantToolStatus;
     errorMessage?: string;
+    metadata?: AssistantToolCallMetadata;
   }): AssistantToolCall {
     const createdAt = nowIso();
     const toolCall: AssistantToolCall = {
@@ -2247,13 +2102,14 @@ export class AssistantRuntime {
       errorMessage: input.errorMessage,
       createdAt,
       updatedAt: createdAt,
+      metadata: input.metadata,
     };
     const integrityHash = this.hashRecord("tool_call", toolCall);
     this.db
       .prepare(
         `insert into tool_calls
-          (id, conversation_id, message_id, user_id, kind, status, script, result_json, error_message, approval_mode, created_at, updated_at, integrity_hash)
-         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          (id, conversation_id, message_id, user_id, kind, status, script, result_json, error_message, approval_mode, created_at, updated_at, metadata_json, integrity_hash)
+         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         toolCall.id,
@@ -2268,6 +2124,7 @@ export class AssistantRuntime {
         toolCall.approvalMode,
         toolCall.createdAt,
         toolCall.updatedAt,
+        toolCall.metadata ? JSON.stringify(toolCall.metadata) : null,
         integrityHash,
       );
     return toolCall;
@@ -2452,6 +2309,13 @@ export class AssistantRuntime {
     };
   }
 
+  private toolCallMetadataForInput(input: AssistantSendInput): AssistantToolCallMetadata {
+    return {
+      selectedTempDataSourceIds: input.selectedTempDataSourceIds ?? [],
+      selectedFieldRefs: input.selectedFieldRefs ?? [],
+    };
+  }
+
   private async handleToolCall(input: AssistantSendInput, conversation: AssistantConversation, message: AssistantMessage, tool: ToolDetection, options: { appendToMessage?: boolean } = {}) {
     const normalizedTool: ToolDetection =
       tool.kind === "python"
@@ -2463,9 +2327,11 @@ export class AssistantRuntime {
               prompt: input.prompt,
               script: tool.script,
               selectedTempDataSourceIds: input.selectedTempDataSourceIds,
+              selectedFieldRefs: input.selectedFieldRefs,
             }),
-          }
+        }
         : tool;
+    const toolMetadata = this.toolCallMetadataForInput(input);
 
     if (normalizedTool.kind === "sql" && !isReadonlySql(normalizedTool.script)) {
       const toolCall = this.insertToolCall({
@@ -2477,6 +2343,7 @@ export class AssistantRuntime {
         approvalMode: input.approvalMode,
         status: "blocked",
         errorMessage: "SQL 安全校验未通过。",
+        metadata: toolMetadata,
       });
       this.appendToolLog(toolCall, "safety-check", "error", "SQL 安全校验未通过。", { script: normalizedTool.script });
       const toolBlock = this.toolBlock(toolCall, "SQL 安全校验未通过：仅允许单条只读 SELECT / WITH / PRAGMA 查询。");
@@ -2492,6 +2359,45 @@ export class AssistantRuntime {
       return;
     }
 
+    if (normalizedTool.kind === "sql") {
+      try {
+        this.tempSourceManager.assertSqlCanAccessTempTables({
+          sql: normalizedTool.script,
+          conversationId: conversation.id,
+          userId: input.userId,
+          selectedFieldRefs: toolMetadata.selectedFieldRefs,
+        });
+      } catch (error) {
+        const messageText = error instanceof Error ? error.message : "SQL 字段范围校验未通过。";
+        const toolCall = this.insertToolCall({
+          conversationId: conversation.id,
+          messageId: message.id,
+          userId: input.userId,
+          kind: normalizedTool.kind,
+          script: normalizedTool.script,
+          approvalMode: input.approvalMode,
+          status: "blocked",
+          errorMessage: messageText,
+          metadata: toolMetadata,
+        });
+        this.appendToolLog(toolCall, "field-scope-check", "error", messageText, {
+          selectedFieldCount: toolMetadata.selectedFieldRefs?.length ?? 0,
+          script: normalizedTool.script,
+        });
+        const toolBlock = this.toolBlock(toolCall, `SQL 字段范围校验未通过：${messageText}`);
+        const current = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(message.id));
+        const keepContent = options.appendToMessage && current.content.trim();
+        const updated = this.updateMessage(message.id, {
+          status: "error",
+          content: keepContent ? current.content : messageText,
+          blocks: options.appendToMessage ? replaceToolBlock(current.blocks, toolBlock) : [toolBlock],
+          errorMessage: messageText,
+        });
+        this.options.emit({ type: "tool", conversationId: conversation.id, toolCall, message: updated });
+        return;
+      }
+    }
+
     if (input.approvalMode === "no_access") {
       const toolCall = this.insertToolCall({
         conversationId: conversation.id,
@@ -2502,6 +2408,7 @@ export class AssistantRuntime {
         approvalMode: input.approvalMode,
         status: "blocked",
         errorMessage: "当前审批权限禁止执行脚本工具。",
+        metadata: toolMetadata,
       });
       this.appendToolLog(toolCall, "permission-check", "error", "审批权限禁止执行脚本工具。", { approvalMode: input.approvalMode });
       const toolBlock = this.toolBlock(toolCall, "当前审批权限为“禁止访问权限”，工具调用已被拦截。");
@@ -2526,6 +2433,7 @@ export class AssistantRuntime {
       script: normalizedTool.script,
       approvalMode: input.approvalMode,
       status,
+      metadata: toolMetadata,
     });
 
     if (input.approvalMode === "request_approval") {
@@ -2562,6 +2470,8 @@ export class AssistantRuntime {
             conversationId: toolCall.conversationId,
             prompt: this.sourcePromptForToolCall(toolCall),
             script: toolCall.script,
+            selectedTempDataSourceIds: toolCall.metadata?.selectedTempDataSourceIds,
+            selectedFieldRefs: toolCall.metadata?.selectedFieldRefs,
           })
         : toolCall.script;
     const executableToolCall = normalizedScript === toolCall.script ? toolCall : this.updateToolCallScript(toolCall.id, normalizedScript);
@@ -3538,6 +3448,8 @@ export class AssistantRuntime {
         metadata: {
           assistantToolKind: toolCall.kind,
           approvalMode: toolCall.approvalMode,
+          resultPreview: truncateText(input.result, 20_000),
+          resultPreviewFormat: isJsonContent(input.result) ? "json" : "text",
         },
       },
       parentToolCallIds: parent ? [parent.toolCallId] : [],
@@ -4070,6 +3982,7 @@ export class AssistantRuntime {
       sql: script,
       conversationId: toolCall.conversationId,
       userId: toolCall.userId,
+      selectedFieldRefs: toolCall.metadata?.selectedFieldRefs,
     });
     const views = this.prepareCsvSqlViews(toolCall);
     let executableScript = normalizeCsvSchemaQualifiedSql(script);
@@ -4584,6 +4497,7 @@ export class AssistantRuntime {
           "仅在本地脚本调试场景才输出 /sql 或 /python 代码块，客户端会按审批权限处理。",
           `当前数据源：${dataSourceLabel || "未选择"}`,
           `当前 Skill：${skill || "未选择"}`,
+          !skill ? "当前未选择 Skill。必须严格按用户自然语言请求生成内容；不得自行添加用户未要求的报告章节、模板栏目、核心风险指标、数据质量说明或口径说明。若用户只要求查询或分析，只输出与该请求直接相关的结果和必要解释。" : undefined,
           selectedSkillSystemPrompt(skill),
           `审批权限：${approvalMode}`,
           schemaContextMarkdown ? `\n以下是已授权数据源 Schema Context。请遵守其中 Usage Policy、安全约束和工具调用要求，不要基于样例行推断全量结论。\n${schemaContextMarkdown}` : undefined,
