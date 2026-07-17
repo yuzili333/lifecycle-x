@@ -144,6 +144,36 @@ export function createChatFieldToken(field: ConversationCsvField, range: { start
   };
 }
 
+export function findCsvFieldTokenMatchesInText(text: string, fields: ConversationCsvField[]) {
+  const candidates = fields
+    .flatMap((field) => {
+      const labels = Array.from(new Set([field.displayName, field.sourceHeader, field.physicalName].filter(Boolean)));
+      return labels.map((label) => ({ field, rawText: `#${label}` }));
+    })
+    .sort((left, right) => right.rawText.length - left.rawText.length);
+  const matches: Array<{ field: ConversationCsvField; rawText: string; start: number; end: number }> = [];
+  let cursor = 0;
+  while (cursor < text.length) {
+    if (text[cursor] !== "#") {
+      cursor += 1;
+      continue;
+    }
+    const match = candidates.find((candidate) => text.startsWith(candidate.rawText, cursor));
+    if (!match) {
+      cursor += 1;
+      continue;
+    }
+    matches.push({
+      field: match.field,
+      rawText: match.rawText,
+      start: cursor,
+      end: cursor + match.rawText.length,
+    });
+    cursor += match.rawText.length;
+  }
+  return matches;
+}
+
 export function insertFieldTokenText(value: string, mention: ChatFieldMention, token: ChatCsvSelectedFieldRef) {
   const before = value.slice(0, mention.start);
   const after = value.slice(mention.end);

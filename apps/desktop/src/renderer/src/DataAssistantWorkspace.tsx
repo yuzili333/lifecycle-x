@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type CSSProperties, type FocusEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type ClipboardEvent, type CSSProperties, type FocusEvent, type KeyboardEvent } from "react";
 import { Avatar } from "@astryxdesign/core/Avatar";
 import { Badge } from "@astryxdesign/core/Badge";
 import { Button } from "@astryxdesign/core/Button";
@@ -43,6 +43,7 @@ import {
   chatFieldMentionKey,
   createChatFieldToken,
   fieldsFromChatCsvAttachment,
+  findCsvFieldTokenMatchesInText,
   findChatFieldMention,
   insertFieldTokenText,
   selectConversationCsvFields,
@@ -62,6 +63,7 @@ import {
   type ChatToolSelectorItem,
 } from "./chat-tool-selector";
 import { VisualizationRenderer } from "./components/VisualizationRenderer";
+import { AgentGuidanceCard } from "./components/agent-guidance";
 import { ReportMarkdownViewer, toolKindLabel, toolStatusLabel } from "./components/tool-calls";
 import { StreamingReportSegment } from "./components/streaming-content";
 import {
@@ -88,6 +90,7 @@ import type {
   AssistantStreamEvent,
 } from "../../main/assistantRuntime";
 import type { ChatCsvAttachment, ChatCsvSelectedFieldRef } from "../../main/chatCsvTempSource";
+import type { AgentGuidance, AgentGuidanceAction } from "../../main/agentGuidance";
 import type { ArtifactRecord, ConversationToolState, ToolCallRecord } from "../../main/toolOrchestration";
 import type { WorkflowContextSummary } from "../../main/workflowRuntime";
 
@@ -354,6 +357,91 @@ function selectSerializedComposerRange(root: HTMLElement, start: number, end: nu
   return true;
 }
 
+function serializedComposerOffset(root: HTMLElement, targetNode: Node, targetOffset: number) {
+  let offset = 0;
+  let found = false;
+  const visit = (node: Node) => {
+    if (found) {
+      return;
+    }
+    if (node === targetNode) {
+      if (node.nodeType === Node.TEXT_NODE) {
+        offset += Math.max(0, Math.min(targetOffset, node.textContent?.length ?? 0));
+      } else {
+        const children = Array.from(node.childNodes).slice(0, targetOffset);
+        for (const child of children) {
+          if (child.nodeType === Node.TEXT_NODE) {
+            offset += child.textContent?.length ?? 0;
+          } else if (child instanceof HTMLBRElement) {
+            offset += 1;
+          } else if (child instanceof HTMLElement && child.hasAttribute("data-astryx-token")) {
+            offset += serializedTokenLength(child);
+          } else {
+            offset += child.textContent?.length ?? 0;
+          }
+        }
+      }
+      found = true;
+      return;
+    }
+    if (node.nodeType === Node.TEXT_NODE) {
+      offset += node.textContent?.length ?? 0;
+      return;
+    }
+    if (node instanceof HTMLBRElement) {
+      offset += 1;
+      return;
+    }
+    if (node instanceof HTMLElement && node.hasAttribute("data-astryx-token")) {
+      offset += serializedTokenLength(node);
+      return;
+    }
+    for (const child of Array.from(node.childNodes)) {
+      visit(child);
+      if (found) {
+        return;
+      }
+    }
+  };
+  visit(root);
+  return found ? offset : null;
+}
+
+function serializedComposerSelectionStart(root: HTMLElement) {
+  const selection = window.getSelection();
+  if (!selection || selection.rangeCount === 0) {
+    return null;
+  }
+  const range = selection.getRangeAt(0);
+  if (!root.contains(range.startContainer)) {
+    return null;
+  }
+  return serializedComposerOffset(root, range.startContainer, range.startOffset);
+}
+
+function fieldTokenRangesForContent(content: string, fieldRefs: ChatCsvSelectedFieldRef[]) {
+  const ranges: Array<{ field: ChatCsvSelectedFieldRef; start: number; end: number }> = [];
+  let cursor = 0;
+  const orderedFields = [...fieldRefs].sort((left, right) => {
+    const leftStart = Number.isFinite(left.start) ? left.start : Number.MAX_SAFE_INTEGER;
+    const rightStart = Number.isFinite(right.start) ? right.start : Number.MAX_SAFE_INTEGER;
+    return leftStart - rightStart;
+  });
+  for (const field of orderedFields) {
+    if (field.status !== "valid" || !field.rawText) {
+      continue;
+    }
+    const storedStart = Number.isFinite(field.start) && content.slice(field.start, field.end) === field.rawText ? field.start : -1;
+    const start = storedStart >= cursor ? storedStart : content.indexOf(field.rawText, cursor);
+    if (start < 0) {
+      continue;
+    }
+    ranges.push({ field, start, end: start + field.rawText.length });
+    cursor = start + field.rawText.length;
+  }
+  return ranges;
+}
+
 function toolDataSourceKind(dataSource: DataSourceSummary): ChatToolDataSourceKind {
   return dataSource.type === "csv" ? "csv" : "database";
 }
@@ -500,11 +588,18 @@ function MetadataIconButton({
 
 function MetadataStatusIcon({ status, isThinking }: { status: AssistantMessageStatus; isThinking: boolean }) {
   const label = statusLabel(status);
-  const icon = isThinking || status === "sending" ? LoaderCircle : status === "awaiting_approval" ? Clock : CircleAlert;
+  const isWaiting =
+    status === "awaiting_approval" ||
+    status === "waiting_for_user_input" ||
+    status === "waiting_for_parameters" ||
+    status === "waiting_for_field_selection" ||
+    status === "waiting_for_data_source" ||
+    status === "paused";
+  const icon = isThinking || status === "sending" ? LoaderCircle : isWaiting ? Clock : CircleAlert;
 
   return (
     <Tooltip content={label} placement="above">
-      <span className={`assistant-message-status ${status === "error" ? "failed" : ""}`} aria-label={label} title={label}>
+      <span className={`assistant-message-status ${status === "error" || status === "recoverable_error" ? "failed" : ""}`} aria-label={label} title={label}>
         <Icon icon={icon} size="xsm" color="inherit" className={isThinking || status === "sending" ? "assistant-message-status-spinner" : undefined} />
       </span>
     </Tooltip>
@@ -542,8 +637,20 @@ function statusLabel(status: AssistantMessageStatus) {
       return "思考中";
     case "processing":
       return "思考中";
+    case "waiting_for_user_input":
+      return "等待补充";
+    case "waiting_for_parameters":
+      return "等待参数修复";
+    case "waiting_for_field_selection":
+      return "等待选择字段";
+    case "waiting_for_data_source":
+      return "等待选择数据源";
     case "awaiting_approval":
       return "等待审批";
+    case "paused":
+      return "已暂停";
+    case "recoverable_error":
+      return "可恢复异常";
     case "completed":
       return "已完成";
     case "stopped":
@@ -553,6 +660,37 @@ function statusLabel(status: AssistantMessageStatus) {
     default:
       return "草稿";
   }
+}
+
+function guidanceActionPrompt(action: AgentGuidanceAction) {
+  if (action.type === "select_data_source") {
+    return "我已选择数据源，请继续。";
+  }
+  if (action.type === "select_fields") {
+    return "#";
+  }
+  if (action.type === "return_to_query") {
+    return "请返回查询步骤，并根据当前问题修复查询条件。";
+  }
+  if (action.type === "continue_analysis") {
+    return "请基于当前查询结果继续执行统计分析。";
+  }
+  if (action.type === "create_chart") {
+    return "请基于当前结果绘制图表。";
+  }
+  if (action.type === "generate_report") {
+    return "请基于当前结果生成 Markdown 报告。";
+  }
+  if (action.type === "retry") {
+    return "请重试上一步，并保留已经成功的结果。";
+  }
+  if (action.type === "edit_parameters") {
+    return "我需要修改参数：";
+  }
+  if (action.type === "cancel_workflow") {
+    return "取消";
+  }
+  return action.label;
 }
 
 function createOptimisticUserMessage(
@@ -674,14 +812,6 @@ function reportRecordsForState(toolState?: ConversationToolState | null) {
     .sort((a, b) => b.version - a.version || Date.parse(b.createdAt) - Date.parse(a.createdAt));
 }
 
-function addArtifactLikeIds(sources: Set<string>, values?: string[]) {
-  values?.forEach((value) => {
-    if (/^(workflow-dataset|dataset|assistant-sql-result)[:_-]/i.test(value)) {
-      sources.add(value);
-    }
-  });
-}
-
 function artifactChartCount(message: AssistantMessage, toolState?: ConversationToolState | null) {
   const chartIds = new Set<string>();
   message.blocks.forEach((block) => {
@@ -703,9 +833,8 @@ function artifactChartCount(message: AssistantMessage, toolState?: ConversationT
   return chartIds.size;
 }
 
-function artifactDataSourceMeta(message: AssistantMessage, toolState?: ConversationToolState | null) {
+export function artifactDataSourceMeta(message: AssistantMessage, toolState?: ConversationToolState | null) {
   const sources = new Map<string, string>();
-  const fallbackSources = new Set<string>();
   const addSource = (key?: string, label?: string) => {
     const normalizedKey = key?.trim() || label?.trim();
     if (!normalizedKey) {
@@ -713,28 +842,15 @@ function artifactDataSourceMeta(message: AssistantMessage, toolState?: Conversat
     }
     sources.set(normalizedKey, label?.trim() || normalizedKey);
   };
-  for (const block of message.blocks) {
-    if (block.toolTarget) {
-      addSource(block.toolTarget);
-    }
-    block.toolFiles?.forEach((file) => addSource(file));
-    const artifactMatch = block.content.match(/\b(?:artifact|dataset|workflow-dataset)[:_-][\w-]+/gi);
-    artifactMatch?.forEach((artifactId) => fallbackSources.add(artifactId));
-  }
   for (const record of toolRecordsForMessage(message, toolState)) {
     if (record.toolKind === "sql_query") {
       const dataSourceId = typeof record.request.dataSourceId === "string" ? record.request.dataSourceId : undefined;
       const dataSourceLabel = typeof record.request.dataSourceLabel === "string" ? record.request.dataSourceLabel : undefined;
-      addSource(dataSourceId ?? dataSourceLabel ?? record.toolCallId, dataSourceLabel ?? dataSourceId ?? record.toolCallId);
+      addSource(dataSourceId ?? dataSourceLabel, dataSourceLabel ?? dataSourceId);
     }
-    addArtifactLikeIds(fallbackSources, record.sourceArtifactIds);
-    addArtifactLikeIds(fallbackSources, record.outputArtifactIds ?? record.result?.artifactIds);
   }
   if (sources.size === 0 && message.context?.dataSourceLabel) {
     addSource(message.context.dataSourceLabel);
-  }
-  if (sources.size === 0) {
-    fallbackSources.forEach((source) => addSource(source));
   }
   const labels = Array.from(sources.values());
   return { count: labels.length, labels };
@@ -1195,6 +1311,13 @@ export function DataAssistantWorkspace({
   const readyChatCsvAttachments = activeChatCsvAttachments.filter((attachment) => attachment.status === "ready" && attachment.tempDataSourceId);
   const activeTempDataSourceIds = readyChatCsvAttachments.map((attachment) => attachment.tempDataSourceId as string);
   const selectedTempDataSourceIds = activeTempDataSourceIds.filter((tempDataSourceId) => !disabledTempDataSourceIds.includes(tempDataSourceId));
+  const lastUserMessage = useMemo(
+    () =>
+      [...activeMessages]
+        .reverse()
+        .find((message) => message.role === "user" && message.status === "completed" && message.content.trim().length > 0) ?? null,
+    [activeMessages],
+  );
 
   const connectedDataSources = useMemo(
     () => dataSources.filter((dataSource) => dataSource.status === "online"),
@@ -1209,8 +1332,8 @@ export function DataAssistantWorkspace({
   const messageTempDataSourceLabels = selectedDataSource
     ? []
     : readyChatCsvAttachments
-        .filter((attachment) => attachment.tempDataSourceId && selectedTempDataSourceIds.includes(attachment.tempDataSourceId))
-        .map((attachment) => attachment.fileName);
+      .filter((attachment) => attachment.tempDataSourceId && selectedTempDataSourceIds.includes(attachment.tempDataSourceId))
+      .map((attachment) => attachment.fileName);
   const activeFieldCsvAttachment = useMemo(
     () => readyChatCsvAttachments.find((attachment) => attachment.tempDataSourceId && selectedTempDataSourceIds.includes(attachment.tempDataSourceId)),
     [readyChatCsvAttachments, selectedTempDataSourceIds],
@@ -1833,6 +1956,110 @@ export function DataAssistantWorkspace({
     setFieldMention(null);
   }, []);
 
+  const renderFieldTokensInComposer = useCallback((content: string, fieldRefs: ChatCsvSelectedFieldRef[]) => {
+    const editable = composerShellRef.current?.querySelector<HTMLElement>('[contenteditable="true"]');
+    const ranges = fieldTokenRangesForContent(content, fieldRefs);
+    if (!editable || ranges.length === 0) {
+      return;
+    }
+    editable.focus();
+    for (const { field, start, end } of [...ranges].sort((left, right) => right.start - left.start)) {
+      if (!selectSerializedComposerRange(editable, start, end)) {
+        continue;
+      }
+      composerInputRef.current?.insertToken({
+        value: field.rawText,
+        label: field.rawText,
+        variant: "teal",
+      });
+    }
+    setComposerValue(composerInputRef.current?.getValue() ?? content);
+  }, []);
+
+  const recallLastUserMessage = useCallback(() => {
+    if (!lastUserMessage) {
+      return false;
+    }
+    const fieldRefs = lastUserMessage.context?.selectedFieldRefs?.filter((field) => field.status === "valid") ?? [];
+    setComposerValue(lastUserMessage.content);
+    setSelectedFieldRefs(fieldRefs);
+    setFieldSelectorOpen(false);
+    setFieldMention(null);
+    window.setTimeout(() => {
+      window.requestAnimationFrame(() => renderFieldTokensInComposer(lastUserMessage.content, fieldRefs));
+    }, 0);
+    return true;
+  }, [lastUserMessage, renderFieldTokensInComposer]);
+
+  const handleComposerPaste = useCallback(
+    (_event: ClipboardEvent<HTMLDivElement>, text: string) => {
+      const matches = findCsvFieldTokenMatchesInText(text, activeCsvFields);
+      if (matches.length === 0) {
+        return false;
+      }
+      const editable = composerShellRef.current?.querySelector<HTMLElement>('[contenteditable="true"]');
+      const currentValue = composerInputRef.current?.getValue() ?? composerValue;
+      const selectionStart = editable ? serializedComposerSelectionStart(editable) ?? currentValue.length : currentValue.length;
+      let sourceCursor = 0;
+      let outputCursor = selectionStart;
+      const insertedTokens: ChatCsvSelectedFieldRef[] = [];
+      editable?.focus();
+      for (const match of matches) {
+        const plainSegment = text.slice(sourceCursor, match.start);
+        if (plainSegment) {
+          composerInputRef.current?.insertText(plainSegment);
+          outputCursor += plainSegment.length;
+        }
+        const token = createChatFieldToken(match.field, {
+          start: outputCursor,
+          end: outputCursor + match.rawText.length,
+        });
+        composerInputRef.current?.insertToken({
+          value: token.rawText,
+          label: token.rawText,
+          variant: "teal",
+        });
+        insertedTokens.push(token);
+        outputCursor += token.rawText.length;
+        sourceCursor = match.end;
+      }
+      const tail = text.slice(sourceCursor);
+      if (tail) {
+        composerInputRef.current?.insertText(tail);
+      }
+      setSelectedFieldRefs((current) => insertedTokens.reduce((next, token) => upsertFieldToken(next, token), current));
+      setRecentFieldIds((current) => {
+        const pastedIds = insertedTokens.map((token) => token.fieldId);
+        return [...pastedIds, ...current.filter((fieldId) => !pastedIds.includes(fieldId))].slice(0, 20);
+      });
+      window.setTimeout(() => setComposerValue(composerInputRef.current?.getValue() ?? currentValue), 0);
+      return true;
+    },
+    [activeCsvFields, composerValue],
+  );
+
+  const handleComposerKeyDownCapture = useCallback(
+    (event: KeyboardEvent<HTMLDivElement>) => {
+      if (event.key !== "ArrowUp" || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey || isComposerComposing) {
+        return;
+      }
+      const target = event.target;
+      if (!(target instanceof HTMLElement) || target.closest('[contenteditable="true"]') === null) {
+        return;
+      }
+      const currentValue = composerInputRef.current?.getValue() ?? composerValue;
+      if (currentValue.trim().length > 0) {
+        return;
+      }
+      if (!recallLastUserMessage()) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+    },
+    [composerValue, isComposerComposing, recallLastUserMessage],
+  );
+
   const clearActiveToolMention = useCallback(() => {
     setComposerValue((current) => removeChatToolMention(current, toolMention));
   }, [toolMention]);
@@ -2134,8 +2361,13 @@ export function DataAssistantWorkspace({
   );
 
   const editUserMessage = useCallback((message: AssistantMessage) => {
+    const fieldRefs = message.context?.selectedFieldRefs?.filter((field) => field.status === "valid") ?? [];
     setComposerValue(message.content);
-  }, []);
+    setSelectedFieldRefs(fieldRefs);
+    window.setTimeout(() => {
+      window.requestAnimationFrame(() => renderFieldTokensInComposer(message.content, fieldRefs));
+    }, 0);
+  }, [renderFieldTokensInComposer]);
 
   const openArtifact = useCallback((message: AssistantMessage, explicitArtifactId?: string) => {
     setArtifactWindow({
@@ -2297,7 +2529,7 @@ export function DataAssistantWorkspace({
 
   const retryAssistantMessage = useCallback(
     async (message: AssistantMessage) => {
-      if (!user?.id || !window.lifecycleX?.assistant || message.role !== "assistant" || message.status !== "error") {
+      if (!user?.id || !window.lifecycleX?.assistant || message.role !== "assistant" || (message.status !== "error" && message.status !== "recoverable_error")) {
         return;
       }
 
@@ -2335,8 +2567,15 @@ export function DataAssistantWorkspace({
   const renderMessageMetadata = useCallback(
     (message: AssistantMessage) => {
       const isThinking = message.role === "assistant" && (message.status === "receiving" || message.status === "processing");
-      const showFailed = message.status === "error";
-      const showStatus = isThinking || showFailed || message.status === "sending" || message.status === "awaiting_approval" || message.status === "stopped";
+      const showFailed = message.status === "error" || message.status === "recoverable_error";
+      const showWaiting =
+        message.status === "awaiting_approval" ||
+        message.status === "waiting_for_user_input" ||
+        message.status === "waiting_for_parameters" ||
+        message.status === "waiting_for_field_selection" ||
+        message.status === "waiting_for_data_source" ||
+        message.status === "paused";
+      const showStatus = isThinking || showFailed || message.status === "sending" || showWaiting || message.status === "stopped";
       const showCopy = !(message.role === "assistant" && isThinking);
       const duration = formatMessageDuration(message, metadataNow);
 
@@ -2360,7 +2599,7 @@ export function DataAssistantWorkspace({
                 {message.role === "user" && (
                   <MetadataIconButton label="编辑" icon={Pencil} onClick={() => editUserMessage(message)} />
                 )}
-                {message.role === "assistant" && message.status === "error" && (
+                {message.role === "assistant" && (message.status === "error" || message.status === "recoverable_error") && (
                   <MetadataIconButton label="失败重发" icon={RotateCcw} onClick={() => void retryAssistantMessage(message)} />
                 )}
               </div>
@@ -2865,8 +3104,8 @@ export function DataAssistantWorkspace({
       Boolean(artifactId);
     const markdownBlockCandidates = isReportTransitionActive
       ? message.blocks
-          .map((block, index) => ({ block, index }))
-          .filter(({ block }) => block.type === "markdown" && !isRenderableCodeLanguage(block.language))
+        .map((block, index) => ({ block, index }))
+        .filter(({ block }) => block.type === "markdown" && !isRenderableCodeLanguage(block.language))
       : [];
     const reportContentIndex = reportMarkdownContentIndex(markdownBlockCandidates.map(({ block }) => block.content), reportTitle);
     const reportBlockIndex = reportContentIndex >= 0 ? markdownBlockCandidates[reportContentIndex]?.index ?? -1 : -1;
@@ -2878,27 +3117,51 @@ export function DataAssistantWorkspace({
             ? renderReportReplacementBlock(message, block, message.status, segmentId)
             : transition?.status === "card_ready" && segmentId && index === reportBlockIndex
               ? renderReportBufferBlock(block, message.role, message.status, segmentId)
-            : renderBlock(block, message.role, message.status),
+              : renderBlock(block, message.role, message.status),
         )}
         {shouldShowReportCard && segmentId && reportBlockIndex < 0
           ? renderReportReplacementBlock(
-              message,
-              {
-                id: `report-card-${segmentId}`,
-                type: "markdown",
-                content: "",
-              },
-              message.status,
-              segmentId,
-            )
+            message,
+            {
+              id: `report-card-${segmentId}`,
+              type: "markdown",
+              content: "",
+            },
+            message.status,
+            segmentId,
+          )
           : null}
       </div>
     );
   };
 
+  const applyGuidanceAction = (action: AgentGuidanceAction) => {
+    const nextPrompt = guidanceActionPrompt(action);
+    setComposerValue(nextPrompt);
+    window.requestAnimationFrame(() => {
+      composerShellRef.current?.querySelector<HTMLElement>('[contenteditable="true"]')?.focus();
+    });
+  };
+
+  const renderGuidanceBlock = (block: AssistantBlock, guidance: AgentGuidance) => (
+    <AgentGuidanceCard
+      key={block.id}
+      guidance={guidance}
+      onAction={applyGuidanceAction}
+      onCandidateSelect={(candidate) => {
+        setComposerValue(candidate.label);
+        window.requestAnimationFrame(() => composerShellRef.current?.querySelector<HTMLElement>('[contenteditable="true"]')?.focus());
+      }}
+    />
+  );
+
   const renderBlock = (block: AssistantBlock, role: AssistantMessage["role"], status: AssistantMessageStatus) => {
     if (role === "assistant" && shouldHideInlineToolResult(block)) {
       return null;
+    }
+
+    if (role === "assistant" && block.guidance) {
+      return renderGuidanceBlock(block, block.guidance);
     }
 
     if (role === "assistant" && block.type === "markdown") {
@@ -3073,6 +3336,7 @@ export function DataAssistantWorkspace({
                 className="assistant-composer-shell"
                 onBlurCapture={handleComposerBlurCapture}
                 onFocusCapture={handleComposerFocusCapture}
+                onKeyDownCapture={handleComposerKeyDownCapture}
               >
                 <input
                   ref={chatCsvInputRef}
@@ -3102,6 +3366,7 @@ export function DataAssistantWorkspace({
                         {fieldSelectorOpen && (
                           <div
                             className="assistant-field-selector-panel"
+                            data-xds="dropdown-menu"
                             role="region"
                             aria-label="选择 CSV 字段"
                             onMouseDown={(event) => event.preventDefault()}
@@ -3111,9 +3376,9 @@ export function DataAssistantWorkspace({
                               {activeFieldCsvAttachment?.fileName && <span>{activeFieldCsvAttachment.fileName}</span>}
                             </div>
                             {activeCsvFields.length === 0 ? (
-                              <div className="assistant-tool-selector-empty">当前 CSV 文件没有可用字段</div>
+                              <div className="assistant-field-selector-empty">当前 CSV 文件没有可用字段</div>
                             ) : filteredCsvFields.length === 0 ? (
-                              <div className="assistant-tool-selector-empty">未找到匹配字段</div>
+                              <div className="assistant-field-selector-empty">未找到匹配字段</div>
                             ) : (
                               <div className="assistant-field-selector-results" role="listbox" aria-label="CSV 字段列表">
                                 {filteredCsvFields.map((field) => (
@@ -3121,12 +3386,13 @@ export function DataAssistantWorkspace({
                                     type="button"
                                     key={field.fieldId}
                                     className="assistant-field-selector-item"
+                                    data-xds="dropdown-menu-item"
                                     role="option"
                                     aria-selected={selectedFieldIds.has(field.fieldId)}
                                     onClick={() => selectCsvField(field)}
                                   >
-                                    <span className="assistant-tool-selector-item-label">
-                                      <span className="assistant-tool-selector-item-title">
+                                    <span className="assistant-field-selector-item-label">
+                                      <span className="assistant-field-selector-item-title">
                                         {selectedFieldIds.has(field.fieldId) ? "✓ " : ""}
                                         {field.displayName}
                                       </span>
@@ -3141,7 +3407,7 @@ export function DataAssistantWorkspace({
                         {activeChatCsvAttachments.length > 0 && (
                           <ChatComposerDrawer
                             count={activeChatCsvAttachments.length}
-                            label="Files"
+                            label="文件列表"
                             defaultIsCollapsed
                             className="assistant-composer-file-drawer"
                             aria-label="已上传文件"
@@ -3177,7 +3443,10 @@ export function DataAssistantWorkspace({
                     <ChatComposerInput
                       handleRef={composerInputRef}
                       debounceMs={0}
+                      hasHistory={false}
                       maxRows={8}
+                      onPaste={handleComposerPaste}
+                      pasteAsToken={false}
                       onCompositionStart={() => setIsComposerComposing(true)}
                       onCompositionEnd={() => setIsComposerComposing(false)}
                     />

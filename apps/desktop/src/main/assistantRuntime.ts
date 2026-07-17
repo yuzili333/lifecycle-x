@@ -43,6 +43,16 @@ import {
   type ConversationTempCsvTable,
   type ImportConversationCsvInput,
 } from "./chatCsvTempSource";
+import {
+  createAgentGuidanceModule,
+  DEFAULT_DATA_ACCURACY_POLICY,
+  buildCompletedToolCheckpoint,
+  isWorkflowCancellationPrompt,
+  renderGuidanceMarkdown,
+  SQLiteWorkflowCheckpointStore,
+  type AgentGuidance,
+  type InvalidToolParameter,
+} from "./agentGuidance";
 
 const require = createRequire(import.meta.url);
 const Database = require("better-sqlite3");
@@ -57,8 +67,14 @@ export type AssistantMessageStatus =
   | "sent"
   | "receiving"
   | "processing"
+  | "waiting_for_user_input"
+  | "waiting_for_parameters"
+  | "waiting_for_field_selection"
+  | "waiting_for_data_source"
+  | "recoverable_error"
   | "completed"
   | "awaiting_approval"
+  | "paused"
   | "stopped"
   | "error";
 
@@ -77,6 +93,7 @@ export type AssistantBlock = {
   visualizationSpec?: VisualizationSpec;
   visualizationStatus?: "streaming" | "ready" | "error";
   visualizationError?: VisualizationRenderError;
+  guidance?: AgentGuidance;
 };
 
 export type AssistantMessageContext = {
@@ -345,6 +362,10 @@ function quoteIdentifier(value: string) {
   return `"${value.replaceAll('"', '""')}"`;
 }
 
+function quoteSqlLiteral(value: string) {
+  return `'${value.replaceAll("'", "''")}'`;
+}
+
 function normalizeSqliteAlias(value: string) {
   return value.trim().replace(/^["'`\[]|["'`\]]$/g, "");
 }
@@ -424,13 +445,24 @@ function replaceToolBlock(blocks: AssistantBlock[], toolBlock: AssistantBlock) {
   return [...blocks.filter((block) => block.toolCallId !== toolBlock.toolCallId), toolBlock];
 }
 
+function replaceToolSuccessSummaryBlock(blocks: AssistantBlock[], toolCallId: string, content: string) {
+  const id = `tool-success-summary-${toolCallId}`;
+  const summaryBlock: AssistantBlock = {
+    id,
+    type: "text",
+    content,
+  };
+  const nextBlocks = blocks.filter((block) => block.id !== id);
+  return [...nextBlocks, summaryBlock];
+}
+
 function hasRenderableNonToolContent(message: AssistantMessage) {
   return message.blocks.some((block) => !block.toolCallId && block.content.trim().length > 0);
 }
 
-function shouldAnalyzePriorSqlResult(prompt: string) {
+export function shouldAnalyzePriorSqlResult(prompt: string) {
   return (
-    /(sql\s*查询结果|查询结果数据|查询结果|上一轮|上一次|工具调用结果|结果数据)/i.test(prompt) &&
+    /(sql\s*查询结果|查询数据结果|查询结果数据|查询结果|上一轮|上一次|工具调用结果|结果数据)/i.test(prompt) &&
     /(统计|占比|对比|排名|前三|top\s*3|报告|分析)/i.test(prompt)
   );
 }
@@ -440,6 +472,94 @@ export function shouldAutoStartPythonReport(prompt: string) {
   const asksForChart = /(柱状图|条形图|折线图|饼图|图表|可视化)/i.test(prompt);
   const asksForAnalysis = /(统计|汇总|计数|总计|数量|占比|比例|分布|排序|倒序|排名|对比|分析)/i.test(prompt);
   return asksForReport || (asksForChart && asksForAnalysis) || (/分析/i.test(prompt) && /(汇总|占比|比例|分布|统计|对比)/i.test(prompt));
+}
+
+function shouldFallbackStartDataToolWorkflow(prompt: string, assistantContent: string) {
+  const asksForDataWork = /(查询|统计|汇总|计数|总计|筛选|分布|占比|比例|分析|报告)/i.test(prompt);
+  const acknowledgedWithoutResult = /(正在|我将|将为|为您|请稍候|稍候|提取|查询|统计).{0,40}(数据|结果|报告|汇总)/i.test(assistantContent.trim());
+  return asksForDataWork && (shouldAutoStartPythonReport(prompt) || acknowledgedWithoutResult);
+}
+
+function normalizedPromptText(value: string) {
+  return value.replace(/\u00a0/g, " ");
+}
+
+function promptSliceAfterField(prompt: string, field: ChatCsvSelectedFieldRef) {
+  const normalized = normalizedPromptText(prompt);
+  if (field.start >= 0 && field.end > field.start && normalized.slice(field.start, field.end) === field.rawText) {
+    return normalized.slice(field.end);
+  }
+  const index = normalized.indexOf(field.rawText);
+  return index >= 0 ? normalized.slice(index + field.rawText.length) : "";
+}
+
+function extractPromptFilterValue(prompt: string, field: ChatCsvSelectedFieldRef) {
+  const afterField = promptSliceAfterField(prompt, field);
+  const quoted = afterField.match(/^[\s:：,，]*[“"']([^”"']{1,80})[”"']/)?.[1]?.trim();
+  const unquoted = afterField.match(/^[\s:：,，]*([^，,。；;\n#]{1,80}?)(?=(?:的数据|数据中|中|下|里|的|不同|各个|各|每个|分类|类别|汇总|统计|分析|报告|占比|比例|$))/i)?.[1]?.trim();
+  const value = quoted || unquoted;
+  if (!value || /^(不同|各个|各|每个|分类|类别|数据|汇总|统计|分析|报告|占比|比例)/i.test(value)) {
+    return null;
+  }
+  return value;
+}
+
+function hasPromptFilterValue(prompt: string, field: ChatCsvSelectedFieldRef) {
+  return Boolean(extractPromptFilterValue(prompt, field));
+}
+
+function likelyMetricColumns(source: ConversationTempCsvTable, selectedFieldNames: Set<string>) {
+  return source.columns
+    .filter((column) => {
+      if (selectedFieldNames.has(column.sqliteColumnName)) {
+        return false;
+      }
+      const text = `${column.displayName}\n${column.sourceHeader}\n${column.sqliteColumnName}`.toLowerCase();
+      return (
+        ["INTEGER", "REAL", "NUMERIC"].includes(column.sqliteType) &&
+        /(金额|余额|贷款|合同|本金|amount|balance|principal)/i.test(text)
+      );
+    })
+    .slice(0, 4);
+}
+
+export function buildFallbackTempCsvSqlForAnalysisRequest(
+  prompt: string,
+  source: ConversationTempCsvTable,
+  selectedFieldRefs: ChatCsvSelectedFieldRef[],
+) {
+  const selectedFields = selectedFieldRefs
+    .filter((field) => field.status === "valid" && field.tempDataSourceId === source.tempDataSourceId)
+    .sort((left, right) => left.start - right.start);
+  if (selectedFields.length === 0 || source.columns.length === 0) {
+    return null;
+  }
+
+  const filters = selectedFields
+    .map((field) => ({ field, value: extractPromptFilterValue(prompt, field) }))
+    .filter((item): item is { field: ChatCsvSelectedFieldRef; value: string } => Boolean(item.value));
+  const groupedFields = selectedFields.filter((field) => !hasPromptFilterValue(prompt, field));
+  const selectedFieldNames = new Set(selectedFields.map((field) => field.physicalName));
+  const metrics = likelyMetricColumns(source, selectedFieldNames);
+  const tableName = quoteIdentifier(source.sqliteTableName);
+  const whereClause = filters.length
+    ? `\nwhere ${filters.map(({ field, value }) => `${quoteIdentifier(field.physicalName)} = ${quoteSqlLiteral(value)}`).join(" and ")}`
+    : "";
+
+  if (groupedFields.length > 0) {
+    const groupSelect = groupedFields.map((field) => `${quoteIdentifier(field.physicalName)} as ${quoteIdentifier(field.displayName)}`);
+    const metricSelect = metrics.map((column) => `sum(${quoteIdentifier(column.sqliteColumnName)}) as ${quoteIdentifier(`${column.displayName}合计`)}`);
+    const groupBy = groupedFields.map((field) => quoteIdentifier(field.physicalName)).join(", ");
+    return [
+      `select ${[...groupSelect, "count(*) as \"笔数\"", ...metricSelect].join(", ")}`,
+      `from ${tableName}${whereClause}`,
+      `group by ${groupBy}`,
+      `order by "笔数" desc`,
+    ].join("\n");
+  }
+
+  const selectColumns = source.columns.map((column) => quoteIdentifier(column.sqliteColumnName)).join(", ");
+  return `select ${selectColumns}\nfrom ${tableName}${whereClause}\nlimit 500`;
 }
 
 function parseSqlToolRows(result: string | undefined) {
@@ -507,27 +627,25 @@ export function buildGenericSqlResultAnalysisPythonScript(prompt: string, rows: 
     "",
     "def choose_dimensions(profiles, requested, total_rows):",
     "    requested_dimensions = [field for field in requested if not profiles[field]['is_numeric']]",
-    "    inferred_dimensions = [",
-    "        item['key'] for item in sorted(profiles.values(), key=lambda p: (p['unique_count'], -p['non_empty'], str(p['key'])))",
-    "        if not item['is_numeric'] and 1 < item['unique_count'] <= max(30, int(total_rows * 0.7))",
-    "    ]",
     "    dimensions = []",
-    "    for field in requested_dimensions + inferred_dimensions:",
+    "    for field in requested_dimensions:",
     "        if field not in dimensions:",
     "            dimensions.append(field)",
-    "    return dimensions[:3]",
+    "    return dimensions[:2]",
     "",
     "def choose_measures(profiles, requested):",
     "    requested_measures = [field for field in requested if profiles[field]['is_numeric']]",
-    "    inferred_measures = [",
-    "        item['key'] for item in sorted(profiles.values(), key=lambda p: (-len(p['numeric_values']), str(p['key'])))",
-    "        if item['is_numeric']",
-    "    ]",
     "    measures = []",
-    "    for field in requested_measures + inferred_measures:",
+    "    for field in requested_measures:",
     "        if field not in measures:",
     "            measures.append(field)",
-    "    return measures[:3]",
+    "    return measures[:2]",
+    "",
+    "def count_label():",
+    "    return '合同总数' if re.search(r'合同', question) else '总计数'",
+    "",
+    "def ratio_label(dimension):",
+    "    return '全部分行占比' if '分行' in str(dimension) else '占比'",
     "",
     "def requested_values():",
     "    quoted = re.findall(r'[“\"「『]([^”\"」』]+)[”\"」』]', question)",
@@ -535,22 +653,24 @@ export function buildGenericSqlResultAnalysisPythonScript(prompt: string, rows: 
     "",
     "def filter_rows_by_requested_values(rows_data, dimensions):",
     "    values = requested_values()",
-    "    if not values or not dimensions:",
+    "    if not values:",
     "        return rows_data",
     "    filtered = []",
+    "    non_dimension_keys = [key for key in (rows_data[0].keys() if rows_data else []) if key not in dimensions and not str(key).startswith('__')]",
     "    for row in rows_data:",
-    "        if any(normalize_text(row.get(field)) in values for field in dimensions):",
+    "        target_keys = non_dimension_keys or [key for key in row.keys() if not str(key).startswith('__')]",
+    "        if any(any(value in normalize_text(row.get(field)) for value in values) for field in target_keys):",
     "            filtered.append(row)",
     "    return filtered or rows_data",
     "",
     "total_rows = len(rows)",
-    "keys = list(rows[0].keys()) if rows else []",
+    "keys = [key for key in (list(rows[0].keys()) if rows else []) if not str(key).startswith('__')]",
     "lines = []",
     "lines.append('# SQL 查询结果分析')",
     "lines.append('')",
     "lines.append(f'- 分析对象：上一轮 SQL 工具调用返回结果')",
-    "lines.append(f'- 返回行数：{total_rows}')",
-    "lines.append('- 说明：以下计算仅基于已返回的 SQL 结果字段，不注入本地 Skill 模板。')",
+    "lines.append(f'- 返回记录数：{total_rows}')",
+    "lines.append('- 说明：以下计算仅基于用户明确指定的字段和筛选条件，不输出未要求的扩展分析。')",
     "lines.append('')",
     "",
     "if not rows:",
@@ -562,66 +682,31 @@ export function buildGenericSqlResultAnalysisPythonScript(prompt: string, rows: 
     "    measures = choose_measures(profiles, requested)",
     "    analysis_rows = filter_rows_by_requested_values(rows, dimensions)",
     "    analysis_total = len(analysis_rows)",
-    "    weight_measure = measures[0] if measures else None",
-    "    weight_total = sum((to_number(row.get(weight_measure)) or 0) for row in analysis_rows) if weight_measure else 0",
+    "    count_name = count_label()",
     "    if requested:",
     "        lines.append('- 已匹配用户指定字段：' + '、'.join(str(field) for field in requested))",
     "    if len(analysis_rows) != len(rows):",
-    "        lines.append(f'- 已按用户描述中的引号取值筛选分析样本：{analysis_total} 行。')",
+    "        lines.append(f'- 已按用户描述中的引号取值筛选分析样本：{analysis_total} 条。')",
     "    lines.append('')",
     "    if dimensions:",
-    "        for dimension in dimensions[:2]:",
+    "        for dimension in dimensions:",
     "            counter = Counter(normalize_text(row.get(dimension)) for row in analysis_rows)",
-    "            weighted = Counter()",
-    "            if weight_measure:",
-    "                for row in analysis_rows:",
-    "                    weighted[normalize_text(row.get(dimension))] += to_number(row.get(weight_measure)) or 0",
-    "            lines.append(f'## 按 {dimension} 分布')",
-    "            if weight_measure:",
-    "                lines.append(f'| {dimension} | 行数 | 行数占比 | {weight_measure}合计 | {weight_measure}占比 |')",
-    "                lines.append('|---|---:|---:|---:|---:|')",
-    "            else:",
-    "                lines.append(f'| {dimension} | 行数 | 占比 |')",
-    "                lines.append('|---|---:|---:|')",
+    "            lines.append(f'## 按 {dimension} 汇总')",
+    "            lines.append(f'| {dimension} | {count_name} | {ratio_label(dimension)} |')",
+    "            lines.append('|---|---:|---:|')",
     "            for value, count in counter.most_common(20):",
-    "                if weight_measure:",
-    "                    measure_sum = weighted[value]",
-    "                    lines.append(f'| {value} | {count} | {pct(count, analysis_total)}% | {round(measure_sum, 4)} | {pct(measure_sum, weight_total)}% |')",
-    "                else:",
-    "                    lines.append(f'| {value} | {count} | {pct(count, analysis_total)}% |')",
-    "            lines.append('')",
-    "    if len(dimensions) >= 2:",
-    "        first, second = dimensions[0], dimensions[1]",
-    "        combo = Counter((normalize_text(row.get(first)), normalize_text(row.get(second))) for row in analysis_rows)",
-    "        parent_totals = Counter()",
-    "        for (first_value, _second_value), count in combo.items():",
-    "            parent_totals[first_value] += count",
-    "        lines.append(f'## {first} 与 {second} 交叉分布')",
-    "        lines.append(f'| {first} | {second} | 行数 | {first}内占比 | 全量占比 |')",
-    "        lines.append('|---|---|---:|---:|---:|')",
-    "        for (first_value, second_value), count in combo.most_common(50):",
-    "            lines.append(f'| {first_value} | {second_value} | {count} | {pct(count, parent_totals[first_value])}% | {pct(count, analysis_total)}% |')",
+    "                lines.append(f'| {value} | {count} | {pct(count, analysis_total)}% |')",
     "        lines.append('')",
-    "    if measures:",
-    "        lines.append('## 数值字段汇总')",
-    "        lines.append('| 字段 | 非空数值数 | 合计 | 平均值 | 最小值 | 最大值 |')",
-    "        lines.append('|---|---:|---:|---:|---:|---:|')",
+    "    elif measures:",
+    "        lines.append('## 指定字段合计')",
+    "        lines.append('| 字段 | 总计数 | 合计 |')",
+    "        lines.append('|---|---:|---:|')",
     "        for measure in measures:",
     "            values = [to_number(row.get(measure)) for row in analysis_rows]",
     "            values = [value for value in values if value is not None]",
-    "            if values:",
-    "                lines.append(f'| {measure} | {len(values)} | {round(sum(values), 4)} | {round(sum(values) / len(values), 4)} | {round(min(values), 4)} | {round(max(values), 4)} |')",
-    "        lines.append('')",
-    "    if not dimensions and not measures:",
-    "        lines.append('当前 SQL 结果未包含可自动统计的分类字段或数值字段。')",
-    "        lines.append('')",
-    "    lines.append('## 字段概览')",
-    "    lines.append('| 字段 | 非空样本数 | 去重值数量 | 类型判断 |')",
-    "    lines.append('|---|---:|---:|---|')",
-    "    for key in keys:",
-    "        profile = profiles[key]",
-    "        kind = '数值' if profile['is_numeric'] else '分类/文本'",
-    "        lines.append(f\"| {key} | {profile['non_empty']} | {profile['unique_count']} | {kind} |\")",
+    "            lines.append(f'| {measure} | {len(values)} | {round(sum(values), 4) if values else 0} |')",
+    "    else:",
+    "        lines.append('当前请求未明确指定要汇总的字段；为避免自行发挥，未生成额外分析内容。')",
     "",
     "print('\\n'.join(lines))",
   ].join("\n");
@@ -816,6 +901,10 @@ export function isReportGenerationContent(userPrompt: string, content: string) {
     return false;
   }
   return isMarkdownLikeContent(content) || /^#{1,3}\s+/m.test(content) || /\|.+\|/m.test(content);
+}
+
+export function shouldGenerateReportFromAnalysisResult(prompt: string) {
+  return /(根据|基于|依据|据).{0,12}(分析结果|python\s*分析结果|工具分析结果|上一轮分析|最近分析|当前分析).{0,24}(生成|输出|形成|整理|撰写).{0,8}(报告|分析报告|markdown|Markdown)/i.test(prompt);
 }
 
 export function inferReportTitle(content: string) {
@@ -1115,6 +1204,7 @@ export class AssistantRuntime {
   private readonly toolResultRegistry: ToolResultRegistry;
   private readonly toolArtifactManager: ArtifactManager;
   private readonly tempSourceManager: ConversationTempSourceManager;
+  private readonly agentGuidance: ReturnType<typeof createAgentGuidanceModule>;
 
   constructor(options: AssistantRuntimeOptions) {
     this.options = options;
@@ -1128,6 +1218,11 @@ export class AssistantRuntime {
     this.tempSourceManager.cleanupExpired();
     this.toolResultRegistry = new SQLiteToolResultRegistry(this.db);
     this.toolArtifactManager = new SQLiteArtifactManager(this.db);
+    this.agentGuidance = createAgentGuidanceModule({
+      checkpointStore: new SQLiteWorkflowCheckpointStore(this.db),
+      dataAccuracyPolicy: DEFAULT_DATA_ACCURACY_POLICY,
+      enableNextActionRecommendations: true,
+    });
     this.workflowStore = new AuditedWorkflowStateStore(new SQLiteWorkflowStateStore(this.db), new SQLiteWorkflowAuditLogger(this.db));
     this.datasetStateManager = new SQLiteDatasetStateManager(this.db, this.workflowStore);
     this.sqliteMaterializer = new SQLiteMaterializer(this.db, {
@@ -1272,6 +1367,502 @@ export class AssistantRuntime {
     return this.tempSourceManager.listByConversation(conversationId, userId).slice(0, 1);
   }
 
+  private guidanceMessageStatus(status?: string): AssistantMessageStatus {
+    if (status === "waiting_for_data_source") {
+      return "waiting_for_data_source";
+    }
+    if (status === "waiting_for_field_selection") {
+      return "waiting_for_field_selection";
+    }
+    if (status === "waiting_for_parameters") {
+      return "waiting_for_parameters";
+    }
+    if (status === "recoverable_error") {
+      return "recoverable_error";
+    }
+    if (status === "paused") {
+      return "paused";
+    }
+    return "waiting_for_user_input";
+  }
+
+  private guidanceBlocks(guidance: AgentGuidance): AssistantBlock[] {
+    return [{
+      id: guidance.guidanceId,
+      type: "card",
+      title: guidance.title,
+      content: guidance.message,
+      guidance,
+    }];
+  }
+
+  private async pauseForMissingInputGuidance(input: AssistantSendInput, conversation: AssistantConversation, assistantMessage: AssistantMessage, tempSources: ConversationTempCsvTable[]) {
+    if (isOverallRiskSkill(input.skill)) {
+      return false;
+    }
+    const toolState = await this.toolResultRegistry.getConversationState(conversation.id);
+    const detection = this.agentGuidance.detectMissingInputs({
+      conversationId: conversation.id,
+      prompt: input.prompt,
+      dataSourceLabel: input.dataSourceLabel,
+      tempSources,
+      selectedFieldRefs: input.selectedFieldRefs,
+      toolState,
+    });
+    if (detection.complete) {
+      return false;
+    }
+    const { guidance, checkpoint } = this.agentGuidance.buildClarification({
+      conversationId: conversation.id,
+      detection,
+      prompt: input.prompt,
+    });
+    this.agentGuidance.createCheckpoint({
+      ...checkpoint,
+      latestSuccessfulToolCallIds: {
+        sql_query: toolState.latestSuccessfulSqlToolCallId,
+        python_analysis: toolState.latestSuccessfulPythonToolCallId,
+        chart_rendering: toolState.latestSuccessfulChartToolCallId,
+        report_generation: toolState.latestSuccessfulReportToolCallId,
+      },
+      artifactIds: [
+        ...(toolState.latestSuccessfulSqlArtifactIds ?? []),
+        ...(toolState.latestSuccessfulPythonArtifactIds ?? []),
+        ...(toolState.latestSuccessfulChartArtifactIds ?? []),
+        ...(toolState.latestSuccessfulReportArtifactIds ?? []),
+      ],
+      updatedAt: nowIso(),
+    });
+    await this.workflowMemoryBridge.writeWorkflowMemory({
+      conversationId: conversation.id,
+      userId: input.userId,
+      type: "workflow_guidance_created",
+      summary: guidance.title,
+      payload: {
+        guidanceId: guidance.guidanceId,
+        resumeToken: guidance.resumeToken,
+        requiredInputs: guidance.requiredInputs?.map((item) => item.key),
+      },
+    });
+    const updated = this.updateMessage(assistantMessage.id, {
+      status: this.guidanceMessageStatus(checkpoint.status),
+      content: renderGuidanceMarkdown(guidance),
+      blocks: this.guidanceBlocks(guidance),
+    });
+    this.options.emit({ type: "message", conversationId: conversation.id, message: updated });
+    return true;
+  }
+
+  private async pauseForToolParameterRepairGuidance(input: {
+    conversationId: string;
+    userId: string;
+    assistantMessage: AssistantMessage;
+    toolKind: ToolKind;
+    modelToolCallId: string;
+    invalidParameters: InvalidToolParameter[];
+  }) {
+    const toolState = await this.toolResultRegistry.getConversationState(input.conversationId);
+    const { guidance, issue } = this.agentGuidance.buildParameterRepair({
+      conversationId: input.conversationId,
+      toolKind: input.toolKind,
+      invalidParameters: input.invalidParameters,
+    });
+    this.agentGuidance.createCheckpoint({
+      checkpointId: `checkpoint_${randomUUID()}`,
+      workflowId: guidance.workflowId,
+      conversationId: input.conversationId,
+      currentStepId: input.toolKind,
+      status: "waiting_for_parameters",
+      completedStepIds: [],
+      pendingStepIds: [input.toolKind],
+      activeDatasetIds: [],
+      latestSuccessfulToolCallIds: {
+        sql_query: toolState.latestSuccessfulSqlToolCallId,
+        python_analysis: toolState.latestSuccessfulPythonToolCallId,
+        chart_rendering: toolState.latestSuccessfulChartToolCallId,
+        report_generation: toolState.latestSuccessfulReportToolCallId,
+      },
+      artifactIds: [
+        ...(toolState.latestSuccessfulSqlArtifactIds ?? []),
+        ...(toolState.latestSuccessfulPythonArtifactIds ?? []),
+        ...(toolState.latestSuccessfulChartArtifactIds ?? []),
+        ...(toolState.latestSuccessfulReportArtifactIds ?? []),
+      ],
+      pendingGuidance: guidance,
+      activeIssue: {
+        ...issue,
+        toolCallId: input.modelToolCallId,
+      },
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+    });
+    await this.workflowMemoryBridge.writeWorkflowMemory({
+      conversationId: input.conversationId,
+      userId: input.userId,
+      type: "workflow_parameter_repair_requested",
+      summary: guidance.title,
+      payload: {
+        toolKind: input.toolKind,
+        toolCallId: input.modelToolCallId,
+        invalidParameters: input.invalidParameters.map((item) => ({
+          parameterName: item.parameterName,
+          reason: item.reason,
+          message: item.message,
+        })),
+        preservedToolCallIds: {
+          sql_query: toolState.latestSuccessfulSqlToolCallId,
+          python_analysis: toolState.latestSuccessfulPythonToolCallId,
+          chart_rendering: toolState.latestSuccessfulChartToolCallId,
+          report_generation: toolState.latestSuccessfulReportToolCallId,
+        },
+        artifactIds: [
+          ...(toolState.latestSuccessfulSqlArtifactIds ?? []),
+          ...(toolState.latestSuccessfulPythonArtifactIds ?? []),
+          ...(toolState.latestSuccessfulChartArtifactIds ?? []),
+          ...(toolState.latestSuccessfulReportArtifactIds ?? []),
+        ],
+      },
+    });
+    const current = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(input.assistantMessage.id));
+    const updated = this.updateMessage(input.assistantMessage.id, {
+      status: "waiting_for_parameters",
+      content: current.content.trim() ? current.content : renderGuidanceMarkdown(guidance),
+      blocks: [...(current.content.trim() ? current.blocks : []), ...this.guidanceBlocks(guidance)],
+    });
+    this.options.emit({ type: "message", conversationId: input.conversationId, message: updated });
+    return {
+      status: "waiting_input",
+      toolCallId: input.modelToolCallId,
+      message: guidance.message,
+      guidanceId: guidance.guidanceId,
+      resumeToken: guidance.resumeToken,
+      invalidParameters: input.invalidParameters.map((item) => ({
+        parameterName: item.parameterName,
+        reason: item.reason,
+        message: item.message,
+      })),
+    };
+  }
+
+  private async pauseForApprovalRejectedGuidance(input: {
+    conversationId: string;
+    userId: string;
+    messageId?: string;
+    toolKind: ToolKind;
+    toolCallId: string;
+    leadingBlock?: AssistantBlock;
+  }) {
+    const toolState = await this.toolResultRegistry.getConversationState(input.conversationId);
+    const recovery = this.agentGuidance.handleApprovalRejected({
+      conversationId: input.conversationId,
+      toolKind: input.toolKind,
+      toolCallId: input.toolCallId,
+    });
+    this.agentGuidance.createCheckpoint({
+      checkpointId: `checkpoint_${randomUUID()}`,
+      workflowId: recovery.guidance.workflowId,
+      conversationId: input.conversationId,
+      currentStepId: input.toolKind,
+      status: "paused",
+      completedStepIds: [],
+      pendingStepIds: [input.toolKind],
+      activeDatasetIds: [],
+      latestSuccessfulToolCallIds: {
+        sql_query: toolState.latestSuccessfulSqlToolCallId,
+        python_analysis: toolState.latestSuccessfulPythonToolCallId,
+        chart_rendering: toolState.latestSuccessfulChartToolCallId,
+        report_generation: toolState.latestSuccessfulReportToolCallId,
+      },
+      artifactIds: [
+        ...(toolState.latestSuccessfulSqlArtifactIds ?? []),
+        ...(toolState.latestSuccessfulPythonArtifactIds ?? []),
+        ...(toolState.latestSuccessfulChartArtifactIds ?? []),
+        ...(toolState.latestSuccessfulReportArtifactIds ?? []),
+      ],
+      pendingGuidance: recovery.guidance,
+      activeIssue: recovery.issue,
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+    });
+    await this.workflowMemoryBridge.writeWorkflowMemory({
+      conversationId: input.conversationId,
+      userId: input.userId,
+      type: "workflow_approval_rejected",
+      summary: recovery.guidance.title,
+      payload: {
+        toolKind: input.toolKind,
+        toolCallId: input.toolCallId,
+        issueCode: recovery.issue.code,
+        resumeToken: recovery.guidance.resumeToken,
+        preservedToolCallIds: {
+          sql_query: toolState.latestSuccessfulSqlToolCallId,
+          python_analysis: toolState.latestSuccessfulPythonToolCallId,
+          chart_rendering: toolState.latestSuccessfulChartToolCallId,
+          report_generation: toolState.latestSuccessfulReportToolCallId,
+        },
+        artifactIds: [
+          ...(toolState.latestSuccessfulSqlArtifactIds ?? []),
+          ...(toolState.latestSuccessfulPythonArtifactIds ?? []),
+          ...(toolState.latestSuccessfulChartArtifactIds ?? []),
+          ...(toolState.latestSuccessfulReportArtifactIds ?? []),
+        ],
+      },
+    });
+    const fallback = this.latestAssistantMessageForConversation(input.conversationId, input.userId);
+    const current = input.messageId
+      ? this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(input.messageId))
+      : fallback;
+    if (!current) {
+      return { guidance: recovery.guidance, issue: recovery.issue, message: null };
+    }
+    const baseBlocks = input.leadingBlock ? [input.leadingBlock] : current.content.trim() ? current.blocks : [];
+    const updated = this.updateMessage(current.id, {
+      status: "paused",
+      content: current.content.trim() ? current.content : renderGuidanceMarkdown(recovery.guidance),
+      blocks: [...baseBlocks, ...this.guidanceBlocks(recovery.guidance)],
+      errorMessage: undefined,
+    });
+    this.options.emit({ type: "message", conversationId: input.conversationId, message: updated });
+    return { guidance: recovery.guidance, issue: recovery.issue, message: updated };
+  }
+
+  private async createCompletedToolCheckpoint(record: ToolCallRecord) {
+    const toolState = await this.toolResultRegistry.getConversationState(record.conversationId);
+    const artifactIds = [
+      ...(toolState.latestSuccessfulSqlArtifactIds ?? []),
+      ...(toolState.latestSuccessfulPythonArtifactIds ?? []),
+      ...(toolState.latestSuccessfulChartArtifactIds ?? []),
+      ...(toolState.latestSuccessfulReportArtifactIds ?? []),
+    ];
+    const activeDatasetIds = artifactIds
+      .filter((artifactId) => artifactId.startsWith("workflow-dataset:"))
+      .map((artifactId) => artifactId.slice("workflow-dataset:".length));
+    const workflowId = typeof record.metadata?.planId === "string"
+      ? record.metadata.planId
+      : typeof record.metadata?.workflowId === "string"
+        ? record.metadata.workflowId
+        : `workflow_${record.conversationId}`;
+    const checkpoint = this.agentGuidance.createCheckpoint(buildCompletedToolCheckpoint({
+      workflowId,
+      conversationId: record.conversationId,
+      currentStepId: record.toolKind,
+      activeDatasetIds,
+      latestSuccessfulToolCallIds: {
+        sql_query: toolState.latestSuccessfulSqlToolCallId,
+        python_analysis: toolState.latestSuccessfulPythonToolCallId,
+        chart_rendering: toolState.latestSuccessfulChartToolCallId,
+        report_generation: toolState.latestSuccessfulReportToolCallId,
+      },
+      artifactIds,
+    }));
+    await this.workflowMemoryBridge.writeWorkflowMemory({
+      conversationId: record.conversationId,
+      userId: record.userId,
+      type: "workflow_checkpoint_created",
+      summary: `${TOOL_NAMES[record.toolKind]} v${record.version} 成功后已创建工作流检查点。`,
+      payload: {
+        checkpointId: checkpoint.checkpointId,
+        workflowId: checkpoint.workflowId,
+        status: checkpoint.status,
+        currentStepId: checkpoint.currentStepId,
+        completedStepIds: checkpoint.completedStepIds,
+        latestSuccessfulToolCallIds: checkpoint.latestSuccessfulToolCallIds,
+        artifactIds: checkpoint.artifactIds,
+        activeDatasetIds: checkpoint.activeDatasetIds,
+      },
+    });
+    return checkpoint;
+  }
+
+  private async pauseForOrchestrationToolErrorRecovery(input: {
+    conversationId: string;
+    userId: string;
+    messageId?: string;
+    toolKind: ToolKind;
+    toolCallId: string;
+    message: string;
+  }) {
+    const recovery = this.agentGuidance.handleToolError({
+      conversationId: input.conversationId,
+      toolKind: input.toolKind,
+      message: input.message,
+      toolCallId: input.toolCallId,
+    });
+    const toolState = await this.toolResultRegistry.getConversationState(input.conversationId);
+    this.agentGuidance.createCheckpoint({
+      checkpointId: `checkpoint_${randomUUID()}`,
+      workflowId: recovery.guidance.workflowId,
+      conversationId: input.conversationId,
+      currentStepId: input.toolKind,
+      status: "recoverable_error",
+      completedStepIds: [],
+      pendingStepIds: [input.toolKind],
+      activeDatasetIds: [],
+      latestSuccessfulToolCallIds: {
+        sql_query: toolState.latestSuccessfulSqlToolCallId,
+        python_analysis: toolState.latestSuccessfulPythonToolCallId,
+        chart_rendering: toolState.latestSuccessfulChartToolCallId,
+        report_generation: toolState.latestSuccessfulReportToolCallId,
+      },
+      artifactIds: [
+        ...(toolState.latestSuccessfulSqlArtifactIds ?? []),
+        ...(toolState.latestSuccessfulPythonArtifactIds ?? []),
+        ...(toolState.latestSuccessfulChartArtifactIds ?? []),
+        ...(toolState.latestSuccessfulReportArtifactIds ?? []),
+      ],
+      pendingGuidance: recovery.guidance,
+      activeIssue: recovery.issue,
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+    });
+    await this.workflowMemoryBridge.writeWorkflowMemory({
+      conversationId: input.conversationId,
+      userId: input.userId,
+      type: "workflow_recoverable_error",
+      summary: recovery.guidance.title,
+      payload: {
+        toolCallId: input.toolCallId,
+        toolKind: input.toolKind,
+        issueCode: recovery.issue.code,
+        resumeToken: recovery.guidance.resumeToken,
+        preservedToolCallIds: {
+          sql_query: toolState.latestSuccessfulSqlToolCallId,
+          python_analysis: toolState.latestSuccessfulPythonToolCallId,
+          chart_rendering: toolState.latestSuccessfulChartToolCallId,
+          report_generation: toolState.latestSuccessfulReportToolCallId,
+        },
+        artifactIds: [
+          ...(toolState.latestSuccessfulSqlArtifactIds ?? []),
+          ...(toolState.latestSuccessfulPythonArtifactIds ?? []),
+          ...(toolState.latestSuccessfulChartArtifactIds ?? []),
+          ...(toolState.latestSuccessfulReportArtifactIds ?? []),
+        ],
+      },
+    });
+    if (!input.messageId) {
+      return { guidance: recovery.guidance, issue: recovery.issue, message: null };
+    }
+    const current = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(input.messageId));
+    const updated = this.updateMessage(input.messageId, {
+      status: "recoverable_error",
+      content: current.content.trim() ? current.content : input.message,
+      blocks: [...(current.content.trim() ? current.blocks : []), ...this.guidanceBlocks(recovery.guidance)],
+      errorMessage: input.message,
+    });
+    this.options.emit({ type: "message", conversationId: input.conversationId, message: updated });
+    return { guidance: recovery.guidance, issue: recovery.issue, message: updated };
+  }
+
+  private isWorkflowCancelPrompt(prompt: string) {
+    return isWorkflowCancellationPrompt(prompt);
+  }
+
+  private async resumeGuidedWorkflowIfPossible(input: AssistantSendInput, conversation: AssistantConversation, assistantMessage: AssistantMessage, tempSources: ConversationTempCsvTable[]) {
+    const checkpoint = this.agentGuidance.restoreFromCheckpoint(conversation.id);
+    if (!checkpoint?.pendingGuidance?.blocking) {
+      return { handled: false as const, input, resumed: false as const };
+    }
+
+    if (this.isWorkflowCancelPrompt(input.prompt)) {
+      const cancelled = this.agentGuidance.cancelWorkflow({ checkpoint, reason: input.prompt });
+      await this.workflowMemoryBridge.writeWorkflowMemory({
+        conversationId: conversation.id,
+        userId: input.userId,
+        type: "workflow_cancelled",
+        summary: "用户已取消当前待恢复工作流。",
+        payload: {
+          workflowId: cancelled.workflowId,
+          checkpointId: cancelled.checkpointId,
+          preservedToolCallIds: cancelled.latestSuccessfulToolCallIds,
+          artifactIds: cancelled.artifactIds,
+          activeDatasetIds: cancelled.activeDatasetIds,
+        },
+      });
+      const content = "已取消当前待恢复工作流。已完成的工具结果和数据集仍保留在会话中。";
+      const updated = this.updateMessage(assistantMessage.id, {
+        status: "stopped",
+        content,
+        blocks: [{ id: `workflow-cancelled-${cancelled.checkpointId}`, type: "card", title: "工作流已取消", content }],
+      });
+      this.options.emit({ type: "message", conversationId: conversation.id, message: updated });
+      return { handled: true as const, input, resumed: false as const };
+    }
+
+    const toolState = await this.toolResultRegistry.getConversationState(conversation.id);
+    const resume = this.agentGuidance.resumeWithInput({
+      checkpoint,
+      prompt: input.prompt,
+      dataSourceLabel: input.dataSourceLabel,
+      tempSources,
+      selectedFieldRefs: input.selectedFieldRefs,
+      toolState,
+    });
+    if (resume.canResume) {
+      this.agentGuidance.createCheckpoint({
+        ...checkpoint,
+        status: "retrying",
+        pendingGuidance: undefined,
+        activeIssue: undefined,
+        updatedAt: nowIso(),
+      });
+      await this.workflowMemoryBridge.writeWorkflowMemory({
+        conversationId: conversation.id,
+        userId: input.userId,
+        type: "workflow_resumed",
+        summary: "用户补充信息后工作流从断点恢复。",
+        payload: {
+          workflowId: checkpoint.workflowId,
+          checkpointId: checkpoint.checkpointId,
+          resolvedInputKeys: resume.resolvedInputKeys,
+          preservedToolCallIds: checkpoint.latestSuccessfulToolCallIds,
+          artifactIds: checkpoint.artifactIds,
+        },
+      });
+      return {
+        handled: false as const,
+        resumed: true as const,
+        input: {
+          ...input,
+          prompt: resume.mergedPrompt,
+        },
+      };
+    }
+
+    const detection = {
+      complete: false,
+      missingInputs: resume.unresolvedInputs,
+      warnings: ["已保留上一轮已完成的工具结果和数据集；请继续补充缺失信息。"],
+      nextStatus: checkpoint.status,
+    };
+    const { guidance } = this.agentGuidance.buildClarification({
+      conversationId: conversation.id,
+      workflowId: checkpoint.workflowId,
+      detection,
+      prompt: input.prompt,
+    });
+    const nextCheckpoint = {
+      ...checkpoint,
+      pendingGuidance: guidance,
+      activeIssue: checkpoint.activeIssue
+        ? {
+            ...checkpoint.activeIssue,
+            message: guidance.message,
+            missingInputs: resume.unresolvedInputs,
+            availableActions: guidance.actions,
+          }
+        : undefined,
+      updatedAt: nowIso(),
+    };
+    this.agentGuidance.createCheckpoint(nextCheckpoint);
+    const updated = this.updateMessage(assistantMessage.id, {
+      status: this.guidanceMessageStatus(checkpoint.status),
+      content: renderGuidanceMarkdown(guidance),
+      blocks: this.guidanceBlocks(guidance),
+    });
+    this.options.emit({ type: "message", conversationId: conversation.id, message: updated });
+    return { handled: true as const, input, resumed: false as const };
+  }
+
   async sendMessage(input: AssistantSendInput): Promise<AssistantSendResult> {
     const prompt = input.prompt.trim();
     if (!prompt) {
@@ -1297,7 +1888,7 @@ export class AssistantRuntime {
       selectedFieldRefs: input.selectedFieldRefs,
       maxFieldsPerSource: input.tempSchemaFieldLimit,
     });
-    const effectiveInput: AssistantSendInput = {
+    let effectiveInput: AssistantSendInput = {
       ...input,
       conversationId: conversation.id,
       selectedTempDataSourceIds: tempSources.map((source) => source.tempDataSourceId),
@@ -1341,11 +1932,21 @@ export class AssistantRuntime {
     this.options.emit({ type: "message", conversationId: conversation.id, message: userMessage });
     this.options.emit({ type: "message", conversationId: conversation.id, message: assistantMessage });
 
-    const tool = detectTool(prompt);
-    if (!shouldRouteSkillThroughModel(effectiveInput.skill) && await this.routeOverallRiskSkillWorkflow(effectiveInput, conversation, assistantMessage)) {
+    const resume = await this.resumeGuidedWorkflowIfPossible(effectiveInput, conversation, assistantMessage, tempSources);
+    if (resume.handled) {
+      return { success: true, conversation, userMessage, assistantMessage };
+    }
+    effectiveInput = resume.input;
+
+    const tool = detectTool(effectiveInput.prompt);
+    if (!resume.resumed && !tool && await this.pauseForMissingInputGuidance(effectiveInput, conversation, assistantMessage, tempSources)) {
+      // Paused with actionable guidance; the user can supplement missing inputs in the next turn.
+    } else if (!shouldRouteSkillThroughModel(effectiveInput.skill) && await this.routeOverallRiskSkillWorkflow(effectiveInput, conversation, assistantMessage)) {
       // Routed to the governed multi-step skill workflow.
     } else if (tool) {
       void this.handleToolCall(effectiveInput, conversation, assistantMessage, tool);
+    } else if (await this.routeLatestAnalysisReport(effectiveInput, conversation, assistantMessage)) {
+      // Routed to report generation from the latest Python analysis result.
     } else if (await this.routePriorSqlAnalysis(effectiveInput, conversation, assistantMessage)) {
       // Routed to a governed Python tool call.
     } else {
@@ -1371,12 +1972,15 @@ export class AssistantRuntime {
 
     if (!approved) {
       const next = this.updateToolCall(toolCall.id, "declined", undefined, "用户已拒绝执行该工具调用。");
-      const message = this.updateMessage(toolCall.messageId, {
-        status: "stopped",
-        content: "用户已拒绝执行该工具调用。",
-        blocks: [this.toolBlock(next, "用户已拒绝执行该工具调用。")],
-        errorMessage: "用户拒绝",
+      const paused = await this.pauseForApprovalRejectedGuidance({
+        conversationId: toolCall.conversationId,
+        userId: toolCall.userId,
+        messageId: toolCall.messageId,
+        toolKind: assistantToolKindToOrchestrationKind(toolCall.kind),
+        toolCallId: toolCall.id,
+        leadingBlock: this.toolBlock(next, "用户已拒绝执行该工具调用。"),
       });
+      const message = paused.message ?? this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(toolCall.messageId));
       this.options.emit({ type: "tool", conversationId: toolCall.conversationId, toolCall: next, message });
       return { success: true as const, toolCall: next, message };
     }
@@ -1659,6 +2263,8 @@ export class AssistantRuntime {
 
     if (!shouldRouteSkillThroughModel(retryInput.skill) && await this.routeOverallRiskSkillWorkflow(retryInput, nextConversation, assistantMessage)) {
       // Routed to the governed multi-step skill workflow.
+    } else if (await this.routeLatestAnalysisReport(retryInput, nextConversation, assistantMessage)) {
+      // Routed to report generation from the latest Python analysis result.
     } else if (!(await this.routePriorSqlAnalysis(retryInput, nextConversation, assistantMessage))) {
       void this.streamModelResponse(retryInput, nextConversation, assistantMessage);
     }
@@ -1951,11 +2557,75 @@ export class AssistantRuntime {
       .all(conversationId, userId, limit) as Array<Record<string, unknown>>).map((row) => this.toolCallFromRow(row));
   }
 
+  private async datasetForSqlRecord(record: ToolCallRecord | null | undefined) {
+    const datasetId = (record?.outputArtifactIds ?? record?.result?.artifactIds ?? [])
+      .find((artifactId) => artifactId.startsWith("workflow-dataset:"))
+      ?.slice("workflow-dataset:".length);
+    return datasetId ? this.datasetStateManager.getDataset(datasetId) : null;
+  }
+
+  private sqlScriptForRecord(record: ToolCallRecord) {
+    return typeof record.request.sql === "string"
+      ? record.request.sql
+      : typeof record.request.script === "string"
+        ? record.request.script
+        : typeof record.result?.metadata?.sql === "string"
+          ? record.result.metadata.sql
+          : "select 1";
+  }
+
+  private async resultTextForSqlRecord(record: ToolCallRecord, dataset?: WorkflowDatasetRef | null) {
+    if (dataset) {
+      return JSON.stringify({ rowCount: dataset.rowCount, columnCount: dataset.columnCount, previewRows: dataset.profile?.previewRows ?? [], previewRowLimit: 20 }, null, 2);
+    }
+    const artifactIds = record.outputArtifactIds ?? record.result?.artifactIds ?? [];
+    for (const artifactId of artifactIds) {
+      const artifact = await this.toolArtifactManager.getArtifact(artifactId);
+      if (!artifact?.content) {
+        continue;
+      }
+      return typeof artifact.content === "string" ? artifact.content : JSON.stringify(artifact.content, null, 2);
+    }
+    const resultPreview = record.result?.metadata?.resultPreview;
+    return typeof resultPreview === "string" ? resultPreview : "";
+  }
+
+  private orchestrationSqlRecordAsAssistantTool(record: ToolCallRecord, result: string): AssistantToolCall {
+    return {
+      id: record.toolCallId,
+      conversationId: record.conversationId,
+      messageId: record.messageId ?? "",
+      userId: record.userId,
+      kind: "sql",
+      status: "completed",
+      script: this.sqlScriptForRecord(record),
+      result,
+      approvalMode: "request_approval",
+      createdAt: record.createdAt,
+      updatedAt: record.completedAt ?? record.updatedAt,
+    };
+  }
+
   private async latestSqlRowsForConversation(userId: string, conversationId: string) {
+    const latestSqlRecord = await this.toolResultRegistry.getLatestSuccessful(conversationId, "sql_query");
+    const latestSqlRecordDataset = await this.datasetForSqlRecord(latestSqlRecord);
+    if (latestSqlRecord) {
+      const rows = this.rowsForSqlAnalysis(undefined, latestSqlRecordDataset ?? undefined);
+      const result = await this.resultTextForSqlRecord(latestSqlRecord, latestSqlRecordDataset);
+      return {
+        latestSqlToolCall: this.orchestrationSqlRecordAsAssistantTool(latestSqlRecord, result),
+        latestSqlRecord,
+        latestSqlDataset: latestSqlRecordDataset,
+        rows,
+      };
+    }
+
     const latestSqlToolCall = this.latestCompletedToolCall(userId, conversationId, "sql");
     const latestSqlDataset = await this.datasetStateManager.getLatestSqlDataset(conversationId);
     return {
       latestSqlToolCall,
+      latestSqlRecord,
+      latestSqlDataset,
       rows: this.rowsForSqlAnalysis(latestSqlToolCall ?? undefined, latestSqlDataset ?? undefined),
     };
   }
@@ -1967,7 +2637,7 @@ export class AssistantRuntime {
   private async normalizePythonToolScript(input: { userId: string; conversationId: string; prompt?: string; script: string; selectedTempDataSourceIds?: string[]; selectedFieldRefs?: ChatCsvSelectedFieldRef[] }) {
     const shouldReplaceScript = this.shouldReplacePythonScript(input.script);
     const { latestSqlToolCall, rows } = await this.latestSqlRowsForConversation(input.userId, input.conversationId);
-    if (latestSqlToolCall && rows.length > 0) {
+    if (latestSqlToolCall) {
       return shouldReplaceScript
         ? this.buildPythonAnalysisScript(input.prompt || this.sourcePromptForToolCall(latestSqlToolCall) || "基于上一轮 SQL 结果输出分析报告。", latestSqlToolCall, rows)
         : input.script;
@@ -2043,10 +2713,8 @@ export class AssistantRuntime {
       return false;
     }
 
-    const latestSqlToolCall = this.latestCompletedToolCall(input.userId, conversation.id, "sql");
-    const latestSqlDataset = await this.datasetStateManager.getLatestSqlDataset(conversation.id);
-    const rows = this.rowsForSqlAnalysis(latestSqlToolCall ?? undefined, latestSqlDataset ?? undefined);
-    if (!latestSqlToolCall || rows.length === 0) {
+    const { latestSqlToolCall, latestSqlDataset, rows } = await this.latestSqlRowsForConversation(input.userId, conversation.id);
+    if (!latestSqlToolCall) {
       return false;
     }
 
@@ -2066,10 +2734,190 @@ export class AssistantRuntime {
       },
     );
 
-    void this.handleToolCall(input, conversation, assistantMessage, {
+    await this.handleToolCall(input, conversation, assistantMessage, {
       kind: "python",
       script: this.buildPythonAnalysisScript(input.prompt, latestSqlToolCall, rows),
     });
+    return true;
+  }
+
+  private async markdownForToolRecord(record: ToolCallRecord | null | undefined) {
+    const artifactIds = record?.outputArtifactIds ?? record?.result?.artifactIds ?? [];
+    for (const artifactId of artifactIds) {
+      const artifact = await this.toolArtifactManager.getArtifact(artifactId);
+      if (!artifact || artifact.contentType !== "markdown" || typeof artifact.content !== "string") {
+        continue;
+      }
+      const markdown = artifact.content.trim();
+      if (markdown) {
+        return { markdown, artifact };
+      }
+    }
+    return null;
+  }
+
+  private async routeLatestAnalysisReport(input: AssistantSendInput, conversation: AssistantConversation, assistantMessage: AssistantMessage) {
+    if (!shouldGenerateReportFromAnalysisResult(input.prompt)) {
+      return false;
+    }
+
+    const pythonRecord = await this.toolResultRegistry.getLatestSuccessful(conversation.id, "python_analysis");
+    const analysis = await this.markdownForToolRecord(pythonRecord);
+    if (!pythonRecord || !analysis) {
+      return false;
+    }
+
+    const markdown = analysis.markdown;
+    const title = inferReportTitle(markdown) ?? "分析报告";
+    const completedAt = nowIso();
+    const reportToolCallId = generatedReportToolCallId(assistantMessage.id);
+    const artifact = await this.toolArtifactManager.createArtifact({
+      artifactId: generatedReportArtifactId(assistantMessage.id),
+      artifactType: "report_markdown",
+      title,
+      contentType: "markdown",
+      content: markdown,
+      metadata: {
+        messageId: assistantMessage.id,
+        sourcePythonToolCallId: pythonRecord.toolCallId,
+        sourceAnalysisArtifactId: analysis.artifact.artifactId,
+      },
+    });
+    const version = (await this.toolResultRegistry.listByConversation(conversation.id)).filter((record) => record.toolKind === "report_generation").length + 1;
+    const reportRecord: ToolCallRecord = {
+      toolCallId: reportToolCallId,
+      conversationId: conversation.id,
+      messageId: assistantMessage.id,
+      userId: input.userId,
+      toolKind: "report_generation",
+      toolName: TOOL_NAMES.report_generation,
+      status: "completed",
+      request: {
+        userRequest: input.prompt,
+        title,
+        source: "latest-python-analysis-result",
+      },
+      resolvedInput: {
+        mode: "latest_result",
+        sourceToolKind: "python_analysis",
+        sourceToolCallId: pythonRecord.toolCallId,
+        sourceArtifactIds: pythonRecord.outputArtifactIds ?? pythonRecord.result?.artifactIds,
+        reason: "用户要求根据分析结果生成报告，已复用最近一次成功 Python 分析结果。",
+      },
+      result: {
+        resultId: `result_${reportToolCallId}`,
+        toolKind: "report_generation",
+        artifactIds: [artifact.artifactId],
+        primaryArtifactId: artifact.artifactId,
+        summary: `Markdown 报告「${title}」已根据最近分析结果生成。`,
+        createdAt: completedAt,
+        metadata: {
+          messageId: assistantMessage.id,
+          sourcePythonToolCallId: pythonRecord.toolCallId,
+          sourceAnalysisArtifactId: analysis.artifact.artifactId,
+        },
+      },
+      parentToolCallIds: [pythonRecord.toolCallId],
+      sourceArtifactIds: pythonRecord.outputArtifactIds ?? pythonRecord.result?.artifactIds ?? [],
+      outputArtifactIds: [artifact.artifactId],
+      version,
+      isLatestSuccessful: false,
+      createdAt: assistantMessage.createdAt,
+      updatedAt: completedAt,
+      completedAt,
+      metadata: {
+        source: "latest-python-analysis-result",
+        title,
+      },
+    };
+
+    await this.toolResultRegistry.register(reportRecord);
+    await this.toolResultRegistry.markLatestSuccessful(conversation.id, reportToolCallId);
+    await this.workflowMemoryBridge.writeWorkflowMemory({
+      conversationId: conversation.id,
+      userId: input.userId,
+      type: "report_generation_completed",
+      summary: reportRecord.result?.summary ?? "报告已生成。",
+      payload: {
+        toolCallId: reportToolCallId,
+        toolKind: "report_generation",
+        version,
+        artifactIds: [artifact.artifactId],
+        parentToolCallIds: reportRecord.parentToolCallIds,
+        sourceArtifactIds: reportRecord.sourceArtifactIds,
+      },
+    });
+
+    const updated = this.updateMessage(assistantMessage.id, {
+      status: "completed",
+      content: markdown,
+      blocks: parseAssistantBlocks(markdown),
+    });
+    this.options.emit({ type: "message", conversationId: conversation.id, message: updated });
+    this.emitReportContentReady({
+      conversationId: conversation.id,
+      messageId: assistantMessage.id,
+      toolCallId: reportToolCallId,
+      version,
+      artifactId: artifact.artifactId,
+      title,
+      createdAt: artifact.createdAt,
+      completedAt,
+      markdown,
+    });
+    await this.workflowMemoryBridge.writeWorkflowMemory({
+      conversationId: conversation.id,
+      userId: input.userId,
+      type: "report_generation_routed_from_analysis",
+      summary: "已根据最近 Python 分析结果生成报告。",
+      payload: {
+        sourcePythonToolCallId: pythonRecord.toolCallId,
+        reportToolCallId,
+        artifactId: artifact.artifactId,
+      },
+    });
+    const saved = (await this.toolResultRegistry.get(reportToolCallId)) ?? reportRecord;
+    await this.createCompletedToolCheckpoint(saved);
+    await this.emitToolState(conversation.id);
+    return true;
+  }
+
+  private async routeFallbackTempCsvAnalysisSql(input: AssistantSendInput, conversation: AssistantConversation, assistantMessage: AssistantMessage, assistantContent: string) {
+    if (!shouldFallbackStartDataToolWorkflow(input.prompt, assistantContent)) {
+      return false;
+    }
+    if (isOverallRiskSkill(input.skill)) {
+      return false;
+    }
+
+    const source = this.activeTempSources(input.userId, conversation.id, input.selectedTempDataSourceIds)[0];
+    if (!source) {
+      return false;
+    }
+    const sql = buildFallbackTempCsvSqlForAnalysisRequest(input.prompt, source, input.selectedFieldRefs ?? []);
+    if (!sql) {
+      return false;
+    }
+
+    this.appendToolLog(
+      {
+        conversationId: conversation.id,
+        userId: input.userId,
+        kind: "sql",
+      },
+      "workflow-routing",
+      "info",
+      "模型回复未包含工具调用，已基于用户请求和已选 CSV 字段创建兜底 SQL 查询。",
+      {
+        prompt: input.prompt,
+        assistantContent,
+        tempDataSourceId: source.tempDataSourceId,
+        sqliteTableName: source.sqliteTableName,
+        sql,
+      },
+    );
+
+    await this.handleToolCall(input, conversation, assistantMessage, { kind: "sql", script: sql }, { appendToMessage: true });
     return true;
   }
 
@@ -2518,10 +3366,22 @@ export class AssistantRuntime {
       const shouldRenderPythonReportCard = completed.kind === "python" && isPythonReportCardContent(sourcePrompt, result);
       const completedDisplay = shouldRenderPythonReportCard ? "Python 分析已完成，报告内容已生成，可点击报告卡片查看完整报告。" : result;
       const completedBlock = this.toolBlock(completed, completedDisplay);
+      const nextGuidance = this.agentGuidance.recommendNextActions({
+        conversationId: toolCall.conversationId,
+        toolKind: assistantToolKindToOrchestrationKind(completed.kind),
+        rowCount: completed.kind === "sql" ? sqlDataset?.rowCount ?? parseSqlToolRowCount(result) ?? undefined : undefined,
+        columnCount: completed.kind === "sql" ? sqlDataset?.columnCount : undefined,
+      });
+      const successSummary = nextGuidance?.message ?? completedDisplay;
+      const completedBlocks = replaceToolSuccessSummaryBlock(
+        preserveContent ? replaceToolBlock(currentBeforeComplete.blocks, completedBlock) : [completedBlock],
+        completed.id,
+        successSummary,
+      );
       const message = this.updateMessage(toolCall.messageId, {
         status: "completed",
-        content: preserveContent ? currentBeforeComplete.content : completedDisplay,
-        blocks: preserveContent ? replaceToolBlock(currentBeforeComplete.blocks, completedBlock) : [completedBlock],
+        content: preserveContent ? currentBeforeComplete.content : successSummary,
+        blocks: completedBlocks,
       });
       this.options.emit({ type: "tool", conversationId: toolCall.conversationId, toolCall: completed, message });
       const toolRecord = await this.registerAssistantToolResult(completed, {
@@ -2544,10 +3404,68 @@ export class AssistantRuntime {
       });
       const currentBeforeFailure = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(toolCall.messageId));
       const failedBlock = this.toolBlock(failed, messageText);
+      const recovery = this.agentGuidance.handleToolError({
+        conversationId: toolCall.conversationId,
+        toolKind: assistantToolKindToOrchestrationKind(toolCall.kind),
+        message: messageText,
+        toolCallId: toolCall.id,
+      });
+      const toolState = await this.toolResultRegistry.getConversationState(toolCall.conversationId);
+      this.agentGuidance.createCheckpoint({
+        checkpointId: `checkpoint_${randomUUID()}`,
+        workflowId: recovery.guidance.workflowId,
+        conversationId: toolCall.conversationId,
+        status: "recoverable_error",
+        completedStepIds: [],
+        pendingStepIds: [toolCall.kind],
+        activeDatasetIds: [],
+        latestSuccessfulToolCallIds: {
+          sql_query: toolState.latestSuccessfulSqlToolCallId,
+          python_analysis: toolState.latestSuccessfulPythonToolCallId,
+          chart_rendering: toolState.latestSuccessfulChartToolCallId,
+          report_generation: toolState.latestSuccessfulReportToolCallId,
+        },
+        artifactIds: [
+          ...(toolState.latestSuccessfulSqlArtifactIds ?? []),
+          ...(toolState.latestSuccessfulPythonArtifactIds ?? []),
+          ...(toolState.latestSuccessfulChartArtifactIds ?? []),
+          ...(toolState.latestSuccessfulReportArtifactIds ?? []),
+        ],
+        pendingGuidance: recovery.guidance,
+        activeIssue: recovery.issue,
+        createdAt: nowIso(),
+        updatedAt: nowIso(),
+      });
+      await this.workflowMemoryBridge.writeWorkflowMemory({
+        conversationId: toolCall.conversationId,
+        userId: toolCall.userId,
+        type: "workflow_recoverable_error",
+        summary: recovery.guidance.title,
+        payload: {
+          toolCallId: toolCall.id,
+          toolKind: toolCall.kind,
+          issueCode: recovery.issue.code,
+          resumeToken: recovery.guidance.resumeToken,
+          preservedToolCallIds: {
+            sql_query: toolState.latestSuccessfulSqlToolCallId,
+            python_analysis: toolState.latestSuccessfulPythonToolCallId,
+            chart_rendering: toolState.latestSuccessfulChartToolCallId,
+            report_generation: toolState.latestSuccessfulReportToolCallId,
+          },
+          artifactIds: [
+            ...(toolState.latestSuccessfulSqlArtifactIds ?? []),
+            ...(toolState.latestSuccessfulPythonArtifactIds ?? []),
+            ...(toolState.latestSuccessfulChartArtifactIds ?? []),
+            ...(toolState.latestSuccessfulReportArtifactIds ?? []),
+          ],
+        },
+      });
+      const failedBlocks = preserveContent ? replaceToolBlock(currentBeforeFailure.blocks, failedBlock) : [failedBlock];
+      failedBlocks.push(...this.guidanceBlocks(recovery.guidance));
       runningMessage = this.updateMessage(toolCall.messageId, {
-        status: "error",
+        status: "recoverable_error",
         content: preserveContent ? currentBeforeFailure.content : messageText,
-        blocks: preserveContent ? replaceToolBlock(currentBeforeFailure.blocks, failedBlock) : [failedBlock],
+        blocks: failedBlocks,
         errorMessage: messageText,
       });
       this.options.emit({ type: "tool", conversationId: toolCall.conversationId, toolCall: failed, message: runningMessage });
@@ -2812,21 +3730,18 @@ export class AssistantRuntime {
           conversationId: record.conversationId,
           toolCallId: record.toolCallId,
           traceId: `trace_${randomUUID()}`,
-          recoverable: false,
+          recoverable: true,
         },
       });
-      const message = record.messageId
-        ? this.updateMessage(record.messageId, {
-            status: "stopped",
-            content: "用户已拒绝执行工具调用，工作流已停止。",
-            blocks: parseAssistantBlocks("## 工作流已停止\n\n用户拒绝执行待审批工具调用。"),
-            errorMessage: "用户拒绝",
-          })
-        : this.latestAssistantMessageForConversation(record.conversationId, userId);
+      const paused = await this.pauseForApprovalRejectedGuidance({
+        conversationId: record.conversationId,
+        userId,
+        messageId: record.messageId,
+        toolKind: record.toolKind,
+        toolCallId: record.toolCallId,
+      });
+      const message = paused.message ?? this.latestAssistantMessageForConversation(record.conversationId, userId);
       await this.emitToolState(record.conversationId);
-      if (message) {
-        this.options.emit({ type: "message", conversationId: record.conversationId, message });
-      }
       return { success: true as const, toolCall: rejected, message: message ?? this.fallbackAssistantMessage(record, "用户已拒绝执行工具调用。") };
     }
 
@@ -2883,13 +3798,16 @@ export class AssistantRuntime {
     } catch (error) {
       const messageText = error instanceof Error ? error.message : "整体风险分类分布工作流执行失败。";
       if (sqlRecord.messageId) {
-        const failed = this.updateMessage(sqlRecord.messageId, {
-          status: "error",
-          content: messageText,
-          blocks: parseAssistantBlocks(`## 工作流执行失败\n\n${messageText}`),
-          errorMessage: messageText,
-        });
-        this.options.emit({ type: "message", conversationId: sqlRecord.conversationId, message: failed });
+        const current = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(sqlRecord.messageId));
+        if (current.status !== "recoverable_error") {
+          const failed = this.updateMessage(sqlRecord.messageId, {
+            status: "error",
+            content: messageText,
+            blocks: parseAssistantBlocks(`## 工作流执行失败\n\n${messageText}`),
+            errorMessage: messageText,
+          });
+          this.options.emit({ type: "message", conversationId: sqlRecord.conversationId, message: failed });
+        }
       }
       await this.emitToolState(sqlRecord.conversationId);
     }
@@ -2939,6 +3857,7 @@ export class AssistantRuntime {
         summary: completed.result?.summary ?? "SQL 查询已完成。",
         payload: { toolCallId: record.toolCallId, artifactIds },
       });
+      await this.createCompletedToolCheckpoint(completed);
       await this.emitToolState(record.conversationId);
       return completed;
     } catch (error) {
@@ -2952,6 +3871,14 @@ export class AssistantRuntime {
           toolCallId: record.toolCallId,
           traceId: `trace_${randomUUID()}`,
         },
+      });
+      await this.pauseForOrchestrationToolErrorRecovery({
+        conversationId: record.conversationId,
+        userId: record.userId,
+        messageId: record.messageId,
+        toolKind: "sql_query",
+        toolCallId: record.toolCallId,
+        message: failed.error?.message ?? "SQL 查询执行失败。",
       });
       await this.emitToolState(record.conversationId);
       throw new Error(failed.error?.message ?? "SQL 查询执行失败。");
@@ -3005,6 +3932,7 @@ export class AssistantRuntime {
         summary: completed.result?.summary ?? "Python 分析已完成。",
         payload: { toolCallId: completed.toolCallId, artifactIds: [artifact.artifactId] },
       });
+      await this.createCompletedToolCheckpoint(completed);
       await this.emitToolState(executing.conversationId);
       return completed;
     } catch (error) {
@@ -3019,6 +3947,14 @@ export class AssistantRuntime {
           traceId: `trace_${randomUUID()}`,
         },
       });
+      await this.pauseForOrchestrationToolErrorRecovery({
+        conversationId: executing.conversationId,
+        userId: executing.userId,
+        messageId: executing.messageId,
+        toolKind: "python_analysis",
+        toolCallId: executing.toolCallId,
+        message: failed.error?.message ?? "Python 分析执行失败。",
+      });
       await this.emitToolState(executing.conversationId);
       throw new Error(failed.error?.message ?? "Python 分析执行失败。");
     }
@@ -3027,6 +3963,7 @@ export class AssistantRuntime {
   private async executeOverallRiskReport(record: ToolCallRecord) {
     const executing = await this.toolResultRegistry.update(record.toolCallId, { status: "executing" });
     await this.emitToolState(record.conversationId);
+    try {
     const analysis = await this.toolResultRegistry.getLatestSuccessful(executing.conversationId, "python_analysis");
     const sourceSql = await this.toolResultRegistry.getLatestSuccessful(executing.conversationId, "sql_query");
     const dataSourceLabel = typeof executing.request.dataSourceLabel === "string"
@@ -3073,6 +4010,7 @@ export class AssistantRuntime {
       summary: completed.result?.summary ?? "报告已生成。",
       payload: { toolCallId: completed.toolCallId, artifactIds: [artifact.artifactId], version: completed.version },
     });
+    await this.createCompletedToolCheckpoint(completed);
     const message = executing.messageId
       ? this.updateMessage(executing.messageId, {
           status: "completed",
@@ -3094,6 +4032,29 @@ export class AssistantRuntime {
     });
     await this.emitToolState(executing.conversationId);
     return message;
+    } catch (error) {
+      const failed = await this.toolResultRegistry.update(executing.toolCallId, {
+        status: "failed",
+        completedAt: nowIso(),
+        error: {
+          code: "TOOL_EXECUTION_FAILED",
+          message: error instanceof Error ? error.message : "报告生成失败。",
+          conversationId: executing.conversationId,
+          toolCallId: executing.toolCallId,
+          traceId: `trace_${randomUUID()}`,
+        },
+      });
+      await this.pauseForOrchestrationToolErrorRecovery({
+        conversationId: executing.conversationId,
+        userId: executing.userId,
+        messageId: executing.messageId,
+        toolKind: "report_generation",
+        toolCallId: executing.toolCallId,
+        message: failed.error?.message ?? "报告生成失败。",
+      });
+      await this.emitToolState(executing.conversationId);
+      throw new Error(failed.error?.message ?? "报告生成失败。");
+    }
   }
 
   private async nextSkillWorkflowRecord(record: ToolCallRecord, toolKind: ToolKind) {
@@ -3511,7 +4472,9 @@ export class AssistantRuntime {
       conversationId: toolCall.conversationId,
       state: await this.toolResultRegistry.getConversationState(toolCall.conversationId),
     });
-    return (await this.toolResultRegistry.get(toolCall.id)) ?? record;
+    const saved = (await this.toolResultRegistry.get(toolCall.id)) ?? record;
+    await this.createCompletedToolCheckpoint(saved);
+    return saved;
   }
 
   private async registerPythonReportCard(
@@ -3617,7 +4580,9 @@ export class AssistantRuntime {
       conversationId: toolCall.conversationId,
       state: await this.toolResultRegistry.getConversationState(toolCall.conversationId),
     });
-    return (await this.toolResultRegistry.get(toolCallId)) ?? reportRecord;
+    const saved = (await this.toolResultRegistry.get(toolCallId)) ?? reportRecord;
+    await this.createCompletedToolCheckpoint(saved);
+    return saved;
   }
 
   private async createAssistantToolArtifacts(
@@ -3775,7 +4740,9 @@ export class AssistantRuntime {
         },
       });
       await this.toolResultRegistry.markLatestSuccessful(input.message.conversationId, input.toolCallId);
-      return (await this.toolResultRegistry.get(input.toolCallId)) ?? updated;
+      const saved = (await this.toolResultRegistry.get(input.toolCallId)) ?? updated;
+      await this.createCompletedToolCheckpoint(saved);
+      return saved;
     }
     const parents = (await Promise.all(input.parentKinds.map((toolKind) => this.toolResultRegistry.getLatestSuccessful(input.message.conversationId, toolKind))))
       .filter((record): record is ToolCallRecord => Boolean(record));
@@ -3850,7 +4817,9 @@ export class AssistantRuntime {
         sourceArtifactIds,
       },
     });
-    return (await this.toolResultRegistry.get(input.toolCallId)) ?? record;
+    const saved = (await this.toolResultRegistry.get(input.toolCallId)) ?? record;
+    await this.createCompletedToolCheckpoint(saved);
+    return saved;
   }
 
   private async emitToolState(conversationId: string) {
@@ -4332,6 +5301,18 @@ export class AssistantRuntime {
         }
       }
 
+      const latestMessage = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(assistantMessage.id));
+      if (
+        latestMessage.status === "waiting_for_user_input" ||
+        latestMessage.status === "waiting_for_parameters" ||
+        latestMessage.status === "waiting_for_field_selection" ||
+        latestMessage.status === "waiting_for_data_source" ||
+        latestMessage.status === "recoverable_error"
+      ) {
+        this.options.emit({ type: "message", conversationId: conversation.id, message: latestMessage });
+        return;
+      }
+
       const completed = this.updateMessage(assistantMessage.id, {
         status: "completed",
         content,
@@ -4351,11 +5332,17 @@ export class AssistantRuntime {
 
       const tool = detectToolFromAssistantOutput(content);
       const shouldStartSkillWorkflow = !providerToolActivity && shouldStartOverallRiskWorkflowAfterModelText(input, content);
+      const shouldStartFallbackTempCsvSql =
+        !providerToolActivity && !tool && !shouldStartSkillWorkflow
+          ? await this.routeFallbackTempCsvAnalysisSql(input, conversation, completed, content)
+          : false;
       if (!shouldStartSkillWorkflow) {
         await this.registerAssistantGeneratedArtifacts(input, completed);
       }
       if (tool && !shouldStartSkillWorkflow) {
         await this.handleToolCall(input, conversation, completed, tool, { appendToMessage: true });
+      } else if (shouldStartFallbackTempCsvSql) {
+        return;
       } else if (shouldStartSkillWorkflow) {
         await this.routeOverallRiskSkillWorkflow(input, conversation, completed);
       }
@@ -4444,6 +5431,56 @@ export class AssistantRuntime {
     assistantMessage: AssistantMessage,
     modelToolCallId: string,
   ) {
+    if (shouldAnalyzePriorSqlResult(input.prompt)) {
+      const { latestSqlToolCall, rows } = await this.latestSqlRowsForConversation(input.userId, conversation.id);
+      if (latestSqlToolCall) {
+        this.appendToolLog(
+          {
+            conversationId: conversation.id,
+            userId: input.userId,
+            kind: "python",
+          },
+          "workflow-routing",
+          "info",
+          "模型尝试发起 SQL 查询，但用户要求基于查询结果继续统计，已改路由为 Python 工具调用。",
+          {
+            prompt: input.prompt,
+            modelToolCallId,
+            latestSqlToolCallId: latestSqlToolCall.id,
+          },
+        );
+        const currentMessage = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(assistantMessage.id));
+        await this.handleToolCall(
+          input,
+          conversation,
+          currentMessage,
+          {
+            kind: "python",
+            script: this.buildPythonAnalysisScript(input.prompt, latestSqlToolCall, rows),
+          },
+          { appendToMessage: true },
+        );
+        return {
+          status: input.approvalMode === "request_approval" ? "waiting_approval" : "submitted",
+          toolCallId: modelToolCallId,
+          latestSqlToolCallId: latestSqlToolCall.id,
+          message: "已复用最近一次 SQL 查询结果，并改为发起 Python 分析工具调用。",
+        };
+      }
+    }
+
+    const toolState = await this.toolResultRegistry.getConversationState(conversation.id);
+    const repair = this.agentGuidance.validateToolRequest({ toolKind: "sql_query", request, toolState });
+    if (!repair.valid) {
+      return this.pauseForToolParameterRepairGuidance({
+        conversationId: conversation.id,
+        userId: input.userId,
+        assistantMessage,
+        toolKind: "sql_query",
+        modelToolCallId,
+        invalidParameters: repair.invalidParameters,
+      });
+    }
     const script = typeof request.sql === "string" ? request.sql : typeof request.script === "string" ? request.script : "";
     if (!script.trim()) {
       return {
@@ -4477,14 +5514,37 @@ export class AssistantRuntime {
     assistantMessage: AssistantMessage,
     modelToolCallId: string,
   ) {
+    const toolState = await this.toolResultRegistry.getConversationState(conversation.id);
+    const repair = this.agentGuidance.validateToolRequest({ toolKind: "python_analysis", request, toolState });
+    const scriptParameterMissing = typeof request.script !== "string" || !request.script.trim();
+    const invalidParameters = [
+      ...repair.invalidParameters,
+      ...(scriptParameterMissing && !repair.invalidParameters.some((item) => item.parameterName === "script")
+        ? [{
+            parameterName: "script",
+            value: request.script,
+            reason: "missing" as const,
+            message: "request_python_analysis_execution 需要提供非空 script 字段，才能执行受控 Python 分析。",
+          }]
+        : []),
+    ];
+    if (invalidParameters.length > 0) {
+      return this.pauseForToolParameterRepairGuidance({
+        conversationId: conversation.id,
+        userId: input.userId,
+        assistantMessage,
+        toolKind: "python_analysis",
+        modelToolCallId,
+        invalidParameters,
+      });
+    }
     const script = typeof request.script === "string" ? request.script : "";
     if (!script.trim()) {
-      const state = await this.toolResultRegistry.getConversationState(conversation.id);
       return {
         status: "waiting_input",
         toolCallId: modelToolCallId,
-        latestSqlToolCallId: state.latestSuccessfulSqlToolCallId,
-        latestSqlArtifactIds: state.latestSuccessfulSqlArtifactIds,
+        latestSqlToolCallId: toolState.latestSuccessfulSqlToolCallId,
+        latestSqlArtifactIds: toolState.latestSuccessfulSqlArtifactIds,
         message: "request_python_analysis_execution 需要提供 script 字段，或先完成可分析 SQL/Workflow 数据集。",
       };
     }
@@ -4512,6 +5572,18 @@ export class AssistantRuntime {
     assistantMessage: AssistantMessage,
     modelToolCallId: string,
   ) {
+    const toolState = await this.toolResultRegistry.getConversationState(assistantMessage.conversationId);
+    const repair = this.agentGuidance.validateToolRequest({ toolKind: "chart_rendering", request, toolState });
+    if (!repair.valid) {
+      return this.pauseForToolParameterRepairGuidance({
+        conversationId: assistantMessage.conversationId,
+        userId: input.userId,
+        assistantMessage,
+        toolKind: "chart_rendering",
+        modelToolCallId,
+        invalidParameters: repair.invalidParameters,
+      });
+    }
     const parsed = parseVisualizationSpecJson(JSON.stringify(request.visualizationSpec ?? {}), {
       allowInlineData: true,
       inlineDataMaxRows: 200,
@@ -4560,15 +5632,37 @@ export class AssistantRuntime {
     assistantMessage: AssistantMessage,
     modelToolCallId: string,
   ) {
+    const toolState = await this.toolResultRegistry.getConversationState(assistantMessage.conversationId);
+    const repair = this.agentGuidance.validateToolRequest({ toolKind: "report_generation", request, toolState });
     const markdown = typeof request.markdown === "string" ? request.markdown.trim() : "";
+    const invalidParameters = [
+      ...repair.invalidParameters,
+      ...(!markdown && !repair.invalidParameters.some((item) => item.parameterName === "markdown")
+        ? [{
+            parameterName: "markdown",
+            value: request.markdown,
+            reason: "missing" as const,
+            message: "request_markdown_report_generation 需要提供非空 markdown 字段；不能用空报告或虚构结论兜底。",
+          }]
+        : []),
+    ];
+    if (invalidParameters.length > 0) {
+      return this.pauseForToolParameterRepairGuidance({
+        conversationId: assistantMessage.conversationId,
+        userId: input.userId,
+        assistantMessage,
+        toolKind: "report_generation",
+        modelToolCallId,
+        invalidParameters,
+      });
+    }
     if (!markdown) {
-      const state = await this.toolResultRegistry.getConversationState(assistantMessage.conversationId);
       return {
         status: "waiting_input",
         toolCallId: modelToolCallId,
-        latestSqlToolCallId: state.latestSuccessfulSqlToolCallId,
-        latestPythonToolCallId: state.latestSuccessfulPythonToolCallId,
-        latestChartToolCallId: state.latestSuccessfulChartToolCallId,
+        latestSqlToolCallId: toolState.latestSuccessfulSqlToolCallId,
+        latestPythonToolCallId: toolState.latestSuccessfulPythonToolCallId,
+        latestChartToolCallId: toolState.latestSuccessfulChartToolCallId,
         message: "request_markdown_report_generation 需要提供 markdown 字段，或先完成报告内容生成。",
       };
     }
@@ -4656,7 +5750,7 @@ export class AssistantRuntime {
           "仅在本地脚本调试场景才输出 /sql 或 /python 代码块，客户端会按审批权限处理。",
           `当前数据源：${dataSourceLabel || "未选择"}`,
           `当前 Skill：${skill || "未选择"}`,
-          !skill ? "当前未选择 Skill。必须严格按用户自然语言请求生成内容；不得自行添加用户未要求的报告章节、模板栏目、核心风险指标、数据质量说明或口径说明。若用户只要求查询或分析，只输出与该请求直接相关的结果和必要解释。" : undefined,
+          !skill ? "当前未选择 Skill。必须严格按用户自然语言请求生成内容；只能使用用户显式点名的字段、筛选条件、统计指标和分析维度。不得自行添加用户未要求的报告章节、模板栏目、字段概览、交叉分布、数值字段汇总、核心风险指标、数据质量说明或口径说明。若用户只要求查询或分析，只输出与该请求直接相关的结果和必要解释。" : undefined,
           selectedSkillSystemPrompt(skill),
           `审批权限：${approvalMode}`,
           schemaContextMarkdown ? `\n以下是已授权数据源 Schema Context。请遵守其中 Usage Policy、安全约束和工具调用要求，不要基于样例行推断全量结论。\n${schemaContextMarkdown}` : undefined,

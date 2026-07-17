@@ -50,6 +50,14 @@ describe("tool orchestration", () => {
     await expect(tools.detectIntent({ conversationId: "c1", userMessage: "把刚才的数据画成横向柱状图" }))
       .resolves.toMatchObject({ intents: [{ toolKind: "chart_rendering" }] });
 
+    const priorResultAnalysis = await tools.detectIntent({
+      conversationId: "c1",
+      userMessage: "根据查询数据结果汇总分行 #一级分行名称 的最新风险分类为“关注”的合同总数以及全部分行的占比。",
+    });
+    expect(priorResultAnalysis.intents.map((item) => item.toolKind)).toEqual(["python_analysis"]);
+    await expect(tools.detectIntent({ conversationId: "c1", userMessage: "请根据分析结果生成报告" }))
+      .resolves.toMatchObject({ intents: [{ toolKind: "report_generation" }] });
+
     const combined = await tools.detectIntent({
       conversationId: "c1",
       userMessage: "查询近 6 个月逾期客户，分析风险特征，画图并生成报告",
@@ -68,6 +76,26 @@ describe("tool orchestration", () => {
     expect(chartPlan.steps).toHaveLength(1);
     expect(chartPlan.steps[0].toolKind).toBe("chart_rendering");
     expect(chartPlan.steps[0].dependencies).toEqual([]);
+
+    const priorResultPlan = await tools.buildPlan({
+      conversationId: "c2",
+      userId: "u",
+      userMessage: "根据查询数据结果汇总分行 #一级分行名称 的最新风险分类为“关注”的合同总数以及全部分行的占比。",
+    });
+    expect(priorResultPlan.steps).toHaveLength(1);
+    expect(priorResultPlan.steps[0].toolKind).toBe("python_analysis");
+    expect(priorResultPlan.steps[0].dependencies).toEqual([]);
+    expect(priorResultPlan.steps[0].inputStrategy).toBe("latest_sql");
+
+    const reportFromAnalysisPlan = await tools.buildPlan({
+      conversationId: "c2",
+      userId: "u",
+      userMessage: "请根据分析结果生成报告",
+    });
+    expect(reportFromAnalysisPlan.steps).toHaveLength(1);
+    expect(reportFromAnalysisPlan.steps[0].toolKind).toBe("report_generation");
+    expect(reportFromAnalysisPlan.steps[0].dependencies).toEqual([]);
+    expect(reportFromAnalysisPlan.steps[0].inputStrategy).toBe("latest_python");
 
     const fullPlan = await tools.buildPlan({
       conversationId: "c2",

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { buildGenericSqlResultAnalysisPythonScript, buildOverallRiskDistributionMarkdown, generalStreamSegmentId, generalTextStreamSegmentId, generatedReportArtifactId, generatedReportToolCallId, inferReportTitle, isPythonReportCardContent, isReportGenerationContent, reportStreamSegmentId, shouldAutoStartPythonReport, shouldRouteSkillThroughModel, shouldStartOverallRiskWorkflowAfterModelText } from "./assistantRuntime";
+import { buildFallbackTempCsvSqlForAnalysisRequest, buildGenericSqlResultAnalysisPythonScript, buildOverallRiskDistributionMarkdown, generalStreamSegmentId, generalTextStreamSegmentId, generatedReportArtifactId, generatedReportToolCallId, inferReportTitle, isPythonReportCardContent, isReportGenerationContent, reportStreamSegmentId, shouldAnalyzePriorSqlResult, shouldAutoStartPythonReport, shouldGenerateReportFromAnalysisResult, shouldRouteSkillThroughModel, shouldStartOverallRiskWorkflowAfterModelText } from "./assistantRuntime";
+import type { ChatCsvSelectedFieldRef, ConversationTempCsvTable } from "./chatCsvTempSource";
 
 describe("AssistantRuntime workflow intent", () => {
   it("starts Python report flow for one-shot SQL, chart, and report requests", () => {
@@ -16,6 +17,15 @@ describe("AssistantRuntime workflow intent", () => {
 
   it("continues with Python analysis for SQL summary and analysis requests", () => {
     expect(shouldAutoStartPythonReport("查询各个分行 #一级分行名称 的 #短中长期贷款标识 中“中期”和“长期”的数据汇总和分析。")).toBe(true);
+  });
+
+  it("recognizes query-result summary requests as prior SQL analysis", () => {
+    expect(shouldAnalyzePriorSqlResult("根据查询数据结果汇总分行 #一级分行名称 的最新风险分类为“关注”的合同总数以及全部分行的占比。")).toBe(true);
+  });
+
+  it("recognizes latest analysis result report generation requests", () => {
+    expect(shouldGenerateReportFromAnalysisResult("请根据分析结果生成报告")).toBe(true);
+    expect(shouldGenerateReportFromAnalysisResult("请基于上一轮分析整理成 Markdown 报告")).toBe(true);
   });
 
   it("routes selected overall risk skill through model orchestration instead of local history fallback", () => {
@@ -100,11 +110,122 @@ describe("AssistantRuntime workflow intent", () => {
     expect(script).not.toContain("数据质量与口径说明");
   });
 
+  it("keeps generic SQL result analysis limited to requested field and count intent", () => {
+    const script = buildGenericSqlResultAnalysisPythonScript(
+      "根据查询数据结果汇总分行 #一级分行名称 的最新风险分类为“关注”的合同总数以及全部分行的占比。",
+      [
+        { __row_index: 1, 一级分行名称: "上海分行", 最新风险分类: "关注", 业务品种大类: "流贷" },
+        { __row_index: 2, 一级分行名称: "北京分行", 最新风险分类: "正常", 业务品种大类: "个贷" },
+      ],
+    );
+
+    expect(script).toContain("合同总数");
+    expect(script).toContain("全部分行占比");
+    expect(script).toContain("filter_rows_by_requested_values");
+    expect(script).not.toContain("行数 |");
+    expect(script).not.toContain("行数占比");
+    expect(script).not.toContain("__row_index合计");
+    expect(script).not.toContain("__row_index占比");
+    expect(script).not.toContain("交叉分布");
+    expect(script).not.toContain("数值字段汇总");
+    expect(script).not.toContain("字段概览");
+    expect(script).not.toContain("inferred_dimensions");
+    expect(script).not.toContain("inferred_measures");
+  });
+
   it("treats Python markdown analysis output as report-card content only for analysis/report requests", () => {
     const markdown = "# SQL 查询结果分析\n\n## 按 分行 分布\n| 分行 | 行数 | 占比 |\n|---|---:|---:|\n| 杭州 | 2 | 100% |";
 
     expect(isPythonReportCardContent("查询各分行数据汇总和分析。", markdown)).toBe(true);
     expect(isPythonReportCardContent("查询前 20 条明细。", "工具执行完成。")).toBe(false);
+  });
+
+  it("builds fallback CSV SQL when the model only acknowledges a field-based report request", () => {
+    const source: ConversationTempCsvTable = {
+      tempTableId: "temp-table-1",
+      tempDataSourceId: "temp-source-1",
+      conversationId: "conversation-1",
+      userId: "user-1",
+      fileName: "loan.csv",
+      fileSizeBytes: 100,
+      sqliteTableName: "chat_csv_conv_1",
+      rowCount: 10,
+      columnCount: 3,
+      status: "ready",
+      createdAt: "2026-07-17T00:00:00.000Z",
+      updatedAt: "2026-07-17T00:00:00.000Z",
+      columns: [
+        {
+          ordinalPosition: 0,
+          sourceHeader: "一级分行名称",
+          sqliteColumnName: "一级分行名称",
+          displayName: "一级分行名称",
+          inferredLogicalType: "category",
+          sqliteType: "TEXT",
+        },
+        {
+          ordinalPosition: 1,
+          sourceHeader: "最新风险五级分类",
+          sqliteColumnName: "最新风险五级分类",
+          displayName: "最新风险五级分类",
+          inferredLogicalType: "category",
+          sqliteType: "TEXT",
+        },
+        {
+          ordinalPosition: 2,
+          sourceHeader: "贷款余额（万元）",
+          sqliteColumnName: "贷款余额（万元）",
+          displayName: "贷款余额（万元）",
+          inferredLogicalType: "decimal",
+          sqliteType: "REAL",
+        },
+      ],
+    };
+    const prompt = "请统计 #一级分行名称 上海分行的数据中 #最新风险五级分类 不同分类的数据汇总，再输出分析结果报告。";
+    const fields: ChatCsvSelectedFieldRef[] = [
+      {
+        tokenId: "token-branch",
+        type: "csv_field",
+        tempDataSourceId: "temp-source-1",
+        tempTableId: "temp-table-1",
+        fieldId: "branch",
+        sourceHeader: "一级分行名称",
+        physicalName: "一级分行名称",
+        displayName: "一级分行名称",
+        logicalType: "category",
+        sqliteType: "TEXT",
+        rawText: "#一级分行名称",
+        start: prompt.indexOf("#一级分行名称"),
+        end: prompt.indexOf("#一级分行名称") + "#一级分行名称".length,
+        createdAt: "2026-07-17T00:00:00.000Z",
+        status: "valid",
+      },
+      {
+        tokenId: "token-risk",
+        type: "csv_field",
+        tempDataSourceId: "temp-source-1",
+        tempTableId: "temp-table-1",
+        fieldId: "risk",
+        sourceHeader: "最新风险五级分类",
+        physicalName: "最新风险五级分类",
+        displayName: "最新风险五级分类",
+        logicalType: "category",
+        sqliteType: "TEXT",
+        rawText: "#最新风险五级分类",
+        start: prompt.indexOf("#最新风险五级分类"),
+        end: prompt.indexOf("#最新风险五级分类") + "#最新风险五级分类".length,
+        createdAt: "2026-07-17T00:00:00.000Z",
+        status: "valid",
+      },
+    ];
+
+    const sql = buildFallbackTempCsvSqlForAnalysisRequest(prompt, source, fields);
+
+    expect(sql).toContain('from "chat_csv_conv_1"');
+    expect(sql).toContain('where "一级分行名称" = \'上海分行\'');
+    expect(sql).toContain('group by "最新风险五级分类"');
+    expect(sql).toContain('sum("贷款余额（万元）") as "贷款余额（万元）合计"');
+    expect(sql).not.toContain("整体风险分类分布");
   });
 });
 

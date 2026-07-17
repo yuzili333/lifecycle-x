@@ -4,6 +4,7 @@ import {
   createChatFieldToken,
   fieldsFromChatCsvAttachment,
   filterConversationCsvFields,
+  findCsvFieldTokenMatchesInText,
   findChatFieldMention,
   insertFieldTokenText,
   removeFieldTokenText,
@@ -121,5 +122,13 @@ describe("chat field selector field operations", () => {
     expect(upsertFieldToken([], token)).toHaveLength(1);
     expect(upsertFieldToken([token], token)).toHaveLength(1);
     expect(removeFieldTokenText(nextText, token)).toBe("分析 的分布");
+  });
+
+  it("finds pasted CSV field token text from active fields", () => {
+    const fields = fieldsFromChatCsvAttachment(attachment);
+    const matches = findCsvFieldTokenMatchesInText("查询 #五级分类 和 #贷款余额（万元） 的分布", fields);
+
+    expect(matches.map((match) => match.rawText)).toEqual(["#五级分类", "#贷款余额（万元）"]);
+    expect(matches.map((match) => match.field.displayName)).toEqual(["五级分类", "贷款余额（万元）"]);
   });
 });
