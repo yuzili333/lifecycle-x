@@ -4,6 +4,7 @@ import { Badge } from "@astryxdesign/core/Badge";
 import { Button } from "@astryxdesign/core/Button";
 import {
   ChatComposer,
+  ChatComposerDrawer,
   ChatLayout,
   ChatMessage,
   ChatMessageBubble,
@@ -15,7 +16,6 @@ import {
   type ChatToolCallItem,
   type ChatComposerToken,
   type ChatComposerInputHandle,
-  type ChatComposerTrigger,
 } from "@astryxdesign/core/Chat";
 import { CodeBlock } from "@astryxdesign/core/CodeBlock";
 import { Dialog } from "@astryxdesign/core/Dialog";
@@ -30,8 +30,7 @@ import { Text } from "@astryxdesign/core/Text";
 import { Token } from "@astryxdesign/core/Token";
 import { Toolbar } from "@astryxdesign/core/Toolbar";
 import { Tooltip } from "@astryxdesign/core/Tooltip";
-import type { SearchableItem, SearchSource } from "@astryxdesign/core/Typeahead";
-import { CircleAlert, Clock, Copy, FileText, LoaderCircle, Maximize2, Minimize2, Pencil, Plus, RotateCcw, Sparkles, Trash2, X, type LucideIcon } from "lucide-react";
+import { CircleAlert, Clock, Copy, FileSpreadsheet, FileText, LoaderCircle, Maximize2, Minimize2, Pencil, Plus, RotateCcw, Sparkles, Trash2, X, type LucideIcon } from "lucide-react";
 import type { AuthFailure, AuthUser } from "./auth";
 import { useAppToast } from "./useAppToast";
 import { workbenchApi, type ApiResult, type DataSourceSummary } from "./workbenchApi";
@@ -160,8 +159,6 @@ type ContextTokenDisplay = {
   values: string[];
 };
 
-type CsvFieldSearchItem = SearchableItem<ConversationCsvField>;
-
 type AssistantComposerDraft = ChatComposerDraftState<AssistantSkill, ChatCsvSelectedFieldRef>;
 
 type AssistantComposerDraftSnapshot = {
@@ -285,14 +282,6 @@ function buildContextTokenDisplay(input: ContextTokenInput): ContextTokenDisplay
   }
 
   return { tokens, values };
-}
-
-function isNativeChatComposerFieldMention(value: string, mention: ChatFieldMention) {
-  if (mention.start === 0) {
-    return true;
-  }
-  const previous = value[mention.start - 1];
-  return previous === " " || previous === "\n";
 }
 
 function childNodeIndex(node: ChildNode) {
@@ -427,12 +416,14 @@ function extractMarkdownTitle(content: string, fallback: string) {
 }
 
 function isAssistantArtifactMessage(message: AssistantMessage, toolState?: ConversationToolState | null) {
+  const reportArtifactId = reportArtifactIdForMessage(message, toolState);
   return (
     message.role === "assistant" &&
-    message.content.trim().length > 0 &&
-    message.blocks.some((block) => block.type === "markdown" && !isRenderableCodeLanguage(block.language)) &&
-    !message.blocks.some((block) => block.toolCallId) &&
-    Boolean(reportRecordForMessage(message, toolState))
+    Boolean(reportRecordForMessage(message, toolState)) &&
+    (Boolean(reportArtifactId) ||
+      (message.content.trim().length > 0 &&
+        message.blocks.some((block) => block.type === "markdown" && !isRenderableCodeLanguage(block.language)) &&
+        !message.blocks.some((block) => block.toolCallId)))
   );
 }
 
@@ -988,6 +979,7 @@ export function DataAssistantWorkspace({
   const [streamContentRevision, setStreamContentRevision] = useState(0);
   const streamSegmentManagerRef = useRef(new StreamSegmentManager());
   const chatCsvInputRef = useRef<HTMLInputElement | null>(null);
+  const removedChatCsvAttachmentIdsRef = useRef<Set<string>>(new Set());
   const composerInputRef = useRef<ChatComposerInputHandle | null>(null);
   const composerShellRef = useRef<HTMLDivElement | null>(null);
   const composerBlurTimerRef = useRef<number | null>(null);
@@ -1173,15 +1165,30 @@ export function DataAssistantWorkspace({
   const activePendingPythonToolCallId = useMemo(() => pendingPythonToolCallId(activeMessages), [activeMessages]);
   const landingUserName = user?.displayName?.trim() || user?.username || "Yuzili";
   const activeArtifactMessage = useMemo(
-    () =>
-      artifactWindow.isOpen && artifactWindow.messageId
-        ? activeMessages.find((message) => message.id === artifactWindow.messageId && isAssistantArtifactMessage(message, activeToolState)) ?? null
-        : null,
-    [activeMessages, activeToolState, artifactWindow.isOpen, artifactWindow.messageId],
+    () => {
+      if (!artifactWindow.isOpen || !artifactWindow.messageId) {
+        return null;
+      }
+      const message = activeMessages.find((item) => item.id === artifactWindow.messageId);
+      if (!message) {
+        return null;
+      }
+      if (isAssistantArtifactMessage(message, activeToolState)) {
+        return message;
+      }
+      const contentState = artifactContentByMessage[message.id];
+      return message.role === "assistant" && contentState?.artifactId ? message : null;
+    },
+    [activeMessages, activeToolState, artifactContentByMessage, artifactWindow.isOpen, artifactWindow.messageId],
   );
   const activeArtifactContent = activeArtifactMessage ? artifactContentByMessage[activeArtifactMessage.id] : undefined;
   const activeReportRecords = useMemo(() => reportRecordsForState(activeToolState), [activeToolState]);
   const activeArtifactReportRecord = activeArtifactMessage ? reportRecordForMessage(activeArtifactMessage, activeToolState) : undefined;
+  const activeArtifactTitle = activeArtifactMessage
+    ? typeof activeArtifactReportRecord?.request.title === "string" && activeArtifactReportRecord.request.title.trim()
+      ? activeArtifactReportRecord.request.title.trim()
+      : artifactTitle(activeArtifactMessage)
+    : "";
   const isStreaming = activeMessages.some((message) => message.role === "assistant" && (message.status === "receiving" || message.status === "processing"));
   const activeStreamingMessageId = activeMessages.find((message) => message.role === "assistant" && (message.status === "receiving" || message.status === "processing"))?.id;
   const activeChatCsvAttachments = activeConversation ? chatCsvAttachmentsByConversation[activeConversation.id] ?? [] : [];
@@ -1227,82 +1234,13 @@ export function DataAssistantWorkspace({
       }),
     [activeCsvFields, fieldSelectorQuery, recentFieldIds, selectedFieldIds],
   );
-  const csvFieldSearchSource = useMemo<SearchSource<CsvFieldSearchItem>>(() => {
-    const fieldItems = (query: string) =>
-      selectConversationCsvFields({
-        fields: activeCsvFields,
-        query,
-        selectedFieldIds,
-        recentFieldIds,
-      })
-        .map((field) => ({
-          id: field.fieldId,
-          label: field.displayName,
-          auxiliaryData: field,
-        }));
-    return {
-      bootstrap: () => fieldItems(""),
-      search: (query: string) => fieldItems(query),
-    };
-  }, [activeCsvFields, recentFieldIds, selectedFieldIds]);
-  const fieldComposerTriggers = useMemo<ChatComposerTrigger[]>(
-    () =>
-      activeCsvFields.length > 0 && !isComposerComposing
-        ? [
-            {
-              character: "#",
-              searchSource: csvFieldSearchSource,
-              menuLabel: "选择 CSV 字段",
-              emptySearchResultsText: "未找到匹配字段",
-              loadingText: "正在查找字段...",
-              renderItem: (item) => {
-                const field = item.auxiliaryData as ConversationCsvField | undefined;
-                return (
-                  <span className="assistant-tool-selector-item-label">
-                    <span className="assistant-tool-selector-item-title">
-                      {field && selectedFieldIds.has(field.fieldId) ? "✓ " : ""}
-                      {item.label}
-                    </span>
-                    {field && <Badge label={field.sqliteType} variant="neutral" />}
-                  </span>
-                );
-              },
-              onSelect: (item) => {
-                const field = item.auxiliaryData as ConversationCsvField | undefined;
-                if (!field) {
-                  return item.label;
-                }
-                const valueBeforeInsert = composerInputRef.current?.getValue() ?? composerValue;
-                const mention = findChatFieldMention(valueBeforeInsert) ?? {
-                  start: valueBeforeInsert.length,
-                  end: valueBeforeInsert.length,
-                  query: "",
-                };
-                const fieldToken = createChatFieldToken(field, mention);
-                setSelectedFieldRefs((current) => upsertFieldToken(current, fieldToken));
-                setRecentFieldIds((current) => [field.fieldId, ...current.filter((fieldId) => fieldId !== field.fieldId)].slice(0, 20));
-                setSuppressedFieldMentionKey(null);
-                setFieldSelectorOpen(false);
-                setFieldMention(null);
-                return {
-                  value: fieldToken.rawText,
-                  label: fieldToken.rawText,
-                  variant: "teal",
-                };
-              },
-            },
-          ]
-        : [],
-    [activeCsvFields.length, composerValue, csvFieldSearchSource, isComposerComposing, selectedFieldIds],
-  );
   const composerContextTokenDisplay = useMemo(
     () =>
       buildContextTokenDisplay({
-        files: messageTempDataSourceLabels,
         skill: selectedSkill,
         dataSourceLabel: selectedDataSource ? dataSourceLabel(selectedDataSource) : null,
       }),
-    [messageTempDataSourceLabels, selectedDataSource, selectedSkill],
+    [selectedDataSource, selectedSkill],
   );
   const toolSelectorQuery = toolSelectorTrigger === "at_symbol" && toolMention ? toolMention.query : "";
   const toolDataSources = useMemo<ChatToolDataSourceOption[]>(
@@ -1687,21 +1625,10 @@ export function DataAssistantWorkspace({
 
   useEffect(() => {
     if (isComposerComposing) {
-      if (fieldSelectorOpen) {
-        setFieldSelectorOpen(false);
-        setFieldMention(null);
-      }
       return;
     }
     const mention = findChatFieldMention(composerValue);
     if (mention && activeCsvFields.length > 0) {
-      if (isNativeChatComposerFieldMention(composerValue, mention)) {
-        if (fieldSelectorOpen) {
-          setFieldSelectorOpen(false);
-          setFieldMention(null);
-        }
-        return;
-      }
       if (chatFieldMentionKey(composerValue, mention) === suppressedFieldMentionKey) {
         return;
       }
@@ -1833,6 +1760,17 @@ export function DataAssistantWorkspace({
           fileBuffer: new Uint8Array(buffer),
           mimeType: file.type || "text/csv",
         });
+        if (removedChatCsvAttachmentIdsRef.current.has(localAttachment.attachmentId)) {
+          removedChatCsvAttachmentIdsRef.current.delete(localAttachment.attachmentId);
+          if (imported.tempDataSourceId) {
+            await window.lifecycleX.assistant.removeConversationCsvAttachment(user.id, conversation.id, imported.tempDataSourceId);
+          }
+          setChatCsvAttachmentsByConversation((current) => ({
+            ...current,
+            [conversation.id]: (current[conversation.id] ?? []).filter((item) => item.attachmentId !== localAttachment.attachmentId && item.tempDataSourceId !== imported.tempDataSourceId),
+          }));
+          return;
+        }
         setChatCsvAttachmentsByConversation((current) => ({
           ...current,
           [conversation.id]: [imported, ...(current[conversation.id] ?? []).filter((item) => item.attachmentId !== localAttachment.attachmentId && item.tempDataSourceId !== imported.tempDataSourceId)],
@@ -1941,6 +1879,10 @@ export function DataAssistantWorkspace({
       if (activeElement && composerShellRef.current?.contains(activeElement)) {
         return;
       }
+      if (fieldSelectorOpen) {
+        closeFieldSelector();
+        return;
+      }
       if (toolSelectorTrigger !== "at_symbol") {
         return;
       }
@@ -1953,7 +1895,7 @@ export function DataAssistantWorkspace({
       setToolSelectorTrigger(null);
       setToolMention(null);
     }, 0);
-  }, [composerValue, toolMention, toolSelectorTrigger]);
+  }, [closeFieldSelector, composerValue, fieldSelectorOpen, toolMention, toolSelectorTrigger]);
 
   const selectSkillFromToolSelector = useCallback(
     (skill: AssistantSkill) => {
@@ -1992,16 +1934,6 @@ export function DataAssistantWorkspace({
     closeToolSelector();
     chatCsvInputRef.current?.click();
   }, [clearActiveToolMention, closeToolSelector]);
-
-  const handleFieldSelectorOpenChange = useCallback((isOpen: boolean) => {
-    setFieldSelectorOpen(isOpen);
-    if (!isOpen) {
-      if (fieldMention) {
-        setSuppressedFieldMentionKey(chatFieldMentionKey(composerValue, fieldMention));
-      }
-      setFieldMention(null);
-    }
-  }, [composerValue, fieldMention]);
 
   const selectCsvField = useCallback(
     (field: ConversationCsvField) => {
@@ -2053,11 +1985,16 @@ export function DataAssistantWorkspace({
 
   const removeChatCsvAttachment = useCallback(
     async (attachment: ChatCsvAttachment) => {
-      if (!user?.id || !activeConversation?.id || !window.lifecycleX?.assistant || !attachment.tempDataSourceId) {
+      if (!activeConversation?.id) {
         return;
       }
       try {
-        await window.lifecycleX.assistant.removeConversationCsvAttachment(user.id, activeConversation.id, attachment.tempDataSourceId);
+        if (attachment.status === "importing" || attachment.status === "validating" || attachment.status === "parsing") {
+          removedChatCsvAttachmentIdsRef.current.add(attachment.attachmentId);
+        }
+        if (user?.id && window.lifecycleX?.assistant && attachment.tempDataSourceId) {
+          await window.lifecycleX.assistant.removeConversationCsvAttachment(user.id, activeConversation.id, attachment.tempDataSourceId);
+        }
         setChatCsvAttachmentsByConversation((current) => ({
           ...current,
           [activeConversation.id]: (current[activeConversation.id] ?? []).filter((item) => item.attachmentId !== attachment.attachmentId),
@@ -2200,14 +2137,14 @@ export function DataAssistantWorkspace({
     setComposerValue(message.content);
   }, []);
 
-  const openArtifact = useCallback((message: AssistantMessage) => {
+  const openArtifact = useCallback((message: AssistantMessage, explicitArtifactId?: string) => {
     setArtifactWindow({
       messageId: message.id,
       isOpen: true,
       isMinimized: false,
       isMaximized: false,
     });
-    const artifactId = reportArtifactIdForMessage(message, activeToolState);
+    const artifactId = explicitArtifactId ?? reportArtifactIdForMessage(message, activeToolState);
     if (!artifactId || !user?.id || !window.lifecycleX?.assistant) {
       setArtifactContentByMessage((current) => ({
         ...current,
@@ -2893,7 +2830,7 @@ export function DataAssistantWorkspace({
           dataSourceCount={dataSourceMeta.count}
           dataSourceLabels={dataSourceMeta.labels}
           generatedAt={formatArtifactGeneratedAt(generatedAt)}
-          onOpen={() => openArtifact(message)}
+          onOpen={() => openArtifact(message, artifactId)}
         />
       </div>
     );
@@ -2943,6 +2880,18 @@ export function DataAssistantWorkspace({
               ? renderReportBufferBlock(block, message.role, message.status, segmentId)
             : renderBlock(block, message.role, message.status),
         )}
+        {shouldShowReportCard && segmentId && reportBlockIndex < 0
+          ? renderReportReplacementBlock(
+              message,
+              {
+                id: `report-card-${segmentId}`,
+                type: "markdown",
+                content: "",
+              },
+              message.status,
+              segmentId,
+            )
+          : null}
       </div>
     );
   };
@@ -3125,40 +3074,6 @@ export function DataAssistantWorkspace({
                 onBlurCapture={handleComposerBlurCapture}
                 onFocusCapture={handleComposerFocusCapture}
               >
-                {activeChatCsvAttachments.length > 0 && (
-                  <div className="assistant-chat-csv-attachments" aria-label="会话临时 CSV">
-                    {activeChatCsvAttachments.map((attachment) => (
-                      <div
-                        key={attachment.attachmentId}
-                        className={`assistant-chat-csv-chip ${attachment.status}`}
-                        title={attachment.error?.message ?? `${attachment.fileName} · ${attachment.sqliteTableName ?? "导入中"}`}
-                      >
-                        <span className="assistant-chat-csv-chip-main">
-                          <span className="assistant-chat-csv-chip-name">{attachment.fileName}</span>
-                          <span className="assistant-chat-csv-chip-meta">
-                            {attachment.status === "ready"
-                              ? `${attachment.rowCount ?? 0} 行 · ${attachment.columnCount ?? 0} 列`
-                              : attachment.status === "failed"
-                                ? attachment.error?.message ?? "导入失败"
-                                : "导入中"}
-                            {" · "}
-                            {formatFileSize(attachment.fileSizeBytes)}
-                          </span>
-                        </span>
-                        {attachment.status === "ready" && (
-                          <button
-                            type="button"
-                            className="assistant-chat-csv-chip-remove"
-                            aria-label={`移除 ${attachment.fileName}`}
-                            onClick={() => void removeChatCsvAttachment(attachment)}
-                          >
-                            <Icon icon={X} size="xsm" color="inherit" />
-                          </button>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                )}
                 <input
                   ref={chatCsvInputRef}
                   type="file"
@@ -3181,10 +3096,86 @@ export function DataAssistantWorkspace({
                   isStopShown={isStreaming}
                   placeholder="问问数据助手"
                   density="compact"
+                  drawer={
+                    fieldSelectorOpen || activeChatCsvAttachments.length > 0 ? (
+                      <div className="assistant-composer-drawer-stack">
+                        {fieldSelectorOpen && (
+                          <div
+                            className="assistant-field-selector-panel"
+                            role="region"
+                            aria-label="选择 CSV 字段"
+                            onMouseDown={(event) => event.preventDefault()}
+                          >
+                            <div className="assistant-field-selector-heading">
+                              <strong>选择 CSV 字段</strong>
+                              {activeFieldCsvAttachment?.fileName && <span>{activeFieldCsvAttachment.fileName}</span>}
+                            </div>
+                            {activeCsvFields.length === 0 ? (
+                              <div className="assistant-tool-selector-empty">当前 CSV 文件没有可用字段</div>
+                            ) : filteredCsvFields.length === 0 ? (
+                              <div className="assistant-tool-selector-empty">未找到匹配字段</div>
+                            ) : (
+                              <div className="assistant-field-selector-results" role="listbox" aria-label="CSV 字段列表">
+                                {filteredCsvFields.map((field) => (
+                                  <button
+                                    type="button"
+                                    key={field.fieldId}
+                                    className="assistant-field-selector-item"
+                                    role="option"
+                                    aria-selected={selectedFieldIds.has(field.fieldId)}
+                                    onClick={() => selectCsvField(field)}
+                                  >
+                                    <span className="assistant-tool-selector-item-label">
+                                      <span className="assistant-tool-selector-item-title">
+                                        {selectedFieldIds.has(field.fieldId) ? "✓ " : ""}
+                                        {field.displayName}
+                                      </span>
+                                    </span>
+                                    <Badge label={field.sqliteType} variant="neutral" />
+                                  </button>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        )}
+                        {activeChatCsvAttachments.length > 0 && (
+                          <ChatComposerDrawer
+                            count={activeChatCsvAttachments.length}
+                            label="Files"
+                            defaultIsCollapsed
+                            className="assistant-composer-file-drawer"
+                            aria-label="已上传文件"
+                          >
+                            <div className="assistant-composer-file-tokens">
+                              {activeChatCsvAttachments.map((attachment) => {
+                                const meta = attachment.status === "ready"
+                                  ? `${attachment.rowCount ?? 0} 行 · ${attachment.columnCount ?? 0} 列`
+                                  : attachment.status === "failed"
+                                    ? attachment.error?.message ?? "导入失败"
+                                    : "导入中";
+                                const color = attachment.status === "failed" ? "red" : attachment.status === "ready" ? "green" : "gray";
+                                return (
+                                  <Token
+                                    key={attachment.attachmentId}
+                                    label={attachment.fileName}
+                                    color={color}
+                                    size="sm"
+                                    icon={<Icon icon={FileSpreadsheet} size="xsm" color="inherit" />}
+                                    description={`${attachment.fileName} · ${meta} · ${formatFileSize(attachment.fileSizeBytes)}`}
+                                    endContent={<span className="assistant-composer-file-token-meta">{meta}</span>}
+                                    onRemove={() => void removeChatCsvAttachment(attachment)}
+                                  />
+                                );
+                              })}
+                            </div>
+                          </ChatComposerDrawer>
+                        )}
+                      </div>
+                    ) : undefined
+                  }
                   input={
                     <ChatComposerInput
                       handleRef={composerInputRef}
-                      triggers={fieldComposerTriggers}
                       debounceMs={0}
                       maxRows={8}
                       onCompositionStart={() => setIsComposerComposing(true)}
@@ -3193,51 +3184,6 @@ export function DataAssistantWorkspace({
                   }
                   footerActions={
                     <div className="assistant-composer-actions" aria-label="数据助手工具栏">
-                      <DropdownMenu
-                        hasChevron={false}
-                        isMenuOpen={fieldSelectorOpen}
-                        onOpenChange={handleFieldSelectorOpenChange}
-                        placement="above"
-                        menuWidth={340}
-                        button={{
-                          label: "CSV字段",
-                          variant: "ghost",
-                          size: "sm",
-                          className: "assistant-field-selector-anchor",
-                          isIconOnly: true,
-                        }}
-                      >
-                        <div className="assistant-field-selector-menu" role="presentation">
-                          <div className="assistant-field-selector-heading">
-                            <strong>选择 CSV 字段</strong>
-                            {activeFieldCsvAttachment?.fileName && <span>{activeFieldCsvAttachment.fileName}</span>}
-                          </div>
-                          {activeCsvFields.length === 0 ? (
-                            <div className="assistant-tool-selector-empty">当前 CSV 文件没有可用字段</div>
-                          ) : filteredCsvFields.length === 0 ? (
-                            <div className="assistant-tool-selector-empty">未找到匹配字段</div>
-                          ) : (
-                            <div className="assistant-field-selector-results" role="listbox" aria-label="CSV 字段列表">
-                              {filteredCsvFields.map((field) => (
-                                <DropdownMenuItem
-                                  key={field.fieldId}
-                                  className="assistant-tool-selector-menu-item"
-                                  label={
-                                    <span className="assistant-tool-selector-item-label">
-                                      <span className="assistant-tool-selector-item-title">
-                                        {selectedFieldIds.has(field.fieldId) ? "✓ " : ""}
-                                        {field.displayName}
-                                      </span>
-                                    </span>
-                                  }
-                                  endContent={<Badge label={field.sqliteType} variant="neutral" />}
-                                  onClick={() => selectCsvField(field)}
-                                />
-                              ))}
-                            </div>
-                          )}
-                        </div>
-                      </DropdownMenu>
                       <DropdownMenu
                         hasChevron={false}
                         isMenuOpen={toolSelectorOpen}
@@ -3379,7 +3325,7 @@ export function DataAssistantWorkspace({
                     <Icon icon={FileText} size="sm" color="secondary" />
                     <VStack gap={0}>
                       <Text type="label" weight="semibold">
-                        {artifactTitle(activeArtifactMessage)}
+                        {activeArtifactTitle}
                       </Text>
                       <Text type="supporting" color="secondary">
                         生成于 {formatArtifactGeneratedAt(activeArtifactMessage.createdAt)}

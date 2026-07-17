@@ -669,7 +669,7 @@ button {
   min-height: 92px;
 }
 
-.assistant-composer-shell .astryx-chat-composer > * {
+.assistant-composer-shell .astryx-chat-composer > *:not(.astryx-chat-composer-drawer) {
   padding: 16px !important;
 }
 
@@ -685,94 +685,6 @@ button {
   display: none;
 }
 
-.assistant-chat-csv-attachments {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  width: 100%;
-  max-width: 100%;
-  min-width: 0;
-  margin-bottom: 8px;
-}
-
-.assistant-chat-csv-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  box-sizing: border-box;
-  max-width: min(100%, 360px);
-  min-width: 0;
-  min-height: 34px;
-  padding: 5px 6px 5px 10px;
-  border: 1px solid color-mix(in srgb, var(--workbench-accent, #65d6d2) 34%, transparent);
-  border-radius: 6px;
-  color: color-mix(in srgb, var(--workbench-foreground, #e6edf6) 90%, transparent);
-  background: color-mix(in srgb, var(--workbench-background, #0f1724) 78%, var(--workbench-accent, #65d6d2));
-}
-
-.assistant-chat-csv-chip.importing,
-.assistant-chat-csv-chip.validating,
-.assistant-chat-csv-chip.parsing {
-  border-color: color-mix(in srgb, var(--workbench-accent, #65d6d2) 46%, transparent);
-  background: color-mix(in srgb, var(--workbench-background, #0f1724) 70%, var(--workbench-accent, #65d6d2));
-}
-
-.assistant-chat-csv-chip.failed {
-  border-color: color-mix(in srgb, #f87171 54%, transparent);
-  background: color-mix(in srgb, var(--workbench-background, #0f1724) 78%, #f87171);
-}
-
-.assistant-chat-csv-chip-main {
-  display: grid;
-  gap: 1px;
-  min-width: 0;
-  flex: 1 1 auto;
-}
-
-.assistant-chat-csv-chip-name,
-.assistant-chat-csv-chip-meta {
-  display: block;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.assistant-chat-csv-chip-name {
-  font-size: 12px;
-  font-weight: 650;
-  line-height: 1.25;
-}
-
-.assistant-chat-csv-chip-meta {
-  color: color-mix(in srgb, var(--workbench-foreground, #e6edf6) 62%, transparent);
-  font-size: 11px;
-  line-height: 1.25;
-}
-
-.assistant-chat-csv-chip-remove {
-  display: inline-grid;
-  flex: 0 0 auto;
-  width: 22px;
-  height: 22px;
-  padding: 0;
-  place-items: center;
-  border: 0;
-  border-radius: 5px;
-  color: inherit;
-  background: transparent;
-  cursor: pointer;
-}
-
-.assistant-chat-csv-chip-remove:hover {
-  background: color-mix(in srgb, var(--workbench-foreground, #e6edf6) 12%, transparent);
-}
-
-.assistant-chat-csv-chip-remove:focus-visible {
-  outline: 2px solid var(--workbench-accent, #65d6d2);
-  outline-offset: 2px;
-}
-
 .assistant-composer-context-tokens {
   display: flex;
   width: 100%;
@@ -786,6 +698,53 @@ button {
   flex-wrap: wrap;
   gap: 6px;
   min-width: 0;
+}
+
+.assistant-composer-drawer-stack {
+  display: grid;
+  gap: 8px;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.assistant-field-selector-panel {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--workbench-foreground, #e6edf6) 12%, transparent);
+  border-radius: 8px;
+  background: var(--workbench-surface, #111827);
+}
+
+.assistant-composer-file-drawer {
+  max-width: 100%;
+  min-width: 0;
+}
+
+.assistant-composer-file-tokens {
+  display: flex;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.assistant-composer-file-tokens > span {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.assistant-composer-file-token-meta {
+  max-width: 140px;
+  min-width: 0;
+  overflow: hidden;
+  color: color-mix(in srgb, currentColor 72%, transparent);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
 }
 
 .assistant-user-context-tokens {
@@ -1362,6 +1321,7 @@ button {
 }
 
 .assistant-composer-actions {
+  position: relative;
   display: flex;
   gap: 6px;
   align-items: center;
@@ -1392,27 +1352,31 @@ button {
   padding: 0 !important;
 }
 
-.assistant-field-selector-anchor {
-  width: 1px !important;
-  min-width: 1px !important;
-  max-width: 1px !important;
-  height: 1px !important;
-  min-height: 1px !important;
-  padding: 0 !important;
-  overflow: hidden !important;
-  opacity: 0 !important;
-  pointer-events: none !important;
-}
-
-.assistant-field-selector-menu {
-  min-width: 0;
-}
-
 .assistant-field-selector-results {
-  max-height: min(42vh, 360px);
+  max-height: min(28vh, 180px);
   min-width: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
+}
+
+.assistant-field-selector-item {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  min-height: 32px;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.assistant-field-selector-item:hover {
+  background: color-mix(in srgb, var(--workbench-foreground, #e6edf6) 8%, transparent);
 }
 
 .assistant-field-selector-heading {

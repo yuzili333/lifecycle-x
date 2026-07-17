@@ -52,6 +52,7 @@ describe("chat field selector mention parsing", () => {
     expect(findChatFieldMention("#五级")).toEqual({ start: 0, end: 3, query: "五级" });
     expect(findChatFieldMention("分析 #贷款")).toEqual({ start: 3, end: 6, query: "贷款" });
     expect(findChatFieldMention("基于（#客户")).toEqual({ start: 3, end: 6, query: "客户" });
+    expect(findChatFieldMention("查询 #短中长期贷款标识")).toEqual({ start: 3, end: 12, query: "短中长期贷款标识" });
   });
 
   it("does not trigger for markdown headings, url fragments, or code", () => {

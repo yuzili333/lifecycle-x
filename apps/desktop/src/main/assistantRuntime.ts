@@ -720,6 +720,10 @@ function isMarkdownLikeContent(content: string) {
   );
 }
 
+export function isPythonReportCardContent(userPrompt: string, content: string) {
+  return isMarkdownLikeContent(content) && (shouldAutoStartPythonReport(userPrompt) || isReportGenerationContent(userPrompt, content));
+}
+
 function assistantBlockTypeForContent(content: string): AssistantBlockType {
   if (content.startsWith("{") || content.startsWith("[")) {
     return "json";
@@ -741,6 +745,14 @@ export function generalTextStreamSegmentId(messageId: string) {
 
 export function reportStreamSegmentId(messageId: string, toolCallId: string, version: number) {
   return `report:${messageId}:${toolCallId}:v${version}`;
+}
+
+export function generatedReportToolCallId(messageId: string) {
+  return `report_${messageId}`;
+}
+
+export function generatedReportArtifactId(messageId: string) {
+  return `assistant-report-markdown:${messageId}`;
 }
 
 function parseAssistantBlocks(content: string): AssistantBlock[] {
@@ -2502,17 +2514,23 @@ export class AssistantRuntime {
         resultPreview: result.slice(0, 2_000),
       });
       const currentBeforeComplete = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(toolCall.messageId));
-      const completedBlock = this.toolBlock(completed, result);
+      const sourcePrompt = this.sourcePromptForToolCall(completed);
+      const shouldRenderPythonReportCard = completed.kind === "python" && isPythonReportCardContent(sourcePrompt, result);
+      const completedDisplay = shouldRenderPythonReportCard ? "Python 分析已完成，报告内容已生成，可点击报告卡片查看完整报告。" : result;
+      const completedBlock = this.toolBlock(completed, completedDisplay);
       const message = this.updateMessage(toolCall.messageId, {
         status: "completed",
-        content: preserveContent ? currentBeforeComplete.content : result,
+        content: preserveContent ? currentBeforeComplete.content : completedDisplay,
         blocks: preserveContent ? replaceToolBlock(currentBeforeComplete.blocks, completedBlock) : [completedBlock],
       });
       this.options.emit({ type: "tool", conversationId: toolCall.conversationId, toolCall: completed, message });
-      await this.registerAssistantToolResult(completed, {
+      const toolRecord = await this.registerAssistantToolResult(completed, {
         result,
         sqlDataset: sqlDataset ?? undefined,
       });
+      if (shouldRenderPythonReportCard) {
+        await this.registerPythonReportCard(completed, result, message, toolRecord);
+      }
       if (completed.kind === "sql") {
         await this.maybeCreateAutoPythonReportApproval(completed, message, sqlExecution?.rows);
       }
@@ -3496,6 +3514,112 @@ export class AssistantRuntime {
     return (await this.toolResultRegistry.get(toolCall.id)) ?? record;
   }
 
+  private async registerPythonReportCard(
+    toolCall: AssistantToolCall,
+    markdown: string,
+    message: AssistantMessage,
+    pythonRecord: ToolCallRecord,
+  ) {
+    const toolCallId = `report_${toolCall.id}`;
+    const existing = await this.toolResultRegistry.get(toolCallId);
+    if (existing?.status === "completed") {
+      return existing;
+    }
+
+    const title = inferReportTitle(markdown) ?? "SQL 查询结果分析";
+    const artifact = await this.toolArtifactManager.createArtifact({
+      artifactId: `assistant-report-markdown:${toolCall.id}`,
+      artifactType: "report_markdown",
+      title,
+      contentType: "markdown",
+      content: markdown,
+      metadata: {
+        messageId: message.id,
+        sourcePythonToolCallId: toolCall.id,
+      },
+    });
+    const version = (await this.toolResultRegistry.listByConversation(toolCall.conversationId)).filter((record) => record.toolKind === "report_generation").length + 1;
+    const completedAt = nowIso();
+    const reportRecord: ToolCallRecord = {
+      toolCallId,
+      conversationId: toolCall.conversationId,
+      messageId: message.id,
+      userId: toolCall.userId,
+      toolKind: "report_generation",
+      toolName: TOOL_NAMES.report_generation,
+      status: "completed",
+      request: {
+        userRequest: this.sourcePromptForToolCall(toolCall),
+        title,
+        source: "python-analysis-result",
+      },
+      resolvedInput: {
+        mode: "latest_result",
+        sourceToolKind: "python_analysis",
+        sourceToolCallId: pythonRecord.toolCallId,
+        sourceArtifactIds: pythonRecord.outputArtifactIds ?? pythonRecord.result?.artifactIds,
+        reason: "Python 分析输出为 Markdown 报告内容，自动登记为报告 Artifact。",
+      },
+      result: {
+        resultId: `result_${toolCallId}`,
+        toolKind: "report_generation",
+        artifactIds: [artifact.artifactId],
+        primaryArtifactId: artifact.artifactId,
+        summary: `Markdown 报告「${title}」已由 Python 分析结果生成。`,
+        createdAt: completedAt,
+        metadata: {
+          messageId: message.id,
+          sourcePythonToolCallId: toolCall.id,
+        },
+      },
+      parentToolCallIds: [pythonRecord.toolCallId],
+      sourceArtifactIds: pythonRecord.outputArtifactIds ?? pythonRecord.result?.artifactIds ?? [],
+      outputArtifactIds: [artifact.artifactId],
+      version,
+      isLatestSuccessful: false,
+      createdAt: toolCall.createdAt,
+      updatedAt: completedAt,
+      completedAt,
+      metadata: {
+        source: "python-analysis-result",
+        title,
+      },
+    };
+    await this.toolResultRegistry.register(reportRecord);
+    await this.toolResultRegistry.markLatestSuccessful(toolCall.conversationId, toolCallId);
+    await this.workflowMemoryBridge.writeWorkflowMemory({
+      conversationId: toolCall.conversationId,
+      userId: toolCall.userId,
+      type: "report_generation_completed",
+      summary: reportRecord.result?.summary ?? "报告已生成。",
+      payload: {
+        toolCallId,
+        toolKind: "report_generation",
+        version,
+        artifactIds: [artifact.artifactId],
+        parentToolCallIds: reportRecord.parentToolCallIds,
+        sourceArtifactIds: reportRecord.sourceArtifactIds,
+      },
+    });
+    this.emitReportContentReady({
+      conversationId: toolCall.conversationId,
+      messageId: message.id,
+      toolCallId,
+      version,
+      artifactId: artifact.artifactId,
+      title,
+      createdAt: artifact.createdAt,
+      completedAt,
+      markdown,
+    });
+    this.options.emit({
+      type: "tool-state",
+      conversationId: toolCall.conversationId,
+      state: await this.toolResultRegistry.getConversationState(toolCall.conversationId),
+    });
+    return (await this.toolResultRegistry.get(toolCallId)) ?? reportRecord;
+  }
+
   private async createAssistantToolArtifacts(
     toolCall: AssistantToolCall,
     toolKind: ToolKind,
@@ -3573,17 +3697,19 @@ export class AssistantRuntime {
       }
     }
 
-    if (isReportGenerationContent(input.prompt, message.content)) {
+    const reportToolCallId = generatedReportToolCallId(message.id);
+    const existingReport = await this.toolResultRegistry.get(reportToolCallId);
+    if (!existingReport && isReportGenerationContent(input.prompt, message.content)) {
       const title = inferReportTitle(message.content) ?? "分析报告";
       const record = await this.registerGeneratedToolRecord({
         toolKind: "report_generation",
-        toolCallId: `report_${message.id}`,
+        toolCallId: reportToolCallId,
         message,
         userRequest: input.prompt,
         title,
         summary: `Markdown 报告「${title}」已生成。`,
         artifact: {
-          artifactId: `assistant-report-markdown:${message.id}`,
+          artifactId: generatedReportArtifactId(message.id),
           artifactType: "report_markdown",
           title,
           contentType: "markdown",
@@ -3618,7 +3744,38 @@ export class AssistantRuntime {
   }) {
     const existing = await this.toolResultRegistry.get(input.toolCallId);
     if (existing?.status === "completed") {
-      return null;
+      const artifact = await this.toolArtifactManager.createArtifact(input.artifact);
+      const updated = await this.toolResultRegistry.update(input.toolCallId, {
+        request: {
+          ...existing.request,
+          userRequest: input.userRequest,
+          title: input.title,
+          source: typeof existing.request.source === "string" ? existing.request.source : "assistant-generated-message",
+        },
+        result: {
+          ...(existing.result ?? {
+            resultId: `result_${input.toolCallId}`,
+            toolKind: input.toolKind,
+            createdAt: nowIso(),
+          }),
+          artifactIds: [artifact.artifactId],
+          primaryArtifactId: artifact.artifactId,
+          summary: input.summary,
+          metadata: {
+            ...(existing.result?.metadata ?? {}),
+            messageId: input.message.id,
+            artifactType: artifact.artifactType,
+          },
+        },
+        outputArtifactIds: [artifact.artifactId],
+        completedAt: nowIso(),
+        metadata: {
+          ...(existing.metadata ?? {}),
+          title: input.title,
+        },
+      });
+      await this.toolResultRegistry.markLatestSuccessful(input.message.conversationId, input.toolCallId);
+      return (await this.toolResultRegistry.get(input.toolCallId)) ?? updated;
     }
     const parents = (await Promise.all(input.parentKinds.map((toolKind) => this.toolResultRegistry.getLatestSuccessful(input.message.conversationId, toolKind))))
       .filter((record): record is ToolCallRecord => Boolean(record));
@@ -4416,15 +4573,17 @@ export class AssistantRuntime {
       };
     }
     const title = typeof request.title === "string" && request.title.trim() ? request.title.trim().slice(0, 120) : inferReportTitle(markdown) ?? "分析报告";
+    const currentMessage = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(assistantMessage.id));
+    const reportToolCallId = generatedReportToolCallId(currentMessage.id);
     const record = await this.registerGeneratedToolRecord({
       toolKind: "report_generation",
-      toolCallId: `report_${modelToolCallId}`,
-      message: this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(assistantMessage.id)),
+      toolCallId: reportToolCallId,
+      message: currentMessage,
       userRequest: typeof request.userRequest === "string" ? request.userRequest : input.prompt,
       title,
       summary: `Markdown 报告「${title}」已通过 request_markdown_report_generation 生成。`,
       artifact: {
-        artifactId: `assistant-report-markdown:${modelToolCallId}`,
+        artifactId: generatedReportArtifactId(currentMessage.id),
         artifactType: "report_markdown",
         title,
         contentType: "markdown",
@@ -4434,25 +4593,25 @@ export class AssistantRuntime {
         },
       },
       parentKinds: ["chart_rendering", "python_analysis", "sql_query"],
-	    });
-	    if (record) {
-	      const artifactId = record.result?.primaryArtifactId ?? record.outputArtifactIds?.[0] ?? `assistant-report-markdown:${modelToolCallId}`;
-	      this.emitReportContentReady({
-	        conversationId: assistantMessage.conversationId,
-	        messageId: assistantMessage.id,
-	        toolCallId: record.toolCallId,
-	        version: record.version,
-	        artifactId,
-	        title,
-	        createdAt: record.completedAt ?? record.updatedAt,
-	        completedAt: record.completedAt ?? record.updatedAt,
-	        markdown,
-	      });
-	    }
-	    await this.emitToolState(assistantMessage.conversationId);
+    });
+    if (record) {
+      const artifactId = record.result?.primaryArtifactId ?? record.outputArtifactIds?.[0] ?? generatedReportArtifactId(currentMessage.id);
+      this.emitReportContentReady({
+        conversationId: assistantMessage.conversationId,
+        messageId: currentMessage.id,
+        toolCallId: record.toolCallId,
+        version: record.version,
+        artifactId,
+        title,
+        createdAt: record.completedAt ?? record.updatedAt,
+        completedAt: record.completedAt ?? record.updatedAt,
+        markdown,
+      });
+    }
+    await this.emitToolState(assistantMessage.conversationId);
     return {
       status: "completed",
-      toolCallId: modelToolCallId,
+      toolCallId: record?.toolCallId ?? reportToolCallId,
       artifactIds: record?.outputArtifactIds ?? [],
       summary: record?.result?.summary,
     };

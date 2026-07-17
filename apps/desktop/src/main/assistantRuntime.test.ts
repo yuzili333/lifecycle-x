@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildGenericSqlResultAnalysisPythonScript, buildOverallRiskDistributionMarkdown, generalStreamSegmentId, generalTextStreamSegmentId, inferReportTitle, isReportGenerationContent, reportStreamSegmentId, shouldAutoStartPythonReport, shouldRouteSkillThroughModel, shouldStartOverallRiskWorkflowAfterModelText } from "./assistantRuntime";
+import { buildGenericSqlResultAnalysisPythonScript, buildOverallRiskDistributionMarkdown, generalStreamSegmentId, generalTextStreamSegmentId, generatedReportArtifactId, generatedReportToolCallId, inferReportTitle, isPythonReportCardContent, isReportGenerationContent, reportStreamSegmentId, shouldAutoStartPythonReport, shouldRouteSkillThroughModel, shouldStartOverallRiskWorkflowAfterModelText } from "./assistantRuntime";
 
 describe("AssistantRuntime workflow intent", () => {
   it("starts Python report flow for one-shot SQL, chart, and report requests", () => {
@@ -99,6 +99,13 @@ describe("AssistantRuntime workflow intent", () => {
     expect(script).not.toContain("核心风险指标");
     expect(script).not.toContain("数据质量与口径说明");
   });
+
+  it("treats Python markdown analysis output as report-card content only for analysis/report requests", () => {
+    const markdown = "# SQL 查询结果分析\n\n## 按 分行 分布\n| 分行 | 行数 | 占比 |\n|---|---:|---:|\n| 杭州 | 2 | 100% |";
+
+    expect(isPythonReportCardContent("查询各分行数据汇总和分析。", markdown)).toBe(true);
+    expect(isPythonReportCardContent("查询前 20 条明细。", "工具执行完成。")).toBe(false);
+  });
 });
 
 describe("AssistantRuntime report artifact helpers", () => {
@@ -107,6 +114,8 @@ describe("AssistantRuntime report artifact helpers", () => {
     expect(generalTextStreamSegmentId("message-1")).toBe("message:message-1:text");
     expect(generalTextStreamSegmentId("message-1")).not.toBe(generalStreamSegmentId("message-1"));
     expect(reportStreamSegmentId("message-1", "report-1", 3)).toBe("report:message-1:report-1:v3");
+    expect(generatedReportToolCallId("message-1")).toBe("report_message-1");
+    expect(generatedReportArtifactId("message-1")).toBe("assistant-report-markdown:message-1");
   });
 
   it("detects markdown report content and infers stable report titles", () => {
