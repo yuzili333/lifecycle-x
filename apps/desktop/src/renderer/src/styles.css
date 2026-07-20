@@ -493,22 +493,27 @@ button {
 }
 
 .assistant-history-panel {
+  position: relative;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
   border-right: 1px solid color-mix(in srgb, var(--workbench-foreground, #e6edf6) 12%, transparent);
   background: color-mix(in srgb, var(--workbench-background, #0f1724) 94%, #ffffff);
 }
 
-.assistant-history-heading {
+.assistant-history-new-chat {
+  position: absolute;
+  right: 0;
+  bottom: 16px;
+  left: 0;
   display: flex;
-  justify-content: flex-end;
-  gap: 6px;
-  align-items: center;
-  min-width: 0;
-  border-bottom: 1px solid color-mix(in srgb, var(--workbench-foreground, #e6edf6) 10%, transparent);
-  padding: 6px 8px;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.assistant-history-new-chat button {
+  pointer-events: auto;
 }
 
 .assistant-history-list {
@@ -516,7 +521,7 @@ button {
   align-content: start;
   gap: 4px;
   min-height: 0;
-  padding: 8px;
+  padding: 8px 8px 72px;
   overflow: auto;
 }
 
@@ -1980,9 +1985,12 @@ button {
 
 .settings-sidebar-heading {
   display: flex;
-  justify-content: space-between;
   gap: 12px;
   align-items: flex-start;
+}
+
+.settings-sidebar-shell :where(.astryx-text.display-3) {
+  font-size: var(--font-size-2xl) !important;
 }
 
 .settings-tab-list {

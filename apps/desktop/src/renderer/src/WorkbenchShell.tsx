@@ -33,7 +33,7 @@ type WorkbenchShellProps = {
 };
 
 type WorkbenchModule = "data-assistant" | "data-management";
-type SettingsTab = "profile" | "general" | "appearance" | "agent" | "logout";
+type SettingsTab = "profile" | "appearance" | "agent" | "logout";
 type SessionExpiredPromptPhase = "idle" | "prompting" | "logging-out" | "handled";
 
 const DEFAULT_WORKBENCH_MODULE: WorkbenchModule = "data-assistant";
@@ -312,9 +312,8 @@ async function hasLocalModelApiKey(user: WorkbenchAuth["user"]) {
 
 const settingsTabs: Array<{ id: SettingsTab; label: string; description: string }> = [
   { id: "profile", label: "个人资料", description: "头像和企业主数据" },
-  { id: "general", label: "常规", description: "语言、时区和通知" },
-  { id: "appearance", label: "外观", description: "主题、颜色、字体和侧栏" },
-  { id: "agent", label: "智能体配置", description: "大模型、API Key、Skill 和 MCP" },
+  { id: "appearance", label: "外观", description: "主题、颜色和字体" },
+  { id: "agent", label: "模型配置", description: "大模型、API Key 和 Skill" },
   { id: "logout", label: "退出登录", description: "结束当前登录态" },
 ];
 
@@ -370,7 +369,6 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
   const [avatarDraft, setAvatarDraft] = useState(auth.user?.avatarUrl ?? "");
   const [apiKeyDraft, setApiKeyDraft] = useState("");
   const [settings, setSettings] = useState<WorkbenchSettings>(() => readCachedWorkbenchSettings(auth.user) ?? defaultSettings);
-  const [isSavingAvatar, setIsSavingAvatar] = useState(false);
   const [isSavingSettings, setIsSavingSettings] = useState(false);
 
   const openSessionExpiredConfirm = useCallback(() => {
@@ -606,36 +604,6 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
     }
   };
 
-  const handleAvatarSave = async () => {
-    const nextAvatar = avatarDraft.trim();
-    if (!nextAvatar) {
-      toast({
-        type: "error",
-        body: "头像地址不能为空。",
-        uniqueID: "avatar-empty",
-        collisionBehavior: "overwrite",
-      });
-      return;
-    }
-
-    setIsSavingAvatar(true);
-    const result = await requestWithRefresh((token) => workbenchApi.updateAvatar(token, nextAvatar));
-    setIsSavingAvatar(false);
-    if (isFailure(result)) {
-      showError(result);
-      return;
-    }
-
-    setProfile(result.profile);
-    auth.updateUser({ avatarUrl: result.profile.avatarUrl });
-    toast({
-      type: "info",
-      body: "头像已更新，其他个人资料继续与企业内部数据保持一致。",
-      uniqueID: "avatar-updated",
-      collisionBehavior: "overwrite",
-    });
-  };
-
   const handleSettingsSave = async () => {
     const nextApiKey = apiKeyDraft.trim();
     setIsSavingSettings(true);
@@ -792,7 +760,6 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
               <Text type="display-3" as="h2">
                 用户设置
               </Text>
-              <Button label="关闭" variant="ghost" size="sm" onClick={() => setIsSettingsOpen(false)} />
             </div>
             <div className="settings-tab-list">
               {settingsTabs.map((tab) => (
@@ -817,9 +784,6 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
                     <Text type="display-3" as="h3">
                       个人资料
                     </Text>
-                    <Text type="body" color="secondary">
-                      仅支持更新个人头像，其他字段由企业内部主数据同步。
-                    </Text>
                   </div>
                   <Avatar src={profile?.avatarUrl} name={profile?.displayName ?? auth.user?.displayName} size={64} />
                 </HStack>
@@ -841,51 +805,6 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
                   <ReadOnlyField label="职务" value={profile?.title ?? ""} />
                   <ReadOnlyField label="联系方式" value={profile?.phone ?? ""} />
                 </div>
-
-                <HStack hAlign="end" gap={2}>
-                  <Button label="保存头像" variant="primary" isLoading={isSavingAvatar} onClick={handleAvatarSave} />
-                </HStack>
-              </VStack>
-            )}
-
-            {activeSettingsTab === "general" && (
-              <VStack gap={4} hAlign="stretch">
-                <Text type="display-3" as="h3">
-                  常规
-                </Text>
-                <Selector
-                  label="语言"
-                  value={settings.general.language}
-                  options={[
-                    { label: "简体中文", value: "zh-CN" },
-                    { label: "English", value: "en-US" },
-                  ]}
-                  onChange={(language) =>
-                    setSettings((current) => ({
-                      ...current,
-                      general: { ...current.general, language: language as WorkbenchSettings["general"]["language"] },
-                    }))
-                  }
-                />
-                <Selector
-                  label="时区"
-                  value={settings.general.timezone}
-                  options={["Asia/Shanghai", "UTC", "America/New_York"]}
-                  onChange={(timezone) =>
-                    setSettings((current) => ({ ...current, general: { ...current.general, timezone } }))
-                  }
-                />
-                <Switch
-                  label="接收工作台通知"
-                  description="用于登录态、配置保存和后续任务状态提示。"
-                  value={settings.general.notificationsEnabled}
-                  onChange={(notificationsEnabled) =>
-                    setSettings((current) => ({
-                      ...current,
-                      general: { ...current.general, notificationsEnabled },
-                    }))
-                  }
-                />
               </VStack>
             )}
 
@@ -977,64 +896,13 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
                     setSettings((current) => ({ ...current, appearance: { ...current.appearance, codeFontSize } }))
                   }
                 />
-                <Switch
-                  label="半透明侧边栏"
-                  value={settings.appearance.translucentSidebar}
-                  onChange={(translucentSidebar) =>
-                    setSettings((current) => ({
-                      ...current,
-                      appearance: { ...current.appearance, translucentSidebar },
-                    }))
-                  }
-                />
-                <HStack gap={3} vAlign="start">
-                  <Selector
-                    label="对比度"
-                    value={settings.appearance.contrast}
-                    options={[
-                      { label: "标准", value: "standard" },
-                      { label: "高对比", value: "high" },
-                    ]}
-                    onChange={(contrast) =>
-                      setSettings((current) => ({
-                        ...current,
-                        appearance: { ...current.appearance, contrast: contrast as WorkbenchSettings["appearance"]["contrast"] },
-                      }))
-                    }
-                  />
-                  <Selector
-                    label="应用内图标主题"
-                    value={settings.appearance.dockIcon}
-                    options={[
-                      { label: "深色主题图标", value: "dark" },
-                      { label: "浅色主题图标", value: "light" },
-                    ]}
-                    onChange={(dockIcon) =>
-                      setSettings((current) => ({
-                        ...current,
-                        appearance: { ...current.appearance, dockIcon: normalizeDockIconTheme(dockIcon) },
-                      }))
-                    }
-                  />
-                </HStack>
-                <Section variant="muted" padding={3}>
-                  <HStack gap={3} vAlign="center">
-                    <img className="dock-icon-preview" src={activeAppIcon} alt="" />
-                    <VStack gap={1} hAlign="stretch">
-                      <Text type="body">当前应用内图标：{activeAppIconVariant}</Text>
-                      <Text type="supporting" color="secondary">
-                        程序坞图标固定使用浅色图标；工作台界面图标按当前设置显示。
-                      </Text>
-                    </VStack>
-                  </HStack>
-                </Section>
               </VStack>
             )}
 
             {activeSettingsTab === "agent" && (
               <VStack gap={4} hAlign="stretch">
                 <Text type="display-3" as="h3">
-                  智能体配置
+                  模型配置
                 </Text>
                 <Section variant="muted" padding={4}>
                   <VStack gap={3} hAlign="stretch">
@@ -1079,16 +947,6 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
                         setSettings((current) => ({
                           ...current,
                           configuration: { ...current.configuration, skillEnabled },
-                        }))
-                      }
-                    />
-                    <Switch
-                      label="启用 MCP"
-                      value={settings.configuration.mcpEnabled}
-                      onChange={(mcpEnabled) =>
-                        setSettings((current) => ({
-                          ...current,
-                          configuration: { ...current.configuration, mcpEnabled },
                         }))
                       }
                     />
@@ -1164,7 +1022,7 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
           </div>
           <HStack hAlign="end" gap={2}>
             <Button label="稍后配置" variant="secondary" onClick={() => setIsModelConfigRequiredOpen(false)} />
-            <Button label="打开智能体配置" variant="primary" onClick={openAgentSettingsFromPrompt} />
+            <Button label="打开模型配置" variant="primary" onClick={openAgentSettingsFromPrompt} />
           </HStack>
         </VStack>
       </Dialog>

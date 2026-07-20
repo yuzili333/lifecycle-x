@@ -3656,17 +3656,6 @@ export function DataAssistantWorkspace({
   return (
     <section className="data-assistant-workspace" aria-label="数据助手">
       <aside className="assistant-history-panel" aria-label="对话列表">
-        <div className="assistant-history-heading">
-          <Button
-            label="New Chat"
-            variant="primary"
-            size="sm"
-            icon={<Icon icon={Plus} size="sm" color="inherit" />}
-            isIconOnly
-            isLoading={isLoadingConversations}
-            onClick={startConversation}
-          />
-        </div>
         <div className="assistant-history-list">
           {conversations.map((conversation) => (
             <div
@@ -3714,6 +3703,15 @@ export function DataAssistantWorkspace({
               </div>
             </div>
           ))}
+        </div>
+        <div className="assistant-history-new-chat">
+          <Button
+            label="新增对话"
+            variant="primary"
+            icon={<Icon icon={Plus} size="sm" color="inherit" />}
+            isLoading={isLoadingConversations}
+            onClick={startConversation}
+          />
         </div>
       </aside>
 
