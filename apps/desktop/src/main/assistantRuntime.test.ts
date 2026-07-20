@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildFallbackTempCsvSqlForAnalysisRequest, buildGenericSqlResultAnalysisPythonScript, buildOverallRiskDistributionMarkdown, detectToolFromAssistantOutput, formatStoppedGenerationMessage, generalStreamSegmentId, generalTextStreamSegmentId, generatedReportArtifactId, generatedReportToolCallId, inferReportTitle, isPreToolTextGuidanceRequiredInputs, isPythonReportCardContent, isReportGenerationContent, reportStreamSegmentId, selectedFieldReferencesMarkdown, shouldAnalyzePriorSqlResult, shouldAutoStartPythonReport, shouldEagerStartToolFromAssistantStream, shouldForceGenericSqlResultAnalysisScript, shouldGenerateReportFromAnalysisResult, shouldKeepProviderToolActivityMessage, shouldRegisterAssistantGeneratedArtifacts, shouldRouteSkillThroughModel, shouldStartOverallRiskWorkflowAfterModelText, shouldUseModelForUnclearTaskGoal } from "./assistantRuntime";
+import { buildFallbackTempCsvSqlForAnalysisRequest, buildGenericSqlResultAnalysisPythonScript, buildOverallRiskDistributionMarkdown, detectToolFromAssistantOutput, formatStoppedGenerationMessage, generalStreamSegmentId, generalTextStreamSegmentId, generatedReportArtifactId, generatedReportToolCallId, inferReportTitle, isPreToolTextGuidanceRequiredInputs, isPythonReportCardContent, isReportGenerationContent, normalizeAnalysisReportMarkdown, normalizeAnalysisReportTitle, reportStreamSegmentId, selectedFieldReferencesMarkdown, shouldAnalyzePriorSqlResult, shouldAutoStartPythonReport, shouldEagerStartToolFromAssistantStream, shouldForceGenericSqlResultAnalysisScript, shouldGenerateReportFromAnalysisResult, shouldKeepProviderToolActivityMessage, shouldRegisterAssistantGeneratedArtifacts, shouldRouteSkillThroughModel, shouldStartOverallRiskWorkflowAfterModelText, shouldUseModelForUnclearTaskGoal } from "./assistantRuntime";
 import { MissingInputDetector } from "./agentGuidance";
 import type { ChatCsvSelectedFieldRef, ConversationTempCsvTable } from "./chatCsvTempSource";
 
@@ -238,12 +238,28 @@ describe("AssistantRuntime workflow intent", () => {
   });
 
   it("builds generic Python analysis without business-field hardcoding or fallback skill templates", () => {
-    const script = buildGenericSqlResultAnalysisPythonScript("请根据查询结果分析 #一级分行名称 和 #短中长期贷款标识 的占比。", [
-      { 一级分行名称: "杭州分行", 短中长期贷款标识: "中期", 数量: 3 },
-      { 一级分行名称: "宁波分行", 短中长期贷款标识: "长期", 数量: 2 },
-    ]);
+    const script = buildGenericSqlResultAnalysisPythonScript(
+      "请根据查询结果分析 #一级分行名称 和 #短中长期贷款标识 的占比。",
+      [
+        { 一级分行名称: "杭州分行", 短中长期贷款标识: "中期", 数量: 3 },
+        { 一级分行名称: "宁波分行", 短中长期贷款标识: "长期", 数量: 2 },
+      ],
+      {
+        dataSourceName: "信贷风险表",
+        sampleCount: 2,
+        selectedFieldNames: ["一级分行名称", "短中长期贷款标识"],
+      },
+    );
 
     expect(script).toContain("match_requested_fields");
+    expect(script).toContain("# {analysis_object}分析报告");
+    expect(script).toContain("分析对象：{analysis_object}");
+    expect(script).toContain("样本数量：{sample_count}");
+    expect(script).toContain("筛选字段：");
+    expect(script).not.toContain("已按用户描述中的引号取值筛选分析样本");
+    expect(script).not.toContain("返回记录数");
+    expect(script).not.toContain("已匹配用户指定字段");
+    expect(script).not.toContain("说明：");
     expect(script).not.toContain("loan_term_type");
     expect(script).not.toContain("branch_name");
     expect(script).not.toContain("latest_risk_result");
@@ -252,6 +268,30 @@ describe("AssistantRuntime workflow intent", () => {
     expect(script).not.toContain("整体风险分类分布");
     expect(script).not.toContain("核心风险指标");
     expect(script).not.toContain("数据质量与口径说明");
+  });
+
+  it("normalizes analysis report title and summary metadata from data source context", () => {
+    const title = normalizeAnalysisReportTitle({
+      sourceName: "信贷风险表.csv",
+      requestedTitle: "SQL 查询结果分析",
+      markdown: "# SQL 查询结果分析\n\n- 分析对象：上一轮 SQL 工具调用返回结果\n- 已按用户描述中的引号取值筛选分析样本：25 条。\n\n## 汇总",
+    });
+    const markdown = normalizeAnalysisReportMarkdown(
+      "# SQL 查询结果分析\n\n- 分析对象：上一轮 SQL 工具调用返回结果\n- 已按用户描述中的引号取值筛选分析样本：25 条。\n\n## 汇总",
+      {
+        title,
+        sourceName: "信贷风险表",
+        selectedFieldNames: ["一级分行名称", "最新风险五级分类"],
+      },
+    );
+
+    expect(title).toBe("信贷风险表分析报告");
+    expect(normalizeAnalysisReportTitle({ sourceName: "贷款明细.xlsx" })).toBe("贷款明细分析报告");
+    expect(markdown).toContain("# 信贷风险表分析报告");
+    expect(markdown).toContain("- 分析对象：信贷风险表");
+    expect(markdown).toContain("- 筛选字段：一级分行名称、最新风险五级分类");
+    expect(markdown).not.toContain("SQL 查询结果分析");
+    expect(markdown).not.toContain("已按用户描述中的引号取值筛选分析样本");
   });
 
   it("keeps generic SQL result analysis limited to requested field and count intent", () => {

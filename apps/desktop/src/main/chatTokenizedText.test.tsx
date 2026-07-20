@@ -1,11 +1,45 @@
 import { ChatTokenizedText } from "@astryxdesign/core/Chat";
 import { renderToString } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { chatTokensForFieldRefs, mergeFieldRefsWithTextMatches } from "../renderer/src/DataAssistantWorkspace";
+import { chatTokensForFieldRefs, copyTextForMessage, mergeFieldRefsWithTextMatches } from "../renderer/src/DataAssistantWorkspace";
 import type { ChatCsvSelectedFieldRef } from "./chatCsvTempSource";
 import type { ConversationCsvField } from "../renderer/src/chat-field-selector";
 
 describe("ChatTokenizedText context tokens", () => {
+  it("copies user field-token text without the composer spacer after tokens", () => {
+    const fieldRef: ChatCsvSelectedFieldRef = {
+      tokenId: "field_token_branch",
+      type: "csv_field",
+      tempDataSourceId: "temp-ds-1",
+      tempTableId: "temp-table-1",
+      fieldId: "field-branch",
+      sourceHeader: "一级分行名称",
+      physicalName: "branch_name",
+      displayName: "一级分行名称",
+      logicalType: "category",
+      sqliteType: "TEXT",
+      rawText: "#一级分行名称",
+      start: 3,
+      end: 10,
+      createdAt: "2026-07-20T00:00:00.000Z",
+      status: "valid",
+    };
+
+    expect(copyTextForMessage({
+      id: "message-1",
+      conversationId: "conversation-1",
+      userId: "user-1",
+      role: "user",
+      status: "sent",
+      content: "查询 #一级分行名称 的数据",
+      blocks: [],
+      createdAt: "2026-07-20T00:00:00.000Z",
+      updatedAt: "2026-07-20T00:00:00.000Z",
+      integrityHash: "hash",
+      context: { selectedFieldRefs: [fieldRef] },
+    })).toBe("查询 #一级分行名称的数据");
+  });
+
   it("renders selected file, skill, and data source labels from alphanumeric placeholders with text prefixes", () => {
     const html = renderToString(
       <ChatTokenizedText

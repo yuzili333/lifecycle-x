@@ -46,6 +46,7 @@ function record(toolCallId: string, toolKind: ToolCallRecord["toolKind"], reques
   return {
     toolCallId,
     conversationId: "conversation-1",
+    messageId: "message-1",
     userId: "user-1",
     toolKind,
     toolName: toolKind,
@@ -71,8 +72,12 @@ describe("artifactDataSourceMeta", () => {
           dataSourceId: "csv-source-1",
           dataSourceLabel: "loan_contracts.csv",
         }),
-        record("python-1", "python_analysis", {}),
-        record("report-1", "report_generation", {}),
+        record("python-1", "python_analysis", {
+          temporaryDataSourceLabels: ["loan_contracts.csv"],
+        }),
+        record("report-1", "report_generation", {
+          temporaryDataSourceLabels: ["loan_contracts.csv"],
+        }),
       ],
       updatedAt: createdAt,
     } satisfies ConversationToolState);

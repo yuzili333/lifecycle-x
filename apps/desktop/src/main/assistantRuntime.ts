@@ -135,6 +135,9 @@ export type AssistantToolKind = "sql" | "python";
 export type AssistantToolStatus = "pending_approval" | "running" | "completed" | "declined" | "blocked" | "error";
 
 export type AssistantToolCallMetadata = {
+  dataSourceId?: string | null;
+  dataSourceLabel?: string | null;
+  temporaryDataSourceLabels?: string[];
   selectedTempDataSourceIds?: string[];
   selectedFieldRefs?: ChatCsvSelectedFieldRef[];
 };
@@ -287,7 +290,7 @@ type ToolDetection = {
 const SILICONFLOW_CHAT_COMPLETIONS_URL = "https://api.siliconflow.cn/v1/chat/completions";
 const MAX_STORED_MESSAGES_FOR_CONTEXT = 12;
 const MAX_STREAM_CHARS = 120_000;
-const MODEL_STREAM_TIMEOUT_MS = 90_000;
+const MODEL_STREAM_TIMEOUT_MS = 180_000;
 const PYTHON_TIMEOUT_MS = 5_000;
 const MAX_TOOL_CONTEXT_CHARS = 30_000;
 const WORKFLOW_DATASET_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -785,15 +788,21 @@ function parseSqlToolRows(result: string | undefined) {
   }
 }
 
-export function buildGenericSqlResultAnalysisPythonScript(prompt: string, rows: Array<Record<string, unknown>>) {
+export function buildGenericSqlResultAnalysisPythonScript(prompt: string, rows: Array<Record<string, unknown>>, context: { dataSourceName?: string | null; sampleCount?: number | null; selectedFieldNames?: string[] } = {}) {
   const rowsJson = JSON.stringify(rows);
   const promptJson = JSON.stringify(prompt);
+  const contextJson = JSON.stringify({
+    dataSourceName: context.dataSourceName?.trim() || null,
+    sampleCount: typeof context.sampleCount === "number" && Number.isFinite(context.sampleCount) ? context.sampleCount : rows.length,
+    selectedFieldNames: uniqueValues((context.selectedFieldNames ?? []).map((field) => field.trim()).filter(Boolean)),
+  });
   return [
     "import json, re, math",
     "from collections import Counter",
     "",
     `rows = json.loads(${JSON.stringify(rowsJson)})`,
     `question = ${promptJson}`,
+    `analysis_context = json.loads(${JSON.stringify(contextJson)})`,
     "",
     "def pct(value, total):",
     "    return round(value * 100.0 / total, 2) if total else 0.0",
@@ -912,13 +921,17 @@ export function buildGenericSqlResultAnalysisPythonScript(prompt: string, rows: 
     "    return filtered or rows_data",
     "",
     "total_rows = len(rows)",
+    "sample_count = analysis_context.get('sampleCount') if isinstance(analysis_context.get('sampleCount'), int) else total_rows",
+    "analysis_object = str(analysis_context.get('dataSourceName') or '上一轮 SQL 工具调用返回结果').strip()",
+    "selected_fields = [str(field).strip() for field in (analysis_context.get('selectedFieldNames') or []) if str(field).strip()]",
     "keys = [key for key in (list(rows[0].keys()) if rows else []) if not str(key).startswith('__')]",
     "lines = []",
-    "lines.append('# SQL 查询结果分析')",
+    "lines.append(f'# {analysis_object}分析报告')",
     "lines.append('')",
-    "lines.append(f'- 分析对象：上一轮 SQL 工具调用返回结果')",
-    "lines.append(f'- 返回记录数：{total_rows}')",
-    "lines.append('- 说明：以下计算仅基于用户明确指定的字段和筛选条件，不输出未要求的扩展分析。')",
+    "lines.append(f'- 分析对象：{analysis_object}')",
+    "lines.append(f'- 样本数量：{sample_count}')",
+    "if selected_fields:",
+    "    lines.append('- 筛选字段：' + '、'.join(selected_fields))",
     "lines.append('')",
     "",
     "if not rows:",
@@ -933,10 +946,6 @@ export function buildGenericSqlResultAnalysisPythonScript(prompt: string, rows: 
     "    count_key = count_field(keys)",
     "    weighted_total = sum(row_count_value(row, count_key) for row in analysis_rows)",
     "    count_name = count_label()",
-    "    if requested:",
-    "        lines.append('- 已匹配用户指定字段：' + '、'.join(str(field) for field in requested))",
-    "    if len(analysis_rows) != len(rows):",
-    "        lines.append(f'- 已按用户描述中的引号取值筛选分析样本：{analysis_total} 条。')",
     "    lines.append('')",
     "    if dimensions:",
     "        for dimension in dimensions:",
@@ -1184,6 +1193,83 @@ export function inferReportTitle(content: string) {
   }
   const firstLine = content.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
   return firstLine?.replace(/^#+\s*/, "").slice(0, 120);
+}
+
+function isGenericAnalysisReportTitle(value: string | null | undefined) {
+  const normalized = normalizeSqliteAlias(value ?? "");
+  return !normalized || normalized === "SQL查询结果分析" || normalized === "数据分析报告" || normalized === "分析报告";
+}
+
+function stripReportSourceFileExtension(value: string) {
+  return value.replace(/\.(csv|tsv|txt|xlsx|xls|xlsm|json|jsonl|parquet|db|sqlite|sqlite3)$/i, "").trim();
+}
+
+function analysisReportTitleFromSource(sourceName: string | null | undefined) {
+  const normalized = stripReportSourceFileExtension(sourceName?.trim() ?? "");
+  return normalized ? `${normalized}分析报告` : null;
+}
+
+export function normalizeAnalysisReportTitle(input: {
+  sourceName?: string | null;
+  requestedTitle?: string | null;
+  markdown?: string | null;
+}) {
+  const sourceTitle = analysisReportTitleFromSource(input.sourceName);
+  if (sourceTitle) {
+    return sourceTitle.slice(0, 120);
+  }
+  const requestedTitle = input.requestedTitle?.trim();
+  if (requestedTitle && !isGenericAnalysisReportTitle(requestedTitle)) {
+    return requestedTitle.slice(0, 120);
+  }
+  const inferredTitle = input.markdown ? inferReportTitle(input.markdown) : null;
+  if (inferredTitle && !isGenericAnalysisReportTitle(inferredTitle)) {
+    return inferredTitle.slice(0, 120);
+  }
+  return "分析报告";
+}
+
+function metadataLine(label: string, value: string) {
+  return `- ${label}：${value}`;
+}
+
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function upsertMetadataLine(lines: string[], label: string, value: string, afterLabels: string[]) {
+  const linePattern = new RegExp(`^\\s*[-*]\\s*${escapeRegExp(label)}\\s*[：:]`);
+  const existingIndex = lines.findIndex((line) => linePattern.test(line));
+  const nextLine = metadataLine(label, value);
+  if (existingIndex >= 0) {
+    lines[existingIndex] = nextLine;
+    return;
+  }
+  const afterIndex = Math.max(
+    ...afterLabels.map((afterLabel) => lines.findIndex((line) => new RegExp(`^\\s*[-*]\\s*${escapeRegExp(afterLabel)}\\s*[：:]`).test(line))),
+  );
+  lines.splice(afterIndex >= 0 ? afterIndex + 1 : Math.min(1, lines.length), 0, nextLine);
+}
+
+export function normalizeAnalysisReportMarkdown(markdown: string, context: { title: string; sourceName?: string | null; selectedFieldNames?: string[] }) {
+  const sourceName = context.sourceName?.trim();
+  const selectedFieldNames = uniqueValues((context.selectedFieldNames ?? []).map((field) => field.trim()).filter(Boolean));
+  const lines = markdown.split(/\r?\n/).filter((line) => {
+    return !/^\s*[-*]\s*已按用户描述中的引号取值筛选分析样本\s*[：:]?/.test(line) && !/^\s*[-*]\s*已匹配用户指定字段\s*[：:]?/.test(line);
+  });
+  const headingIndex = lines.findIndex((line) => /^#{1,2}\s+/.test(line));
+  if (headingIndex >= 0) {
+    lines[headingIndex] = `# ${context.title}`;
+  } else {
+    lines.unshift(`# ${context.title}`, "");
+  }
+  if (sourceName) {
+    upsertMetadataLine(lines, "分析对象", sourceName, []);
+  }
+  if (selectedFieldNames.length > 0) {
+    upsertMetadataLine(lines, "筛选字段", selectedFieldNames.join("、"), ["分析对象", "样本数量"]);
+  }
+  return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 function uniqueValues<T>(values: T[]) {
@@ -2624,10 +2710,12 @@ export class AssistantRuntime {
 
     const sourceUserMessage = this.messageFromRow(sourceUserRow);
     this.cancelledMessageIds.delete(sourceMessage.id);
+    const retryStartedAt = nowIso();
     const assistantMessage = this.updateMessage(sourceMessage.id, {
       status: "receiving",
       content: "",
       blocks: [{ id: randomUUID(), type: "text", content: "" }],
+      createdAt: retryStartedAt,
       errorMessage: undefined,
       providerTraceId: undefined,
     });
@@ -2830,7 +2918,10 @@ export class AssistantRuntime {
     return message;
   }
 
-  private updateMessage(messageId: string, patch: Partial<Pick<AssistantMessage, "status" | "content" | "blocks" | "errorMessage" | "providerTraceId">>) {
+  private updateMessage(
+    messageId: string,
+    patch: Partial<Pick<AssistantMessage, "status" | "content" | "blocks" | "createdAt" | "errorMessage" | "providerTraceId">>,
+  ) {
     const current = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(messageId));
     const updatedAt = nowIso();
     const next: AssistantMessage = {
@@ -2841,8 +2932,8 @@ export class AssistantRuntime {
     };
     next.integrityHash = this.hashRecord("message", { ...next, integrityHash: undefined }, next.previousHash);
     this.db
-      .prepare("update messages set status = ?, content = ?, blocks_json = ?, updated_at = ?, error_message = ?, provider_trace_id = ?, integrity_hash = ? where id = ?")
-      .run(next.status, next.content, JSON.stringify(next.blocks), next.updatedAt, next.errorMessage ?? null, next.providerTraceId ?? null, next.integrityHash, messageId);
+      .prepare("update messages set status = ?, content = ?, blocks_json = ?, created_at = ?, updated_at = ?, error_message = ?, provider_trace_id = ?, integrity_hash = ? where id = ?")
+      .run(next.status, next.content, JSON.stringify(next.blocks), next.createdAt, next.updatedAt, next.errorMessage ?? null, next.providerTraceId ?? null, next.integrityHash, messageId);
     this.touchConversation(next.conversationId);
     return next;
   }
@@ -3094,6 +3185,10 @@ export class AssistantRuntime {
       approvalMode: "request_approval",
       createdAt: now,
       updatedAt: now,
+      metadata: {
+        temporaryDataSourceLabels: [source.fileName],
+        selectedTempDataSourceIds: [source.tempDataSourceId],
+      },
     };
     return { source, rows, toolCall };
   }
@@ -3196,8 +3291,16 @@ export class AssistantRuntime {
       return false;
     }
 
-    const markdown = analysis.markdown;
-    const title = inferReportTitle(markdown) ?? "分析报告";
+    const reportContext = this.analysisReportContextFromRecords([pythonRecord]);
+    const title = normalizeAnalysisReportTitle({
+      sourceName: reportContext.sourceName,
+      markdown: analysis.markdown,
+    });
+    const markdown = normalizeAnalysisReportMarkdown(analysis.markdown, {
+      title,
+      sourceName: reportContext.sourceName,
+      selectedFieldNames: reportContext.selectedFieldNames,
+    });
     const completedAt = nowIso();
     const reportToolCallId = generatedReportToolCallId(assistantMessage.id);
     const artifact = await this.toolArtifactManager.createArtifact({
@@ -3225,6 +3328,9 @@ export class AssistantRuntime {
         userRequest: input.prompt,
         title,
         source: "latest-python-analysis-result",
+        dataSourceLabel: typeof pythonRecord.request.dataSourceLabel === "string" ? pythonRecord.request.dataSourceLabel : undefined,
+        temporaryDataSourceLabels: Array.isArray(pythonRecord.request.temporaryDataSourceLabels) ? pythonRecord.request.temporaryDataSourceLabels : [],
+        selectedFieldRefs: Array.isArray(pythonRecord.request.selectedFieldRefs) ? pythonRecord.request.selectedFieldRefs : [],
       },
       resolvedInput: {
         mode: "latest_result",
@@ -3244,6 +3350,8 @@ export class AssistantRuntime {
           messageId: assistantMessage.id,
           sourcePythonToolCallId: pythonRecord.toolCallId,
           sourceAnalysisArtifactId: analysis.artifact.artifactId,
+          dataSourceLabels: reportContext.sourceName ? [reportContext.sourceName] : [],
+          selectedFieldNames: reportContext.selectedFieldNames,
         },
       },
       parentToolCallIds: [pythonRecord.toolCallId],
@@ -3364,7 +3472,11 @@ export class AssistantRuntime {
 
   private buildPythonAnalysisScript(prompt: string, sqlToolCall: AssistantToolCall, rowsOverride?: Array<Record<string, unknown>>) {
     const rows = rowsOverride?.length ? rowsOverride : parseSqlToolRows(sqlToolCall.result);
-    return buildGenericSqlResultAnalysisPythonScript(prompt, rows);
+    return buildGenericSqlResultAnalysisPythonScript(prompt, rows, {
+      dataSourceName: this.toolCallAnalysisObjectName(sqlToolCall),
+      sampleCount: parseSqlToolRowCount(sqlToolCall.result) ?? rows.length,
+      selectedFieldNames: this.selectedFieldNamesForToolCall(sqlToolCall),
+    });
   }
 
   private insertToolCall(input: {
@@ -3598,10 +3710,64 @@ export class AssistantRuntime {
     };
   }
 
-  private toolCallMetadataForInput(input: AssistantSendInput): AssistantToolCallMetadata {
+  private toolCallMetadataForInput(input: AssistantSendInput, conversation: AssistantConversation): AssistantToolCallMetadata {
+    const tempSources = this.activeTempSources(input.userId, conversation.id, input.selectedTempDataSourceIds);
     return {
+      dataSourceId: input.dataSourceId ?? null,
+      dataSourceLabel: input.dataSourceLabel ?? null,
+      temporaryDataSourceLabels: tempSources.map((source) => source.fileName),
       selectedTempDataSourceIds: input.selectedTempDataSourceIds ?? [],
       selectedFieldRefs: input.selectedFieldRefs ?? [],
+    };
+  }
+
+  private toolCallDataSourceLabels(toolCall: AssistantToolCall) {
+    return uniqueValues([
+      ...(toolCall.metadata?.temporaryDataSourceLabels ?? []),
+      toolCall.metadata?.dataSourceLabel ? reportDataSourceName(toolCall.metadata.dataSourceLabel) : null,
+    ].filter((label): label is string => Boolean(label?.trim())));
+  }
+
+  private toolCallAnalysisObjectName(toolCall: AssistantToolCall) {
+    return this.toolCallDataSourceLabels(toolCall)[0] ?? "上一轮 SQL 工具调用返回结果";
+  }
+
+  private selectedFieldNamesForToolCall(toolCall: AssistantToolCall) {
+    return uniqueValues((toolCall.metadata?.selectedFieldRefs ?? [])
+      .filter((field) => field.status === "valid")
+      .map((field) => field.displayName || field.sourceHeader || field.physicalName || field.rawText)
+      .filter((value): value is string => Boolean(value?.trim())));
+  }
+
+  private toolRecordDataSourceLabels(record: ToolCallRecord | null | undefined) {
+    const temporaryLabels = Array.isArray(record?.request.temporaryDataSourceLabels)
+      ? record.request.temporaryDataSourceLabels.filter((label): label is string => typeof label === "string" && Boolean(label.trim()))
+      : [];
+    const metadataLabels = Array.isArray(record?.result?.metadata?.dataSourceLabels)
+      ? record.result.metadata.dataSourceLabels.filter((label): label is string => typeof label === "string" && Boolean(label.trim()))
+      : [];
+    const dataSourceLabel = typeof record?.request.dataSourceLabel === "string" ? reportDataSourceName(record.request.dataSourceLabel) : null;
+    return uniqueValues([...temporaryLabels, ...metadataLabels, dataSourceLabel].filter((label): label is string => Boolean(label?.trim())));
+  }
+
+  private toolRecordSelectedFieldNames(record: ToolCallRecord | null | undefined) {
+    const requestFields = Array.isArray(record?.request.selectedFieldRefs)
+      ? record.request.selectedFieldRefs
+        .filter((field): field is ChatCsvSelectedFieldRef => Boolean(field) && field.status === "valid")
+        .map((field) => field.displayName || field.sourceHeader || field.physicalName || field.rawText)
+      : [];
+    const metadataFields = Array.isArray(record?.result?.metadata?.selectedFieldNames)
+      ? record.result.metadata.selectedFieldNames.filter((field): field is string => typeof field === "string" && Boolean(field.trim()))
+      : [];
+    return uniqueValues([...requestFields, ...metadataFields].filter((field): field is string => typeof field === "string" && Boolean(field.trim())));
+  }
+
+  private analysisReportContextFromRecords(records: Array<ToolCallRecord | null | undefined>) {
+    const sourceLabels = uniqueValues(records.flatMap((record) => this.toolRecordDataSourceLabels(record)));
+    const selectedFieldNames = uniqueValues(records.flatMap((record) => this.toolRecordSelectedFieldNames(record)));
+    return {
+      sourceName: sourceLabels[0] ?? null,
+      selectedFieldNames,
     };
   }
 
@@ -3622,7 +3788,7 @@ export class AssistantRuntime {
         }
         : tool;
     throwIfAssistantOperationCancelled(signal);
-    const toolMetadata = this.toolCallMetadataForInput(input);
+    const toolMetadata = this.toolCallMetadataForInput(input, conversation);
 
     if (normalizedTool.kind === "sql" && !isReadonlySql(normalizedTool.script)) {
       const toolCall = this.insertToolCall({
@@ -3963,6 +4129,10 @@ export class AssistantRuntime {
         prompt: sourcePrompt,
         modelName: "local-workflow",
         approvalMode: toolCall.approvalMode,
+        dataSourceId: toolCall.metadata?.dataSourceId ?? null,
+        dataSourceLabel: toolCall.metadata?.dataSourceLabel ?? null,
+        selectedTempDataSourceIds: toolCall.metadata?.selectedTempDataSourceIds ?? [],
+        selectedFieldRefs: toolCall.metadata?.selectedFieldRefs ?? [],
       },
       conversation,
       message,
@@ -4923,6 +5093,10 @@ export class AssistantRuntime {
         userRequest: this.sourcePromptForToolCall(toolCall),
         script: toolCall.script,
         approvalMode: toolCall.approvalMode,
+        dataSourceId: toolCall.metadata?.dataSourceId ?? undefined,
+        dataSourceLabel: toolCall.metadata?.dataSourceLabel ?? undefined,
+        temporaryDataSourceLabels: toolCall.metadata?.temporaryDataSourceLabels ?? [],
+        selectedFieldRefs: toolCall.metadata?.selectedFieldRefs ?? [],
       },
       resolvedInput: parent
         ? {
@@ -4943,6 +5117,9 @@ export class AssistantRuntime {
         metadata: {
           assistantToolKind: toolCall.kind,
           approvalMode: toolCall.approvalMode,
+          rowCount: toolCall.kind === "sql" ? input.sqlDataset?.rowCount ?? parseSqlToolRowCount(input.result) ?? undefined : undefined,
+          dataSourceLabels: this.toolCallDataSourceLabels(toolCall),
+          selectedFieldNames: this.selectedFieldNamesForToolCall(toolCall),
           resultPreview: truncateText(input.result, 20_000),
           resultPreviewFormat: isJsonContent(input.result) ? "json" : "text",
         },
@@ -5005,16 +5182,27 @@ export class AssistantRuntime {
       return existing;
     }
 
-    const title = inferReportTitle(markdown) ?? "SQL 查询结果分析";
+    const reportContext = this.analysisReportContextFromRecords([pythonRecord]);
+    const title = normalizeAnalysisReportTitle({
+      sourceName: reportContext.sourceName,
+      markdown,
+    });
+    const normalizedMarkdown = normalizeAnalysisReportMarkdown(markdown, {
+      title,
+      sourceName: reportContext.sourceName,
+      selectedFieldNames: reportContext.selectedFieldNames,
+    });
     const artifact = await this.toolArtifactManager.createArtifact({
       artifactId: `assistant-report-markdown:${toolCall.id}`,
       artifactType: "report_markdown",
       title,
       contentType: "markdown",
-      content: markdown,
+      content: normalizedMarkdown,
       metadata: {
         messageId: message.id,
         sourcePythonToolCallId: toolCall.id,
+        dataSourceLabels: reportContext.sourceName ? [reportContext.sourceName] : [],
+        selectedFieldNames: reportContext.selectedFieldNames,
       },
     });
     const version = (await this.toolResultRegistry.listByConversation(toolCall.conversationId)).filter((record) => record.toolKind === "report_generation").length + 1;
@@ -5031,6 +5219,9 @@ export class AssistantRuntime {
         userRequest: this.sourcePromptForToolCall(toolCall),
         title,
         source: "python-analysis-result",
+        dataSourceLabel: typeof pythonRecord.request.dataSourceLabel === "string" ? pythonRecord.request.dataSourceLabel : undefined,
+        temporaryDataSourceLabels: Array.isArray(pythonRecord.request.temporaryDataSourceLabels) ? pythonRecord.request.temporaryDataSourceLabels : [],
+        selectedFieldRefs: Array.isArray(pythonRecord.request.selectedFieldRefs) ? pythonRecord.request.selectedFieldRefs : [],
       },
       resolvedInput: {
         mode: "latest_result",
@@ -5049,6 +5240,8 @@ export class AssistantRuntime {
         metadata: {
           messageId: message.id,
           sourcePythonToolCallId: toolCall.id,
+          dataSourceLabels: reportContext.sourceName ? [reportContext.sourceName] : [],
+          selectedFieldNames: reportContext.selectedFieldNames,
         },
       },
       parentToolCallIds: [pythonRecord.toolCallId],
@@ -5223,14 +5416,47 @@ export class AssistantRuntime {
     artifact: Parameters<ArtifactManager["createArtifact"]>[0];
     parentKinds: ToolKind[];
   }) {
+    const parents = (await Promise.all(input.parentKinds.map((toolKind) => this.toolResultRegistry.getLatestSuccessful(input.message.conversationId, toolKind))))
+      .filter((record): record is ToolCallRecord => Boolean(record));
+    const sourceArtifactIds = uniqueValues(parents.flatMap((record) => record.outputArtifactIds ?? record.result?.artifactIds ?? []));
+    const parentToolCallIds = uniqueValues(parents.map((record) => record.toolCallId));
+    const primaryParent = parents[0];
+    const reportContext = input.toolKind === "report_generation" ? this.analysisReportContextFromRecords(parents) : { sourceName: null, selectedFieldNames: [] };
+    let title = input.title;
+    let summary = input.summary;
+    let artifactInput = input.artifact;
+    if (input.toolKind === "report_generation" && input.artifact.contentType === "markdown" && typeof input.artifact.content === "string") {
+      title = normalizeAnalysisReportTitle({
+        sourceName: reportContext.sourceName,
+        requestedTitle: input.title,
+        markdown: input.artifact.content,
+      });
+      artifactInput = {
+        ...input.artifact,
+        title,
+        content: normalizeAnalysisReportMarkdown(input.artifact.content, {
+          title,
+          sourceName: reportContext.sourceName,
+          selectedFieldNames: reportContext.selectedFieldNames,
+        }),
+        metadata: {
+          ...(input.artifact.metadata ?? {}),
+          dataSourceLabels: reportContext.sourceName ? [reportContext.sourceName] : [],
+          selectedFieldNames: reportContext.selectedFieldNames,
+        },
+      };
+      summary = input.summary.includes(input.title)
+        ? input.summary.replace(input.title, title)
+        : `Markdown 报告「${title}」已生成。`;
+    }
     const existing = await this.toolResultRegistry.get(input.toolCallId);
     if (existing?.status === "completed") {
-      const artifact = await this.toolArtifactManager.createArtifact(input.artifact);
+      const artifact = await this.toolArtifactManager.createArtifact(artifactInput);
       const updated = await this.toolResultRegistry.update(input.toolCallId, {
         request: {
           ...existing.request,
           userRequest: input.userRequest,
-          title: input.title,
+          title,
           source: typeof existing.request.source === "string" ? existing.request.source : "assistant-generated-message",
         },
         result: {
@@ -5241,18 +5467,20 @@ export class AssistantRuntime {
           }),
           artifactIds: [artifact.artifactId],
           primaryArtifactId: artifact.artifactId,
-          summary: input.summary,
+          summary,
           metadata: {
             ...(existing.result?.metadata ?? {}),
             messageId: input.message.id,
             artifactType: artifact.artifactType,
+            dataSourceLabels: reportContext.sourceName ? [reportContext.sourceName] : [],
+            selectedFieldNames: reportContext.selectedFieldNames,
           },
         },
         outputArtifactIds: [artifact.artifactId],
         completedAt: nowIso(),
         metadata: {
           ...(existing.metadata ?? {}),
-          title: input.title,
+          title,
         },
       });
       await this.toolResultRegistry.markLatestSuccessful(input.message.conversationId, input.toolCallId);
@@ -5260,12 +5488,7 @@ export class AssistantRuntime {
       await this.createCompletedToolCheckpoint(saved);
       return saved;
     }
-    const parents = (await Promise.all(input.parentKinds.map((toolKind) => this.toolResultRegistry.getLatestSuccessful(input.message.conversationId, toolKind))))
-      .filter((record): record is ToolCallRecord => Boolean(record));
-    const sourceArtifactIds = uniqueValues(parents.flatMap((record) => record.outputArtifactIds ?? record.result?.artifactIds ?? []));
-    const parentToolCallIds = uniqueValues(parents.map((record) => record.toolCallId));
-    const primaryParent = parents[0];
-    const artifact = await this.toolArtifactManager.createArtifact(input.artifact);
+    const artifact = await this.toolArtifactManager.createArtifact(artifactInput);
     const version = (await this.toolResultRegistry.listByConversation(input.message.conversationId)).filter((record) => record.toolKind === input.toolKind).length + 1;
     const record: ToolCallRecord = {
       toolCallId: input.toolCallId,
@@ -5277,7 +5500,7 @@ export class AssistantRuntime {
       status: "completed",
       request: {
         userRequest: input.userRequest,
-        title: input.title,
+        title,
         source: "assistant-generated-message",
       },
       resolvedInput: primaryParent
@@ -5297,11 +5520,13 @@ export class AssistantRuntime {
         toolKind: input.toolKind,
         artifactIds: [artifact.artifactId],
         primaryArtifactId: artifact.artifactId,
-        summary: input.summary,
+        summary,
         createdAt: input.message.updatedAt,
         metadata: {
           messageId: input.message.id,
           artifactType: artifact.artifactType,
+          dataSourceLabels: reportContext.sourceName ? [reportContext.sourceName] : [],
+          selectedFieldNames: reportContext.selectedFieldNames,
         },
       },
       parentToolCallIds,
@@ -5314,7 +5539,7 @@ export class AssistantRuntime {
       completedAt: input.message.updatedAt,
       metadata: {
         source: "assistant-generated-message",
-        title: input.title,
+        title,
       },
     };
     await this.toolResultRegistry.register(record);
@@ -5323,7 +5548,7 @@ export class AssistantRuntime {
       conversationId: input.message.conversationId,
       userId: input.message.userId,
       type: `${input.toolKind}_completed`,
-      summary: input.summary,
+      summary,
       payload: {
         toolCallId: input.toolCallId,
         toolKind: input.toolKind,
@@ -5803,12 +6028,14 @@ export class AssistantRuntime {
         signal: controller.signal,
         timeoutMs: MODEL_STREAM_TIMEOUT_MS,
       })) {
+        throwIfAssistantOperationCancelled(controller.signal);
         providerTraceId = event.traceId ?? providerTraceId;
         if (event.type === "markdown-delta" || event.type === "text-delta") {
           const delta = typeof event.payload.delta === "string" ? event.payload.delta : "";
           if (!delta) {
             continue;
           }
+          throwIfAssistantOperationCancelled(controller.signal);
           content = `${content}${delta}`;
           if (content.length > MAX_STREAM_CHARS) {
             throw new Error("模型输出超过本地安全限制，已终止。");
@@ -5839,6 +6066,7 @@ export class AssistantRuntime {
           continue;
         }
         if (event.type === "tool-call-start" || event.type === "tool-execution-start") {
+          throwIfAssistantOperationCancelled(controller.signal);
           providerToolActivity = true;
           const current = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(assistantMessage.id));
           const updated = this.updateMessage(assistantMessage.id, {
@@ -5856,6 +6084,7 @@ export class AssistantRuntime {
         }
       }
 
+      throwIfAssistantOperationCancelled(controller.signal);
       const latestMessage = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(assistantMessage.id));
       if (
         latestMessage.status === "waiting_for_user_input" ||
@@ -5916,10 +6145,12 @@ export class AssistantRuntime {
         await this.registerAssistantGeneratedArtifacts(input, completed);
       }
       if (tool && !shouldStartSkillWorkflow) {
+        throwIfAssistantOperationCancelled(controller.signal);
         await this.handleToolCall(input, conversation, completed, tool, { appendToMessage: true }, controller.signal);
       } else if (shouldStartFallbackTempCsvSql) {
         return;
       } else if (shouldStartSkillWorkflow) {
+        throwIfAssistantOperationCancelled(controller.signal);
         await this.routeOverallRiskSkillWorkflow(input, conversation, completed);
       }
     } catch (error) {

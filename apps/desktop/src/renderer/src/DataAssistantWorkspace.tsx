@@ -475,6 +475,26 @@ export function chatTokensForFieldRefs(fieldRefs: ChatCsvSelectedFieldRef[]) {
     }));
 }
 
+export function copyTextForMessage(message: AssistantMessage) {
+  const content = message.content || message.errorMessage || "";
+  if (message.role !== "user") {
+    return content.trim();
+  }
+  const fieldRefs = message.context?.selectedFieldRefs?.filter((field) => field.status === "valid") ?? [];
+  if (fieldRefs.length === 0) {
+    return content.trim();
+  }
+  const ranges = fieldTokenRangesForContent(content, fieldRefs).sort((left, right) => right.end - left.end);
+  let copyText = content;
+  for (const range of ranges) {
+    const nextChar = copyText.slice(range.end, range.end + 1);
+    if (/[\t \u00a0\u3000]/u.test(nextChar)) {
+      copyText = `${copyText.slice(0, range.end)}${copyText.slice(range.end + 1)}`;
+    }
+  }
+  return copyText.trim();
+}
+
 export function mergeFieldRefsWithTextMatches(
   content: string,
   fieldRefs: ChatCsvSelectedFieldRef[],
@@ -970,21 +990,33 @@ function artifactChartCount(message: AssistantMessage, toolState?: ConversationT
 export function artifactDataSourceMeta(message: AssistantMessage, toolState?: ConversationToolState | null) {
   const sources = new Map<string, string>();
   const addSource = (key?: string, label?: string) => {
-    const normalizedKey = key?.trim() || label?.trim();
+    const normalizedKey = label?.trim() || key?.trim();
     if (!normalizedKey) {
       return;
     }
     sources.set(normalizedKey, label?.trim() || normalizedKey);
   };
   for (const record of toolRecordsForMessage(message, toolState)) {
-    if (record.toolKind === "sql_query") {
-      const dataSourceId = typeof record.request.dataSourceId === "string" ? record.request.dataSourceId : undefined;
-      const dataSourceLabel = typeof record.request.dataSourceLabel === "string" ? record.request.dataSourceLabel : undefined;
+    const requestTempLabels = Array.isArray(record.request.temporaryDataSourceLabels)
+      ? record.request.temporaryDataSourceLabels.filter((label): label is string => typeof label === "string" && Boolean(label.trim()))
+      : [];
+    const metadataLabels = Array.isArray(record.result?.metadata?.dataSourceLabels)
+      ? record.result.metadata.dataSourceLabels.filter((label): label is string => typeof label === "string" && Boolean(label.trim()))
+      : [];
+    for (const label of [...requestTempLabels, ...metadataLabels]) {
+      addSource(label);
+    }
+    const dataSourceId = typeof record.request.dataSourceId === "string" ? record.request.dataSourceId : undefined;
+    const dataSourceLabel = typeof record.request.dataSourceLabel === "string" ? dataSourceTableLabel(record.request.dataSourceLabel) : undefined;
+    if (dataSourceId || dataSourceLabel) {
       addSource(dataSourceId ?? dataSourceLabel, dataSourceLabel ?? dataSourceId);
     }
   }
+  for (const label of message.context?.temporaryDataSourceLabels ?? []) {
+    addSource(label);
+  }
   if (sources.size === 0 && message.context?.dataSourceLabel) {
-    addSource(message.context.dataSourceLabel);
+    addSource(dataSourceTableLabel(message.context.dataSourceLabel));
   }
   const labels = Array.from(sources.values());
   return { count: labels.length, labels };
@@ -1649,7 +1681,7 @@ export function DataAssistantWorkspace({
           return;
         }
         if (event.message.status === "stopped") {
-          locallyStoppedMessageIdsRef.current.delete(event.message.id);
+          pendingMessageDeltasRef.current.delete(event.message.id);
         }
         upsertMessage(event.conversationId, event.message);
         return;
@@ -1659,6 +1691,12 @@ export function DataAssistantWorkspace({
         return;
       }
       if (event.type === "stream-content") {
+        if (
+          locallyStoppedMessageIdsRef.current.has(event.event.messageId) &&
+          event.event.type !== "message_stream_completed"
+        ) {
+          return;
+        }
         applyChatStreamEvent(streamSegmentManagerRef.current, event.event as ChatStreamEvent);
         setStreamContentRevision((current) => current + 1);
         return;
@@ -1669,7 +1707,7 @@ export function DataAssistantWorkspace({
           return;
         }
         if (event.message.status === "stopped") {
-          locallyStoppedMessageIdsRef.current.delete(event.message.id);
+          pendingMessageDeltasRef.current.delete(event.message.id);
         }
         upsertMessage(event.conversationId, event.message);
         return;
@@ -2574,7 +2612,7 @@ export function DataAssistantWorkspace({
 
   const copyMessage = useCallback(
     async (message: AssistantMessage) => {
-      const copyText = message.content.trim() || message.errorMessage || "";
+      const copyText = copyTextForMessage(message);
       if (!copyText) {
         return;
       }
@@ -2815,10 +2853,13 @@ export function DataAssistantWorkspace({
         return;
       }
 
+      const retryStartedAt = new Date().toISOString();
       patchMessage(message.conversationId, message.id, {
         status: "receiving",
         content: "",
         blocks: [{ id: createOptimisticMessageId(), type: "text", content: "" }],
+        createdAt: retryStartedAt,
+        updatedAt: retryStartedAt,
         errorMessage: undefined,
       });
 
@@ -3142,7 +3183,7 @@ export function DataAssistantWorkspace({
           upsertMessage(result.conversation.id, result.assistantMessage);
         } else if (result.assistantMessage.status === "stopped") {
           upsertMessage(result.conversation.id, result.assistantMessage);
-          locallyStoppedMessageIdsRef.current.delete(optimisticAssistantMessageId);
+          pendingMessageDeltasRef.current.delete(optimisticAssistantMessageId);
         }
         setActiveConversationId(result.conversation.id);
         const toolState = await window.lifecycleX.assistant.getToolState(user.id, result.conversation.id);
