@@ -26,6 +26,52 @@ function normalizeSearch(value: string) {
   return value.trim().toLowerCase();
 }
 
+function normalizeSearchCompact(value: string) {
+  return normalizeSearch(value)
+    .normalize("NFKC")
+    .replace(/[（(][^（）()]*[）)]/gu, "")
+    .replace(/[\s"'“”‘’`.,，。；;:：!?！？、/\\|()[\]{}<>《》【】]+/gu, "");
+}
+
+function fieldMatchesQuery(field: ConversationCsvField, query: string) {
+  const normalizedQuery = normalizeSearch(query);
+  if (!normalizedQuery) {
+    return true;
+  }
+
+  const values = [
+    field.displayName,
+    field.sourceHeader,
+    field.physicalName,
+    field.fieldComment,
+    field.logicalType,
+    field.sqliteType,
+  ];
+  if (values.some((value) => normalizeSearch(value ?? "").includes(normalizedQuery))) {
+    return true;
+  }
+
+  const compactQuery = normalizeSearchCompact(query);
+  if (!compactQuery) {
+    return false;
+  }
+  return values.some((value) => {
+    const compactValue = normalizeSearchCompact(value ?? "");
+    const canUsePrefixFallback = compactValue.length >= 4 && compactQuery.length >= 4;
+    return (
+      compactValue.length > 0 &&
+      (
+        compactValue.includes(compactQuery) ||
+        (canUsePrefixFallback && (
+          compactQuery.includes(compactValue) ||
+          compactValue.startsWith(compactQuery) ||
+          compactQuery.startsWith(compactValue)
+        ))
+      )
+    );
+  });
+}
+
 function isInsideMarkdownCode(value: string, start: number) {
   const before = value.slice(0, start);
   const fencedCount = before.match(/```/g)?.length ?? 0;
@@ -84,16 +130,7 @@ export function filterConversationCsvFields(fields: ConversationCsvField[], quer
   if (!normalizedQuery) {
     return fields;
   }
-  return fields.filter((field) =>
-    [
-      field.displayName,
-      field.sourceHeader,
-      field.physicalName,
-      field.fieldComment,
-      field.logicalType,
-      field.sqliteType,
-    ].some((value) => normalizeSearch(value ?? "").includes(normalizedQuery)),
-  );
+  return fields.filter((field) => fieldMatchesQuery(field, query));
 }
 
 export function selectConversationCsvFields(input: {

@@ -56,6 +56,14 @@ describe("chat field selector mention parsing", () => {
     expect(findChatFieldMention("查询 #短中长期贷款标识")).toEqual({ start: 3, end: 12, query: "短中长期贷款标识" });
   });
 
+  it("detects field mentions at the current cursor inside existing text", () => {
+    const value = "查询 上海分行的数据，并统计占比";
+    const inserted = "查询 上海分行 #风险 的数据，并统计占比";
+    expect(findChatFieldMention(inserted, "查询 上海分行 #风险".length)).toEqual({ start: 8, end: 11, query: "风险" });
+    expect(findChatFieldMention(inserted, inserted.length)).toBeNull();
+    expect(value).toContain("统计占比");
+  });
+
   it("does not trigger for markdown headings, url fragments, or code", () => {
     expect(findChatFieldMention("# 标题")).toBeNull();
     expect(findChatFieldMention("https://example.com/a#贷款")).toBeNull();
@@ -76,6 +84,8 @@ describe("chat field selector field operations", () => {
     expect(fields).toHaveLength(2);
     expect(filterConversationCsvFields(fields, "贷款")).toHaveLength(1);
     expect(filterConversationCsvFields(fields, "decimal")[0].displayName).toBe("贷款余额（万元）");
+    expect(filterConversationCsvFields(fields, "贷款余额（余额）")[0].displayName).toBe("贷款余额（万元）");
+    expect(filterConversationCsvFields(fields, "贷款余额（万元）以及")[0].displayName).toBe("贷款余额（万元）");
   });
 
   it("orders selected and recent fields before source order with a 200 item cap", () => {

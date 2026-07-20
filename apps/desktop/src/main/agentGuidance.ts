@@ -242,6 +242,13 @@ export type WorkflowResumeInput = {
   toolState?: ConversationToolState | null;
 };
 
+type ClarificationContext = {
+  dataSourceLabel?: string | null;
+  tempSources?: ConversationTempCsvTable[];
+  selectedFieldRefs?: ChatCsvSelectedFieldRef[];
+  toolState?: ConversationToolState | null;
+};
+
 export type WorkflowResumeResult = {
   canResume: boolean;
   mergedPrompt: string;
@@ -297,7 +304,7 @@ export function cancelWorkflowCheckpoint(input: { checkpoint: WorkflowCheckpoint
 }
 
 function asksForDataWork(prompt: string) {
-  return /(查询|查一下|统计|汇总|分析|分布|占比|比例|绘制|图表|可视化|报告|看看).{0,80}(数据|字段|分布|报告|图表|风险|贷款|分类)?/i.test(prompt);
+  return /(查询|查一下|统计|汇总|计数|总计|数量|笔数|条数|个数|多少\s*(例|笔|条|个)?|各有多少|共有多少|分析|分布|占比|比例|绘制|图表|可视化|报告|看看).{0,80}(数据|字段|分布|报告|图表|风险|贷款|分类)?/i.test(prompt);
 }
 
 function asksForReport(prompt: string) {
@@ -305,7 +312,7 @@ function asksForReport(prompt: string) {
 }
 
 function asksForDistribution(prompt: string) {
-  return /(分布|分类|占比|比例|汇总|统计|风险)/i.test(prompt);
+  return /(分布|分类|占比|比例|汇总|统计|计数|总计|数量|笔数|条数|个数|多少\s*(例|笔|条|个)?|各有多少|共有多少|风险)/i.test(prompt);
 }
 
 function asksForChart(prompt: string) {
@@ -330,6 +337,14 @@ function asksForAmountMetric(prompt: string) {
 
 function asksForSpecificChartType(prompt: string) {
   return /(柱状图|条形图|折线图|趋势图|饼图|环形图|散点图|气泡图|热力图|漏斗图|瀑布图|帕累托|表格)/i.test(prompt);
+}
+
+function referencesPriorAnalysisResult(prompt: string) {
+  return /(数据分析结果|分析结果|python\s*分析结果|工具分析结果|上一轮分析|最近分析|当前分析|当前结果|刚才的结果|上一轮结果)/i.test(prompt);
+}
+
+function explicitlyRequestsFreshData(prompt: string) {
+  return /(重新查询|重新查|再查询|再查|重新检索|重新获取|重新读取|重新分析|重新统计|重新计算)/i.test(prompt);
 }
 
 function hasAnyDataSource(input: MissingInputDetectorInput) {
@@ -396,6 +411,143 @@ function promptMentionsCandidate(prompt: string, input: MissingWorkflowInput) {
   );
 }
 
+function normalizeFieldReferenceText(value: string) {
+  return value
+    .trim()
+    .toLowerCase()
+    .normalize("NFKC")
+    .replace(/[（(][^（）()]*[）)]/gu, "")
+    .replace(/[\s"'“”‘’`.,，。；;:：!?！？、/\\|()[\]{}<>《》【】]+/gu, "");
+}
+
+function promptMentionsColumn(prompt: string, column: ConversationTempCsvTable["columns"][number]) {
+  const compactPrompt = normalizeFieldReferenceText(prompt);
+  return [column.displayName, column.sourceHeader, column.sqliteColumnName].some((value) => {
+    const compactValue = normalizeFieldReferenceText(value ?? "");
+    return compactValue.length > 0 && compactPrompt.includes(`#${compactValue}`);
+  });
+}
+
+type PromptFieldReference = {
+  rawText: string;
+  query: string;
+};
+
+function extractPromptFieldReferences(prompt: string): PromptFieldReference[] {
+  const references: PromptFieldReference[] = [];
+  const seen = new Set<string>();
+  const startPattern = /(^|[\s，。；;,.!?！？、（(])#/gu;
+  let match: RegExpExecArray | null;
+  while ((match = startPattern.exec(prompt)) !== null) {
+    const hashIndex = match.index + match[1].length;
+    let cursor = hashIndex + 1;
+    while (cursor < prompt.length && !/[\s#，。；;,.!?！？、"'“”‘’`\n\r\t]/u.test(prompt[cursor])) {
+      cursor += 1;
+    }
+    const query = prompt.slice(hashIndex + 1, cursor).trim();
+    if (!query || /^https?:\/\//iu.test(prompt.slice(Math.max(0, hashIndex - 12), cursor))) {
+      continue;
+    }
+    const rawText = prompt.slice(hashIndex, cursor);
+    const key = normalizeFieldReferenceText(rawText);
+    if (!seen.has(key)) {
+      references.push({ rawText, query });
+      seen.add(key);
+    }
+  }
+  return references;
+}
+
+function columnReferenceValues(column: ConversationTempCsvTable["columns"][number]) {
+  return [column.displayName, column.sourceHeader, column.sqliteColumnName].filter((value): value is string => Boolean(value?.trim()));
+}
+
+function hasExactColumnReference(reference: PromptFieldReference, column: ConversationTempCsvTable["columns"][number]) {
+  const compactReference = normalizeFieldReferenceText(reference.query);
+  return columnReferenceValues(column).some((value) => {
+    const compactValue = normalizeFieldReferenceText(value);
+    return compactValue.length > 0 && (compactReference === compactValue || compactReference.includes(compactValue));
+  });
+}
+
+function characterDice(left: string, right: string) {
+  const leftChars = Array.from(new Set(left));
+  const rightChars = new Set(Array.from(right));
+  if (leftChars.length === 0 || rightChars.size === 0) {
+    return 0;
+  }
+  const overlap = leftChars.filter((char) => rightChars.has(char)).length;
+  return (2 * overlap) / (leftChars.length + rightChars.size);
+}
+
+function fieldReferenceSimilarity(reference: string, value: string) {
+  const left = normalizeFieldReferenceText(reference);
+  const right = normalizeFieldReferenceText(value);
+  if (!left || !right) {
+    return 0;
+  }
+  if (left === right) {
+    return 1;
+  }
+  if (left.includes(right) || right.includes(left)) {
+    return 0.92 * (Math.min(left.length, right.length) / Math.max(left.length, right.length));
+  }
+  return characterDice(left, right);
+}
+
+function similarFieldCandidates(input: MissingInputDetectorInput, reference: PromptFieldReference) {
+  const candidates = input.tempSources?.flatMap((source) =>
+    source.columns.map((column) => {
+      const score = Math.max(...columnReferenceValues(column).map((value) => fieldReferenceSimilarity(reference.query, value)));
+      return {
+        value: column.sqliteColumnName,
+        label: column.displayName,
+        description: `疑似匹配 ${reference.rawText} · ${source.fileName} · ${column.sqliteType}`,
+        confidence: score,
+        metadata: {
+          tempDataSourceId: source.tempDataSourceId,
+          sqliteTableName: source.sqliteTableName,
+          logicalType: column.inferredLogicalType,
+          sqliteType: column.sqliteType,
+          rawReference: reference.rawText,
+          sampleValues: column.sampleValues?.slice(0, 3),
+        },
+      } satisfies MissingInputCandidate;
+    }),
+  ) ?? [];
+  return candidates
+    .filter((candidate) => (candidate.confidence ?? 0) >= 0.42)
+    .sort((left, right) => (right.confidence ?? 0) - (left.confidence ?? 0))
+    .slice(0, 5);
+}
+
+function unresolvedPromptFieldReferences(input: MissingInputDetectorInput) {
+  if (!input.tempSources?.length) {
+    return [];
+  }
+  const sourceColumns = input.tempSources.flatMap((source) => source.columns);
+  return extractPromptFieldReferences(input.prompt)
+    .filter((reference) => !sourceColumns.some((column) => hasExactColumnReference(reference, column)))
+    .map((reference) => ({ reference, candidates: similarFieldCandidates(input, reference) }));
+}
+
+function promptMentionsAnySourceField(input: MissingInputDetectorInput) {
+  return Boolean(input.tempSources?.some((source) =>
+    source.columns.some((column) => promptMentionsColumn(input.prompt, column)),
+  ));
+}
+
+function isMetricColumn(column: ConversationTempCsvTable["columns"][number]) {
+  const text = `${column.displayName}\n${column.sourceHeader}\n${column.sqliteColumnName}\n${column.inferredLogicalType}\n${column.sqliteType}`;
+  return /(金额|余额|本金|敞口|amount|balance|principal|decimal|number|integer|real|int|numeric)/i.test(text);
+}
+
+function promptMentionsMetricField(input: MissingInputDetectorInput) {
+  return Boolean(input.tempSources?.some((source) =>
+    source.columns.some((column) => isMetricColumn(column) && promptMentionsColumn(input.prompt, column)),
+  ));
+}
+
 function fieldCandidates(input: MissingInputDetectorInput) {
   const fields = input.tempSources?.flatMap((source) =>
     source.columns.map((column) => {
@@ -448,7 +600,7 @@ function hasSelectedMetricField(input: MissingInputDetectorInput) {
     }
     const text = `${field.displayName}\n${field.physicalName}\n${field.logicalType}\n${field.sqliteType}`;
     return /(金额|余额|本金|敞口|amount|balance|principal|decimal|number|integer|real|int|numeric)/i.test(text);
-  }));
+  })) || promptMentionsMetricField(input);
 }
 
 export class MissingInputDetector {
@@ -457,6 +609,19 @@ export class MissingInputDetector {
     const missingInputs: MissingWorkflowInput[] = [];
     const warnings: string[] = [];
     const selectedFieldCount = input.selectedFieldRefs?.filter((field) => field.status === "valid").length ?? 0;
+    const canUsePriorQueryForAnalysis = !explicitlyRequestsFreshData(prompt) && asksForDataWork(prompt) && !asksForChart(prompt) && !asksForReport(prompt) && hasSqlOrPythonResult(input.toolState);
+    const canUsePriorAnalysisForChart = !explicitlyRequestsFreshData(prompt) && asksForChart(prompt) && hasSqlOrPythonResult(input.toolState);
+    const canUsePriorArtifactsForReport = !explicitlyRequestsFreshData(prompt) && asksForReport(prompt) && hasReportInputResult(input.toolState);
+    const canUsePriorResult = canUsePriorQueryForAnalysis || canUsePriorAnalysisForChart || canUsePriorArtifactsForReport || (referencesPriorAnalysisResult(prompt) && hasSqlOrPythonResult(input.toolState));
+    const unresolvedFieldReferences = unresolvedPromptFieldReferences(input);
+    const hasUnresolvedFieldReferences = unresolvedFieldReferences.length > 0;
+    const canBuildReportFromCurrentDataRequest =
+      asksForReport(prompt) &&
+      hasAnyDataSource(input) &&
+      asksForDataWork(prompt) &&
+      (asksForDistribution(prompt) || asksForAmountMetric(prompt) || /(查询|统计|汇总|分析|占比|比例)/i.test(prompt)) &&
+      (hasSelectedValidField(input) || promptMentionsAnySourceField(input)) &&
+      !hasUnresolvedFieldReferences;
 
     if (!asksForDataWork(prompt)) {
       missingInputs.push({
@@ -468,7 +633,7 @@ export class MissingInputDetector {
       });
     }
 
-    if (asksForDataWork(prompt) && !hasAnyDataSource(input)) {
+    if (asksForDataWork(prompt) && !hasAnyDataSource(input) && !canUsePriorResult) {
       missingInputs.push({
         key: "data_source",
         label: "数据源",
@@ -478,7 +643,20 @@ export class MissingInputDetector {
       });
     }
 
-    if (hasAnyDataSource(input) && asksForGenericLookup(prompt) && !hasSelectedValidField(input)) {
+    for (const { reference, candidates } of unresolvedFieldReferences) {
+      missingInputs.push({
+        key: `field_reference:${reference.rawText}`,
+        label: `字段 ${reference.rawText}`,
+        type: "field",
+        required: true,
+        description: candidates.length > 0
+          ? `当前数据源中不存在 ${reference.rawText}，请从语义相近的推荐字段中选择真实字段。`
+          : `当前数据源中不存在 ${reference.rawText}，也没有找到足够相近的推荐字段，请重新输入真实字段名。`,
+        candidates,
+      });
+    }
+
+    if (hasAnyDataSource(input) && asksForGenericLookup(prompt) && !hasSelectedValidField(input) && !promptMentionsAnySourceField(input) && !hasUnresolvedFieldReferences) {
       const candidates = fieldCandidates(input);
       missingInputs.push({
         key: "query_target",
@@ -493,7 +671,7 @@ export class MissingInputDetector {
       }
     }
 
-    if (asksForReport(prompt) && !hasAnalysisResult(input.toolState)) {
+    if (asksForReport(prompt) && !hasReportInputResult(input.toolState) && !canBuildReportFromCurrentDataRequest) {
       missingInputs.push({
         key: "report_input",
         label: "报告输入结果",
@@ -503,7 +681,7 @@ export class MissingInputDetector {
       });
     }
 
-    if (hasAnyDataSource(input) && asksForDistribution(prompt) && selectedFieldCount === 0 && !asksForReport(prompt)) {
+    if (hasAnyDataSource(input) && asksForDistribution(prompt) && selectedFieldCount === 0 && !promptMentionsAnySourceField(input) && !hasUnresolvedFieldReferences && !asksForReport(prompt) && !canUsePriorResult) {
       const candidates = fieldCandidates(input);
       missingInputs.push({
         key: "classification_or_dimension_field",
@@ -518,7 +696,7 @@ export class MissingInputDetector {
       }
     }
 
-    if (hasAnyDataSource(input) && asksForAmountMetric(prompt) && !hasSelectedMetricField(input) && !asksForReport(prompt)) {
+    if (hasAnyDataSource(input) && asksForAmountMetric(prompt) && !hasSelectedMetricField(input) && !hasUnresolvedFieldReferences && !asksForReport(prompt) && !canUsePriorResult) {
       missingInputs.push({
         key: "amount_metric_field",
         label: "金额指标字段",
@@ -529,7 +707,7 @@ export class MissingInputDetector {
       });
     }
 
-    if (hasAnyDataSource(input) && asksForTemporalScope(prompt) && !hasExplicitDateRange(prompt)) {
+    if (hasAnyDataSource(input) && asksForTemporalScope(prompt) && !hasExplicitDateRange(prompt) && !canUsePriorResult) {
       missingInputs.push({
         key: "date_range",
         label: "时间范围",
@@ -539,7 +717,7 @@ export class MissingInputDetector {
       });
     }
 
-    if (asksForChart(prompt) && !hasAnalysisResult(input.toolState)) {
+    if (asksForChart(prompt) && !hasSqlOrPythonResult(input.toolState)) {
       missingInputs.push({
         key: "chart_input",
         label: "图表输入数据",
@@ -732,6 +910,7 @@ export class GuidanceEngine {
     workflowId?: string;
     detection: MissingInputDetectionResult;
     prompt: string;
+    context?: ClarificationContext;
   }): { guidance: AgentGuidance; issue: AgentWorkflowIssue; checkpoint: WorkflowCheckpoint } {
     const createdAt = nowIso();
     const workflowId = input.workflowId ?? guidanceId("workflow");
@@ -745,7 +924,7 @@ export class GuidanceEngine {
       conversationId: input.conversationId,
       type: guidanceTypeFor(primaryMissing),
       title: titleForMissingInput(primaryMissing),
-      message: buildMissingInputMessage(input.detection.missingInputs, input.detection.warnings),
+      message: buildMissingInputMessage(input.detection.missingInputs, input.detection.warnings, input.context),
       requiredInputs: input.detection.missingInputs,
       actions,
       blocking: true,
@@ -904,22 +1083,8 @@ export class WorkflowRecoveryManager {
 
 export class NextActionRecommender {
   recommend(input: { conversationId: string; workflowId?: string; toolKind: ToolKind; record?: ToolCallRecord | null; rowCount?: number; columnCount?: number }) {
-    const createdAt = nowIso();
-    const workflowId = input.workflowId ?? guidanceId("workflow");
-    if (input.toolKind === "sql_query") {
-      const rowCount = input.rowCount ?? Number(input.record?.result?.metadata?.rowCount ?? 0);
-      const message = rowCount === 0
-        ? "查询已完成，当前未返回数据，并已保留本次查询状态。"
-        : `查询已完成，共获得 ${rowCount} 条记录${input.columnCount ? `、${input.columnCount} 个字段` : ""}，并保存为当前会话数据集。`;
-      return nextActionGuidance(input.conversationId, workflowId, "数据查询完成", message, [], createdAt);
-    }
-    if (input.toolKind === "python_analysis") {
-      return nextActionGuidance(input.conversationId, workflowId, "分析已完成", "Python 分析已完成，分析结果已保存为当前会话工具结果。", [], createdAt);
-    }
-    if (input.toolKind === "chart_rendering") {
-      return nextActionGuidance(input.conversationId, workflowId, "图表已生成", "图表已生成，渲染结果已保存为当前会话工具结果。", [], createdAt);
-    }
-    return nextActionGuidance(input.conversationId, workflowId, "报告已生成", "报告已生成并保存为 Markdown 版本。", [], createdAt);
+    void input;
+    return null;
   }
 }
 
@@ -1119,6 +1284,9 @@ function action(type: AgentGuidanceAction["type"], label: string, primary = fals
 }
 
 function actionsForMissingInputs(inputs: MissingWorkflowInput[]) {
+  if (inputs.some((item) => item.key === "analysis_goal" || item.type === "analysis_rule")) {
+    return [];
+  }
   const actions: AgentGuidanceAction[] = [];
   if (inputs.some((item) => item.type === "data_source")) {
     actions.push(action("select_data_source", "选择数据源", true));
@@ -1183,8 +1351,8 @@ function codeForMissingInput(input?: MissingWorkflowInput): AgentWorkflowErrorCo
 }
 
 function titleForMissingInput(input?: MissingWorkflowInput) {
-  if (!input) {
-    return "需要补充任务目标";
+  if (!input || input.key === "analysis_goal" || input.type === "analysis_rule") {
+    return "想执行哪类数据任务？";
   }
   if (input.type === "data_source") {
     return "需要选择数据源";
@@ -1198,11 +1366,66 @@ function titleForMissingInput(input?: MissingWorkflowInput) {
   return "需要补充参数";
 }
 
-function buildMissingInputMessage(inputs: MissingWorkflowInput[], warnings: string[]) {
+function buildMissingInputMessage(inputs: MissingWorkflowInput[], warnings: string[], context?: ClarificationContext) {
+  if (inputs.some((input) => input.key === "analysis_goal" || input.type === "analysis_rule")) {
+    return buildTaskGoalGuidanceMessage(context, warnings);
+  }
+  const fieldReferenceInputs = inputs.filter((input) => input.key.startsWith("field_reference:"));
+  if (fieldReferenceInputs.length > 0) {
+    return [
+      "我没有在当前数据源中找到这些字段引用。请从推荐字段中选择最接近的真实字段，或重新输入字段名后再提交。",
+      "",
+      ...fieldReferenceInputs.map((input) => {
+        const candidateText = input.candidates?.length
+          ? `推荐：${input.candidates.map((candidate) => candidate.label).join("、")}`
+          : "未找到足够相近的推荐字段";
+        return `- ${input.label}：${candidateText}`;
+      }),
+      ...warnings.map((warning) => `- 注意：${warning}`),
+    ].join("\n");
+  }
   return [
     "可以继续处理，但当前还缺少必要信息。为保证数据准确性，系统不会使用模拟数据、猜测字段或基于样例行生成结论。",
     "",
     ...inputs.map((input) => `- 缺少 ${input.label}：${input.description}`),
+    ...warnings.map((warning) => `- 注意：${warning}`),
+  ].join("\n");
+}
+
+function buildTaskGoalGuidanceMessage(context: ClarificationContext | undefined, warnings: string[]) {
+  const sourceNames = [
+    context?.dataSourceLabel,
+    ...(context?.tempSources ?? []).map((source) => source.fileName),
+  ]
+    .filter((item): item is string => Boolean(item?.trim()))
+    .slice(0, 2);
+  const selectedFields = (context?.selectedFieldRefs ?? [])
+    .filter((field) => field.status === "valid")
+    .map((field) => field.displayName || field.sourceHeader || field.physicalName)
+    .filter(Boolean)
+    .slice(0, 3);
+  const suggestions: string[] = [];
+  const toolState = context?.toolState;
+
+  if (toolState?.latestSuccessfulPythonToolCallId) {
+    suggestions.push("根据上一轮分析结果生成报告，或绘制一张图表。");
+  }
+  if (toolState?.latestSuccessfulSqlToolCallId) {
+    suggestions.push("基于上一轮查询结果继续统计、筛选或做占比分析。");
+  }
+  if (sourceNames.length > 0) {
+    const sourceText = sourceNames.join("、");
+    const fieldText = selectedFields.length > 0 ? `，例如 ${selectedFields.join("、")}` : "";
+    suggestions.push(`查询或统计 ${sourceText} 中的字段${fieldText}。`);
+  }
+  if (suggestions.length === 0) {
+    suggestions.push("选择或上传数据源后，描述要查询、统计、分析、绘图或生成报告的内容。");
+  }
+
+  return [
+    "我还没识别出明确的数据任务目标。可以直接说明要做什么，例如：",
+    "",
+    ...suggestions.slice(0, 3).map((suggestion) => `- ${suggestion}`),
     ...warnings.map((warning) => `- 注意：${warning}`),
   ].join("\n");
 }

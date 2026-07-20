@@ -210,6 +210,28 @@ function formatChatTime(value: string) {
   }).format(new Date(value));
 }
 
+function formatConversationHistoryTime(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  const hour = String(date.getHours()).padStart(2, "0");
+  const minute = String(date.getMinutes()).padStart(2, "0");
+  return `${year}/${month}/${day} ${hour}:${minute}`;
+}
+
+function formatStoppedMessageFromCreatedAt(createdAt?: string) {
+  const startedAt = createdAt ? Date.parse(createdAt) : Date.now();
+  const totalSeconds = Number.isFinite(startedAt) ? Math.max(0, Math.round((Date.now() - startedAt) / 1000)) : 0;
+  const formatted = totalSeconds >= 60
+    ? `${Math.floor(totalSeconds / 60)}m ${totalSeconds % 60}s`
+    : `${totalSeconds}s`;
+  return `你在 ${formatted} 后停止了`;
+}
+
 function formatArtifactGeneratedAt(value: string) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) {
@@ -440,6 +462,40 @@ function fieldTokenRangesForContent(content: string, fieldRefs: ChatCsvSelectedF
     cursor = start + field.rawText.length;
   }
   return ranges;
+}
+
+export function chatTokensForFieldRefs(fieldRefs: ChatCsvSelectedFieldRef[]) {
+  return fieldRefs
+    .slice()
+    .sort((left, right) => right.rawText.length - left.rawText.length)
+    .map((field) => ({
+      value: field.rawText,
+      label: field.rawText,
+      variant: "teal" as const,
+    }));
+}
+
+export function mergeFieldRefsWithTextMatches(
+  content: string,
+  fieldRefs: ChatCsvSelectedFieldRef[],
+  fields: ConversationCsvField[],
+) {
+  if (fields.length === 0) {
+    return fieldRefs;
+  }
+  const matchedRefs = findCsvFieldTokenMatchesInText(content, fields).map((match) =>
+    createChatFieldToken(match.field, { start: match.start, end: match.end }),
+  );
+  if (matchedRefs.length === 0) {
+    return fieldRefs;
+  }
+  const byRawText = new Map<string, ChatCsvSelectedFieldRef>();
+  for (const field of [...fieldRefs, ...matchedRefs]) {
+    if (field.status === "valid") {
+      byRawText.set(field.rawText, field);
+    }
+  }
+  return Array.from(byRawText.values());
 }
 
 function toolDataSourceKind(dataSource: DataSourceSummary): ChatToolDataSourceKind {
@@ -715,6 +771,26 @@ function createOptimisticUserMessage(
   };
 }
 
+function createOptimisticAssistantMessage(
+  userId: string,
+  conversationId: string,
+  messageId: string,
+): AssistantMessage {
+  const createdAt = new Date().toISOString();
+  return {
+    id: messageId,
+    conversationId,
+    userId,
+    role: "assistant",
+    status: "receiving",
+    content: "",
+    blocks: [{ id: createOptimisticMessageId(), type: "text", content: "" }],
+    createdAt,
+    updatedAt: createdAt,
+    integrityHash: "optimistic",
+  };
+}
+
 function mergeConversation(conversations: AssistantConversation[], next: AssistantConversation) {
   const existingIndex = conversations.findIndex((conversation) => conversation.id === next.id);
   const merged =
@@ -724,13 +800,36 @@ function mergeConversation(conversations: AssistantConversation[], next: Assista
   return [...merged].sort((left: AssistantConversation, right: AssistantConversation) => right.updatedAt.localeCompare(left.updatedAt));
 }
 
+function messageRoleOrder(role: AssistantMessage["role"]) {
+  if (role === "user") {
+    return 0;
+  }
+  return 1;
+}
+
+function compareMessages(left: AssistantMessage, right: AssistantMessage) {
+  const createdOrder = left.createdAt.localeCompare(right.createdAt);
+  if (createdOrder !== 0) {
+    return createdOrder;
+  }
+  const roleOrder = messageRoleOrder(left.role) - messageRoleOrder(right.role);
+  if (roleOrder !== 0) {
+    return roleOrder;
+  }
+  return left.id.localeCompare(right.id);
+}
+
 function mergeMessage(messages: AssistantMessage[], next: AssistantMessage) {
   const existingIndex = messages.findIndex((message) => message.id === next.id);
   const merged =
     existingIndex >= 0
       ? messages.map((message) => (message.id === next.id ? next : message))
       : [...messages, next];
-  return [...merged].sort((left: AssistantMessage, right: AssistantMessage) => left.createdAt.localeCompare(right.createdAt));
+  return [...merged].sort(compareMessages);
+}
+
+function isRunningAssistantMessage(message: AssistantMessage) {
+  return message.role === "assistant" && (message.status === "receiving" || message.status === "processing");
 }
 
 function renderJson(content: string) {
@@ -773,8 +872,33 @@ function artifactTitle(message: AssistantMessage) {
   return extractMarkdownTitle(message.content, "数据助手生成文档");
 }
 
+function isAssistantGeneratedTextReportRecord(record: ToolCallRecord) {
+  return (
+    record.toolKind === "report_generation" &&
+    record.metadata?.source === "assistant-generated-message" &&
+    record.request.source === "assistant-generated-message" &&
+    (record.parentToolCallIds?.length ?? 0) === 0 &&
+    (record.sourceArtifactIds?.length ?? 0) === 0
+  );
+}
+
+function visibleToolRecordsForState(toolState?: ConversationToolState | null) {
+  const records = toolState?.toolCalls ?? [];
+  const messageIdsWithActualWorkflowRecords = new Set(
+    records
+      .filter((record) => record.messageId && !isAssistantGeneratedTextReportRecord(record))
+      .map((record) => record.messageId),
+  );
+  return records.filter((record) => {
+    if (!record.messageId || !messageIdsWithActualWorkflowRecords.has(record.messageId)) {
+      return true;
+    }
+    return !isAssistantGeneratedTextReportRecord(record);
+  });
+}
+
 function toolRecordsForMessage(message: AssistantMessage, toolState?: ConversationToolState | null) {
-  return (toolState?.toolCalls ?? []).filter((record) => record.messageId === message.id);
+  return visibleToolRecordsForState(toolState).filter((record) => record.messageId === message.id);
 }
 
 function sortedToolRecords(records: ToolCallRecord[]) {
@@ -787,6 +911,16 @@ function reportRecordsForMessage(message: AssistantMessage, toolState?: Conversa
 
 function reportRecordForMessage(message: AssistantMessage, toolState?: ConversationToolState | null) {
   return reportRecordsForMessage(message, toolState)[0];
+}
+
+function reportRecordForArtifactId(message: AssistantMessage, toolState: ConversationToolState | null | undefined, artifactId: string | undefined) {
+  if (!artifactId) {
+    return undefined;
+  }
+  return reportRecordsForMessage(message, toolState).find((record) => {
+    const artifactIds = record.outputArtifactIds ?? record.result?.artifactIds ?? [];
+    return record.result?.primaryArtifactId === artifactId || artifactIds.includes(artifactId);
+  });
 }
 
 function completedReportRecordForMessage(message: AssistantMessage, toolState?: ConversationToolState | null) {
@@ -807,7 +941,7 @@ function reportSegmentIdForMessage(message: AssistantMessage, toolState?: Conver
 }
 
 function reportRecordsForState(toolState?: ConversationToolState | null) {
-  return (toolState?.toolCalls ?? [])
+  return visibleToolRecordsForState(toolState)
     .filter((record) => record.toolKind === "report_generation" && record.status === "completed")
     .sort((a, b) => b.version - a.version || Date.parse(b.createdAt) - Date.parse(a.createdAt));
 }
@@ -1044,7 +1178,7 @@ function toolCallsFromToolState(
 }
 
 function shouldHideInlineToolResult(block: AssistantBlock) {
-  return block.toolName === "sql" && block.toolStatus === "completed";
+  return Boolean(block.toolCallId && block.toolStatus === "completed");
 }
 
 export function DataAssistantWorkspace({
@@ -1079,6 +1213,7 @@ export function DataAssistantWorkspace({
   const [suppressedFieldMentionKey, setSuppressedFieldMentionKey] = useState<string | null>(null);
   const [selectedFieldRefs, setSelectedFieldRefs] = useState<ChatCsvSelectedFieldRef[]>([]);
   const [recentFieldIds, setRecentFieldIds] = useState<string[]>([]);
+  const [composerSelectionStart, setComposerSelectionStart] = useState(0);
   const [isComposerComposing, setIsComposerComposing] = useState(false);
   const [isLoadingDataSources, setIsLoadingDataSources] = useState(false);
   const [isLoadingConversations, setIsLoadingConversations] = useState(false);
@@ -1090,6 +1225,7 @@ export function DataAssistantWorkspace({
   const [isImportingChatCsv, setIsImportingChatCsv] = useState(false);
   const [artifactWindow, setArtifactWindow] = useState<ArtifactWindowState>(() => readArtifactWindowState());
   const [artifactContentByMessage, setArtifactContentByMessage] = useState<Record<string, ArtifactContentState>>({});
+  const shouldRestoreLatestReportWindowRef = useRef(artifactWindow.isOpen);
   const [reportCardTransitions, setReportCardTransitions] = useState<Record<string, ReportCardTransitionState>>({});
   const [reportTransitionHeights, setReportTransitionHeights] = useState<Record<string, number>>({});
   const [streamContentRevision, setStreamContentRevision] = useState(0);
@@ -1101,6 +1237,8 @@ export function DataAssistantWorkspace({
   const composerBlurTimerRef = useRef<number | null>(null);
   const fullFieldContextApprovalResolverRef = useRef<((approved: boolean) => void) | null>(null);
   const latestComposerDraftRef = useRef<AssistantComposerDraftSnapshot | null>(null);
+  const pendingComposerTokenRestoreConversationRef = useRef<string | null>(null);
+  const locallyStoppedMessageIdsRef = useRef(new Set<string>());
   const pendingMessageDeltasRef = useRef(new Map<string, MessageDeltaStreamEvent>());
   const messageDeltaFlushTimerRef = useRef<number | null>(null);
   const reportTransitionController = useMemo(
@@ -1160,6 +1298,9 @@ export function DataAssistantWorkspace({
     setMessagesByConversation((current) => {
       const next = { ...current };
       for (const event of pending) {
+        if (locallyStoppedMessageIdsRef.current.has(event.messageId)) {
+          continue;
+        }
         const messages = next[event.conversationId] ?? [];
         next[event.conversationId] = messages.map((message) =>
           message.id === event.messageId
@@ -1173,6 +1314,9 @@ export function DataAssistantWorkspace({
 
   const queueMessageDelta = useCallback(
     (event: MessageDeltaStreamEvent) => {
+      if (locallyStoppedMessageIdsRef.current.has(event.messageId)) {
+        return;
+      }
       pendingMessageDeltasRef.current.set(event.messageId, event);
       if (messageDeltaFlushTimerRef.current !== null) {
         return;
@@ -1242,6 +1386,10 @@ export function DataAssistantWorkspace({
     const nextDraft = activeConversationDraftId
       ? composerDraftsByConversation[activeConversationDraftId] ?? createEmptyChatComposerDraft<AssistantSkill, ChatCsvSelectedFieldRef>()
       : createEmptyChatComposerDraft<AssistantSkill, ChatCsvSelectedFieldRef>();
+    pendingComposerTokenRestoreConversationRef.current =
+      activeConversationDraftId && nextDraft.selectedFieldRefs.some((field) => field.status === "valid" && nextDraft.value.includes(field.rawText))
+        ? activeConversationDraftId
+        : null;
     setComposerValue(nextDraft.value);
     setSelectedSkill(nextDraft.selectedSkill);
     setSelectedDataSourceId(nextDraft.selectedDataSourceId);
@@ -1255,6 +1403,7 @@ export function DataAssistantWorkspace({
     setSuppressedToolMentionKey(null);
     setSuppressedToolMentionAnchor(null);
     setSuppressedFieldMentionKey(null);
+    setComposerSelectionStart(nextDraft.value.length);
     latestComposerDraftRef.current = {
       conversationId: activeConversationDraftId,
       draft: nextDraft,
@@ -1299,14 +1448,18 @@ export function DataAssistantWorkspace({
   );
   const activeArtifactContent = activeArtifactMessage ? artifactContentByMessage[activeArtifactMessage.id] : undefined;
   const activeReportRecords = useMemo(() => reportRecordsForState(activeToolState), [activeToolState]);
-  const activeArtifactReportRecord = activeArtifactMessage ? reportRecordForMessage(activeArtifactMessage, activeToolState) : undefined;
+  const activeArtifactReportRecord = activeArtifactMessage
+    ? reportRecordForArtifactId(activeArtifactMessage, activeToolState, activeArtifactContent?.artifactId) ?? reportRecordForMessage(activeArtifactMessage, activeToolState)
+    : undefined;
+  const activeArtifactId = activeArtifactMessage ? activeArtifactContent?.artifactId ?? reportArtifactIdForMessage(activeArtifactMessage, activeToolState) : undefined;
   const activeArtifactTitle = activeArtifactMessage
     ? typeof activeArtifactReportRecord?.request.title === "string" && activeArtifactReportRecord.request.title.trim()
       ? activeArtifactReportRecord.request.title.trim()
       : artifactTitle(activeArtifactMessage)
     : "";
-  const isStreaming = activeMessages.some((message) => message.role === "assistant" && (message.status === "receiving" || message.status === "processing"));
-  const activeStreamingMessageId = activeMessages.find((message) => message.role === "assistant" && (message.status === "receiving" || message.status === "processing"))?.id;
+  const activeStreamingMessages = useMemo(() => activeMessages.filter(isRunningAssistantMessage), [activeMessages]);
+  const activeStreamingMessageIds = useMemo(() => activeStreamingMessages.map((message) => message.id), [activeStreamingMessages]);
+  const isStreaming = activeStreamingMessages.length > 0;
   const activeChatCsvAttachments = activeConversation ? chatCsvAttachmentsByConversation[activeConversation.id] ?? [] : [];
   const readyChatCsvAttachments = activeChatCsvAttachments.filter((attachment) => attachment.status === "ready" && attachment.tempDataSourceId);
   const activeTempDataSourceIds = readyChatCsvAttachments.map((attachment) => attachment.tempDataSourceId as string);
@@ -1492,6 +1645,12 @@ export function DataAssistantWorkspace({
       }
       if (event.type === "message") {
         flushPendingMessageDeltas();
+        if (locallyStoppedMessageIdsRef.current.has(event.message.id) && event.message.status !== "stopped") {
+          return;
+        }
+        if (event.message.status === "stopped") {
+          locallyStoppedMessageIdsRef.current.delete(event.message.id);
+        }
         upsertMessage(event.conversationId, event.message);
         return;
       }
@@ -1506,6 +1665,12 @@ export function DataAssistantWorkspace({
       }
       if (event.type === "tool") {
         flushPendingMessageDeltas();
+        if (locallyStoppedMessageIdsRef.current.has(event.message.id) && event.message.status !== "stopped") {
+          return;
+        }
+        if (event.message.status === "stopped") {
+          locallyStoppedMessageIdsRef.current.delete(event.message.id);
+        }
         upsertMessage(event.conversationId, event.message);
         return;
       }
@@ -1702,7 +1867,7 @@ export function DataAssistantWorkspace({
   }, [isStreaming]);
 
   useEffect(() => {
-    const mention = findChatToolMention(composerValue);
+    const mention = findChatToolMention(composerValue, composerSelectionStart);
     if (mention) {
       if (suppressedToolMentionAnchor !== null) {
         if (
@@ -1744,13 +1909,13 @@ export function DataAssistantWorkspace({
       setToolSelectorTrigger(null);
       setToolSelectorOpen(false);
     }
-  }, [composerValue, suppressedToolMentionAnchor, suppressedToolMentionKey, toolSelectorTrigger]);
+  }, [composerSelectionStart, composerValue, suppressedToolMentionAnchor, suppressedToolMentionKey, toolSelectorTrigger]);
 
   useEffect(() => {
     if (isComposerComposing) {
       return;
     }
-    const mention = findChatFieldMention(composerValue);
+    const mention = findChatFieldMention(composerValue, composerSelectionStart);
     if (mention && activeCsvFields.length > 0) {
       if (chatFieldMentionKey(composerValue, mention) === suppressedFieldMentionKey) {
         return;
@@ -1769,7 +1934,7 @@ export function DataAssistantWorkspace({
       setFieldMention(null);
       setFieldSelectorOpen(false);
     }
-  }, [activeCsvFields.length, composerValue, fieldSelectorOpen, isComposerComposing, suppressedFieldMentionKey]);
+  }, [activeCsvFields.length, composerSelectionStart, composerValue, fieldSelectorOpen, isComposerComposing, suppressedFieldMentionKey]);
 
   useEffect(() => {
     if (selectedFieldRefs.length === 0) {
@@ -1801,10 +1966,11 @@ export function DataAssistantWorkspace({
     if (!user?.id || !window.lifecycleX?.assistant) {
       return;
     }
-    if (activeStreamingMessageId) {
-      await window.lifecycleX.assistant.cancelMessage(activeStreamingMessageId);
+    const assistantApi = window.lifecycleX.assistant;
+    if (activeStreamingMessageIds.length > 0) {
+      await Promise.all(activeStreamingMessageIds.map((messageId) => assistantApi.cancelMessage(messageId)));
     }
-    const conversation = await window.lifecycleX.assistant.createConversation(user.id);
+    const conversation = await assistantApi.createConversation(user.id);
     setConversations((current) => mergeConversation(current, conversation));
     setMessagesByConversation((current) => ({ ...current, [conversation.id]: [] }));
     setWorkflowContextByConversation((current) => ({ ...current, [conversation.id]: null }));
@@ -1956,14 +2122,45 @@ export function DataAssistantWorkspace({
     setFieldMention(null);
   }, []);
 
-  const renderFieldTokensInComposer = useCallback((content: string, fieldRefs: ChatCsvSelectedFieldRef[]) => {
+  const updateComposerSelectionStart = useCallback(() => {
+    const editable = composerShellRef.current?.querySelector<HTMLElement>('[contenteditable="true"]');
+    const value = composerInputRef.current?.getValue() ?? composerValue;
+    const selectionStart = editable ? serializedComposerSelectionStart(editable) ?? value.length : value.length;
+    setComposerSelectionStart(selectionStart);
+  }, [composerValue]);
+
+  const updateComposerSelectionStartSoon = useCallback(() => {
+    window.requestAnimationFrame(updateComposerSelectionStart);
+  }, [updateComposerSelectionStart]);
+
+  const handleComposerValueChange = useCallback((value: string) => {
+    setComposerValue(value);
+    window.requestAnimationFrame(() => {
+      const editable = composerShellRef.current?.querySelector<HTMLElement>('[contenteditable="true"]');
+      const selectionStart = editable ? serializedComposerSelectionStart(editable) ?? value.length : value.length;
+      setComposerSelectionStart(selectionStart);
+    });
+  }, []);
+
+  const renderFieldTokensInComposer = useCallback((content: string, fieldRefs: ChatCsvSelectedFieldRef[], options?: { focus?: boolean }) => {
     const editable = composerShellRef.current?.querySelector<HTMLElement>('[contenteditable="true"]');
     const ranges = fieldTokenRangesForContent(content, fieldRefs);
     if (!editable || ranges.length === 0) {
       return;
     }
-    editable.focus();
-    for (const { field, start, end } of [...ranges].sort((left, right) => right.start - left.start)) {
+    const existingTokenValues = new Set(
+      Array.from(editable.querySelectorAll<HTMLElement>("[data-astryx-token-value]"))
+        .map((node) => node.getAttribute("data-astryx-token-value"))
+        .filter((value): value is string => Boolean(value)),
+    );
+    const missingRanges = ranges.filter(({ field }) => !existingTokenValues.has(field.rawText));
+    if (missingRanges.length === 0) {
+      return;
+    }
+    if (options?.focus !== false) {
+      editable.focus();
+    }
+    for (const { field, start, end } of [...missingRanges].sort((left, right) => right.start - left.start)) {
       if (!selectSerializedComposerRange(editable, start, end)) {
         continue;
       }
@@ -1976,12 +2173,40 @@ export function DataAssistantWorkspace({
     setComposerValue(composerInputRef.current?.getValue() ?? content);
   }, []);
 
+  useEffect(() => {
+    if (
+      !activeConversationDraftId ||
+      pendingComposerTokenRestoreConversationRef.current !== activeConversationDraftId ||
+      selectedFieldRefs.length === 0 ||
+      !composerValue
+    ) {
+      return;
+    }
+    const conversationId = activeConversationDraftId;
+    const value = composerValue;
+    const fieldRefs = selectedFieldRefs.filter((field) => field.status === "valid" && value.includes(field.rawText));
+    if (fieldRefs.length === 0) {
+      pendingComposerTokenRestoreConversationRef.current = null;
+      return;
+    }
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        if (pendingComposerTokenRestoreConversationRef.current !== conversationId) {
+          return;
+        }
+        renderFieldTokensInComposer(value, fieldRefs, { focus: false });
+        pendingComposerTokenRestoreConversationRef.current = null;
+      });
+    });
+  }, [activeConversationDraftId, composerValue, renderFieldTokensInComposer, selectedFieldRefs]);
+
   const recallLastUserMessage = useCallback(() => {
     if (!lastUserMessage) {
       return false;
     }
     const fieldRefs = lastUserMessage.context?.selectedFieldRefs?.filter((field) => field.status === "valid") ?? [];
     setComposerValue(lastUserMessage.content);
+    setComposerSelectionStart(lastUserMessage.content.length);
     setSelectedFieldRefs(fieldRefs);
     setFieldSelectorOpen(false);
     setFieldMention(null);
@@ -2028,6 +2253,7 @@ export function DataAssistantWorkspace({
         composerInputRef.current?.insertText(tail);
       }
       setSelectedFieldRefs((current) => insertedTokens.reduce((next, token) => upsertFieldToken(next, token), current));
+      setComposerSelectionStart(outputCursor + tail.length);
       setRecentFieldIds((current) => {
         const pastedIds = insertedTokens.map((token) => token.fieldId);
         return [...pastedIds, ...current.filter((fieldId) => !pastedIds.includes(fieldId))].slice(0, 20);
@@ -2040,6 +2266,7 @@ export function DataAssistantWorkspace({
 
   const handleComposerKeyDownCapture = useCallback(
     (event: KeyboardEvent<HTMLDivElement>) => {
+      updateComposerSelectionStartSoon();
       if (event.key !== "ArrowUp" || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey || isComposerComposing) {
         return;
       }
@@ -2057,7 +2284,7 @@ export function DataAssistantWorkspace({
       event.preventDefault();
       event.stopPropagation();
     },
-    [composerValue, isComposerComposing, recallLastUserMessage],
+    [composerValue, isComposerComposing, recallLastUserMessage, updateComposerSelectionStartSoon],
   );
 
   const clearActiveToolMention = useCallback(() => {
@@ -2285,12 +2512,13 @@ export function DataAssistantWorkspace({
     if (!user?.id || !window.lifecycleX?.assistant || !deletingConversation) {
       return;
     }
+    const assistantApi = window.lifecycleX.assistant;
 
     try {
-      if (deletingConversation.id === activeConversation?.id && activeStreamingMessageId) {
-        await window.lifecycleX.assistant.cancelMessage(activeStreamingMessageId);
+      if (deletingConversation.id === activeConversation?.id && activeStreamingMessageIds.length > 0) {
+        await Promise.all(activeStreamingMessageIds.map((messageId) => assistantApi.cancelMessage(messageId)));
       }
-      await window.lifecycleX.assistant.deleteConversation(user.id, deletingConversation.id);
+      await assistantApi.deleteConversation(user.id, deletingConversation.id);
       setConversations((current) => {
         const remaining = current.filter((conversation) => conversation.id !== deletingConversation.id);
         if (activeConversation?.id === deletingConversation.id) {
@@ -2328,10 +2556,21 @@ export function DataAssistantWorkspace({
   };
 
   const stopStreaming = useCallback(() => {
-    if (activeStreamingMessageId) {
-      void window.lifecycleX?.assistant?.cancelMessage(activeStreamingMessageId);
+    if (activeStreamingMessages.length === 0 || !activeConversation?.id) {
+      return;
     }
-  }, [activeStreamingMessageId]);
+    for (const activeMessage of activeStreamingMessages) {
+      locallyStoppedMessageIdsRef.current.add(activeMessage.id);
+      const stoppedText = formatStoppedMessageFromCreatedAt(activeMessage.createdAt);
+      patchMessage(activeConversation.id, activeMessage.id, {
+        status: "stopped",
+        content: stoppedText,
+        blocks: [{ id: createOptimisticMessageId(), type: "text", content: stoppedText }],
+        errorMessage: undefined,
+      });
+      void window.lifecycleX?.assistant?.cancelMessage(activeMessage.id);
+    }
+  }, [activeConversation?.id, activeStreamingMessages, patchMessage]);
 
   const copyMessage = useCallback(
     async (message: AssistantMessage) => {
@@ -2370,6 +2609,7 @@ export function DataAssistantWorkspace({
   }, [renderFieldTokensInComposer]);
 
   const openArtifact = useCallback((message: AssistantMessage, explicitArtifactId?: string) => {
+    shouldRestoreLatestReportWindowRef.current = false;
     setArtifactWindow({
       messageId: message.id,
       isOpen: true,
@@ -2399,7 +2639,7 @@ export function DataAssistantWorkspace({
         messageId: message.id,
         artifactId,
         status: "loading",
-        markdown: message.content,
+        markdown: "",
       },
     }));
     void window.lifecycleX.assistant
@@ -2426,14 +2666,55 @@ export function DataAssistantWorkspace({
             messageId: message.id,
             artifactId,
             status: "error",
-            markdown: message.content,
+            markdown: "",
             error: error instanceof Error ? error.message : "报告 Artifact 加载失败。",
           },
         }));
       });
   }, [activeToolState, artifactContentByMessage, user?.id]);
 
+  useEffect(() => {
+    if (!artifactWindow.isOpen || !shouldRestoreLatestReportWindowRef.current) {
+      return;
+    }
+    const latestReport = activeReportRecords[0];
+    if (!latestReport?.messageId) {
+      return;
+    }
+    const latestMessage = activeMessages.find((message) => message.id === latestReport.messageId);
+    if (!latestMessage) {
+      return;
+    }
+    shouldRestoreLatestReportWindowRef.current = false;
+    if (artifactWindow.messageId !== latestMessage.id) {
+      setArtifactWindow((current) => ({
+        ...current,
+        messageId: latestMessage.id,
+        isOpen: true,
+      }));
+    }
+  }, [activeMessages, activeReportRecords, artifactWindow.isOpen, artifactWindow.messageId]);
+
+  useEffect(() => {
+    if (
+      !activeArtifactMessage ||
+      !activeArtifactId ||
+      !artifactWindow.isOpen ||
+      !user?.id ||
+      !window.lifecycleX?.assistant ||
+      (shouldRestoreLatestReportWindowRef.current && activeReportRecords.length > 0)
+    ) {
+      return;
+    }
+    const existing = artifactContentByMessage[activeArtifactMessage.id];
+    if (existing?.artifactId === activeArtifactId && (existing.status === "ready" || existing.status === "loading")) {
+      return;
+    }
+    openArtifact(activeArtifactMessage, activeArtifactId);
+  }, [activeArtifactId, activeArtifactMessage, activeReportRecords.length, artifactContentByMessage, artifactWindow.isOpen, openArtifact, user?.id]);
+
   const closeArtifact = useCallback(() => {
+    shouldRestoreLatestReportWindowRef.current = false;
     setArtifactWindow((current) => ({ ...current, isOpen: false, messageId: null }));
   }, []);
 
@@ -2476,7 +2757,7 @@ export function DataAssistantWorkspace({
     (toolCallId: string) => {
       const record = activeReportRecords.find((item) => item.toolCallId === toolCallId);
       const message = record?.messageId ? activeMessages.find((item) => item.id === record.messageId && isAssistantArtifactMessage(item, activeToolState)) : undefined;
-      if (!message) {
+      if (!record || !message) {
         toast({
           type: "error",
           body: "报告消息不存在，无法切换到该版本。",
@@ -2485,7 +2766,8 @@ export function DataAssistantWorkspace({
         });
         return;
       }
-      openArtifact(message);
+      const artifactId = record.result?.primaryArtifactId ?? record.outputArtifactIds?.find((item) => item.includes("report"));
+      openArtifact(message, artifactId);
     },
     [activeMessages, activeReportRecords, activeToolState, openArtifact, toast],
   );
@@ -2533,6 +2815,13 @@ export function DataAssistantWorkspace({
         return;
       }
 
+      patchMessage(message.conversationId, message.id, {
+        status: "receiving",
+        content: "",
+        blocks: [{ id: createOptimisticMessageId(), type: "text", content: "" }],
+        errorMessage: undefined,
+      });
+
       try {
         const schemaContextMarkdown = await loadSchemaContextMarkdown(message.conversationId, message.content);
         const result = await window.lifecycleX.assistant.retryMessage({
@@ -2553,15 +2842,22 @@ export function DataAssistantWorkspace({
         const toolState = await window.lifecycleX.assistant.getToolState(user.id, result.conversation.id);
         setToolStateByConversation((current) => ({ ...current, [result.conversation.id]: toolState }));
       } catch (error) {
+        const failedMessage = error instanceof Error ? error.message : "重试未成功。";
+        patchMessage(message.conversationId, message.id, {
+          status: "error",
+          content: failedMessage,
+          blocks: [{ id: createOptimisticMessageId(), type: "card", title: "消息异常", content: failedMessage }],
+          errorMessage: failedMessage,
+        });
         toast({
           type: "error",
-          body: error instanceof Error ? error.message : "失败重发未成功。",
+          body: failedMessage,
           uniqueID: `assistant-retry-error-${message.id}`,
           collisionBehavior: "overwrite",
         });
       }
     },
-    [approvalMode, loadSchemaContextMarkdown, messageTempDataSourceIds, modelName, selectedDataSource, selectedSkill, toast, upsertMessage, user?.id],
+    [approvalMode, loadSchemaContextMarkdown, messageTempDataSourceIds, modelName, patchMessage, selectedDataSource, selectedSkill, toast, upsertMessage, user?.id],
   );
 
   const renderMessageMetadata = useCallback(
@@ -2600,7 +2896,7 @@ export function DataAssistantWorkspace({
                   <MetadataIconButton label="编辑" icon={Pencil} onClick={() => editUserMessage(message)} />
                 )}
                 {message.role === "assistant" && (message.status === "error" || message.status === "recoverable_error") && (
-                  <MetadataIconButton label="失败重发" icon={RotateCcw} onClick={() => void retryAssistantMessage(message)} />
+                  <MetadataIconButton label="重试" icon={RotateCcw} onClick={() => void retryAssistantMessage(message)} />
                 )}
               </div>
             </div>
@@ -2766,6 +3062,7 @@ export function DataAssistantWorkspace({
       }
       let optimisticConversationId: string | null = null;
       let optimisticMessageId: string | null = null;
+      let optimisticAssistantMessageId: string | null = null;
 
       if (!isModelConfigured) {
         onRequireModelConfig();
@@ -2809,8 +3106,11 @@ export function DataAssistantWorkspace({
           selectedFieldRefs: submitFieldRefs,
         };
         const optimisticUserMessage = createOptimisticUserMessage(user.id, conversationId, prompt, optimisticContext);
+        const optimisticAssistantMessage = createOptimisticAssistantMessage(user.id, conversationId, createOptimisticMessageId());
         optimisticMessageId = optimisticUserMessage.id;
+        optimisticAssistantMessageId = optimisticAssistantMessage.id;
         upsertMessage(conversationId, optimisticUserMessage);
+        upsertMessage(conversationId, optimisticAssistantMessage);
         setActiveConversationId(conversationId);
         setComposerValue("");
         clearComposerContextSelection([], conversationId);
@@ -2823,6 +3123,7 @@ export function DataAssistantWorkspace({
           userId: user.id,
           conversationId,
           clientRequestId: createClientRequestId(),
+          assistantMessageId: optimisticAssistantMessage.id,
           prompt,
           modelName,
           dataSourceId: submitDataSource?.id ?? null,
@@ -2837,7 +3138,12 @@ export function DataAssistantWorkspace({
         setConversations((current) => mergeConversation(current, result.conversation));
         removeMessage(conversationId, optimisticUserMessage.id);
         upsertMessage(result.conversation.id, result.userMessage);
-        upsertMessage(result.conversation.id, result.assistantMessage);
+        if (!optimisticAssistantMessageId || !locallyStoppedMessageIdsRef.current.has(optimisticAssistantMessageId)) {
+          upsertMessage(result.conversation.id, result.assistantMessage);
+        } else if (result.assistantMessage.status === "stopped") {
+          upsertMessage(result.conversation.id, result.assistantMessage);
+          locallyStoppedMessageIdsRef.current.delete(optimisticAssistantMessageId);
+        }
         setActiveConversationId(result.conversation.id);
         const toolState = await window.lifecycleX.assistant.getToolState(user.id, result.conversation.id);
         setToolStateByConversation((current) => ({ ...current, [result.conversation.id]: toolState }));
@@ -2846,6 +3152,14 @@ export function DataAssistantWorkspace({
         if (optimisticConversationId && optimisticMessageId) {
           patchMessage(optimisticConversationId, optimisticMessageId, {
             status: "error",
+            errorMessage: failedMessage,
+          });
+        }
+        if (optimisticConversationId && optimisticAssistantMessageId) {
+          patchMessage(optimisticConversationId, optimisticAssistantMessageId, {
+            status: "error",
+            content: failedMessage,
+            blocks: [{ id: createOptimisticMessageId(), type: "card", title: "消息异常", content: failedMessage }],
             errorMessage: failedMessage,
           });
         }
@@ -2986,17 +3300,17 @@ export function DataAssistantWorkspace({
   };
 
   const renderUserMessageBody = (message: AssistantMessage) => {
-    const fieldRefs = message.context?.selectedFieldRefs?.filter((field) => field.status === "valid") ?? [];
+    const fieldRefs = mergeFieldRefsWithTextMatches(
+      message.content,
+      message.context?.selectedFieldRefs?.filter((field) => field.status === "valid") ?? [],
+      activeCsvFields,
+    );
     if (fieldRefs.length === 0) {
       return <p>{message.content}</p>;
     }
     return (
       <ChatTokenizedText
-        tokens={fieldRefs.map((field) => ({
-          value: field.rawText,
-          label: field.rawText,
-          variant: "teal",
-        }))}
+        tokens={chatTokensForFieldRefs(fieldRefs)}
       >
         {message.content}
       </ChatTokenizedText>
@@ -3109,28 +3423,32 @@ export function DataAssistantWorkspace({
       : [];
     const reportContentIndex = reportMarkdownContentIndex(markdownBlockCandidates.map(({ block }) => block.content), reportTitle);
     const reportBlockIndex = reportContentIndex >= 0 ? markdownBlockCandidates[reportContentIndex]?.index ?? -1 : -1;
+    const reportCardBlock =
+      shouldShowReportCard && segmentId
+        ? renderReportReplacementBlock(
+            message,
+            reportBlockIndex >= 0
+              ? message.blocks[reportBlockIndex]
+              : {
+                  id: `report-card-${segmentId}`,
+                  type: "markdown",
+                  content: "",
+                },
+            message.status,
+            segmentId,
+          )
+        : null;
 
     return (
       <div className="assistant-message-blocks">
         {message.blocks.map((block, index) =>
-          shouldShowReportCard && segmentId && index === reportBlockIndex
-            ? renderReportReplacementBlock(message, block, message.status, segmentId)
+          shouldShowReportCard && index === reportBlockIndex
+            ? null
             : transition?.status === "card_ready" && segmentId && index === reportBlockIndex
               ? renderReportBufferBlock(block, message.role, message.status, segmentId)
               : renderBlock(block, message.role, message.status),
         )}
-        {shouldShowReportCard && segmentId && reportBlockIndex < 0
-          ? renderReportReplacementBlock(
-            message,
-            {
-              id: `report-card-${segmentId}`,
-              type: "markdown",
-              content: "",
-            },
-            message.status,
-            segmentId,
-          )
-          : null}
+        {reportCardBlock}
       </div>
     );
   };
@@ -3143,17 +3461,51 @@ export function DataAssistantWorkspace({
     });
   };
 
-  const renderGuidanceBlock = (block: AssistantBlock, guidance: AgentGuidance) => (
-    <AgentGuidanceCard
-      key={block.id}
-      guidance={guidance}
-      onAction={applyGuidanceAction}
-      onCandidateSelect={(candidate) => {
-        setComposerValue(candidate.label);
-        window.requestAnimationFrame(() => composerShellRef.current?.querySelector<HTMLElement>('[contenteditable="true"]')?.focus());
-      }}
-    />
-  );
+  const isPreToolTextGuidance = (guidance: AgentGuidance) => {
+    const requiredInputs = guidance.requiredInputs;
+    return (
+      guidance.type === "data_source_selection" ||
+      (guidance.type === "clarification" && /(任务目标|数据任务|需要补充任务目标|想执行哪类数据任务)/i.test(guidance.title)) ||
+      Boolean(requiredInputs?.length) &&
+        requiredInputs!.every((input) =>
+          input.key === "analysis_goal" ||
+          input.type === "analysis_rule" ||
+          input.key === "data_source" ||
+          input.type === "data_source"
+        )
+    );
+  };
+
+  const preToolGuidanceText = (guidance: AgentGuidance, block: AssistantBlock) => {
+    if (guidance.type === "data_source_selection" || guidance.requiredInputs?.some((input) => input.key === "data_source" || input.type === "data_source")) {
+      return "当前还没有可用于执行查询或分析的数据源。可以通过“文件”手动上传 CSV，也可以在数据管理中导入 CSV，或连接数据库后选择数据源。添加数据源后，可以用 # 选择真实表字段并写清筛选值、分组维度或统计指标。";
+    }
+    if (guidance.requiredInputs?.some((input) => input.key === "analysis_goal" || input.type === "analysis_rule") || guidance.type === "clarification") {
+      return "我没有识别到可以直接执行的查询、分析、绘图或报告任务。可以说明要查询哪个字段、按哪个字段分组统计，或基于上一轮查询结果继续分析。";
+    }
+    return guidance.message || block.content;
+  };
+
+  const renderGuidanceBlock = (block: AssistantBlock, guidance: AgentGuidance) => {
+    if (isPreToolTextGuidance(guidance)) {
+      return (
+        <div key={block.id} className="assistant-message-block text">
+          <p>{preToolGuidanceText(guidance, block)}</p>
+        </div>
+      );
+    }
+    return (
+      <AgentGuidanceCard
+        key={block.id}
+        guidance={guidance}
+        onAction={applyGuidanceAction}
+        onCandidateSelect={(candidate) => {
+          setComposerValue(candidate.label);
+          window.requestAnimationFrame(() => composerShellRef.current?.querySelector<HTMLElement>('[contenteditable="true"]')?.focus());
+        }}
+      />
+    );
+  };
 
   const renderBlock = (block: AssistantBlock, role: AssistantMessage["role"], status: AssistantMessageStatus) => {
     if (role === "assistant" && shouldHideInlineToolResult(block)) {
@@ -3299,7 +3651,7 @@ export function DataAssistantWorkspace({
                 }}
               >
                 <strong>{conversation.title}</strong>
-                <span>{formatChatTime(conversation.updatedAt)}</span>
+                <span>{formatConversationHistoryTime(conversation.updatedAt)}</span>
               </button>
               <div className="assistant-history-actions">
                 <Button
@@ -3335,8 +3687,12 @@ export function DataAssistantWorkspace({
                 ref={composerShellRef}
                 className="assistant-composer-shell"
                 onBlurCapture={handleComposerBlurCapture}
+                onClickCapture={updateComposerSelectionStartSoon}
                 onFocusCapture={handleComposerFocusCapture}
+                onInputCapture={updateComposerSelectionStartSoon}
                 onKeyDownCapture={handleComposerKeyDownCapture}
+                onKeyUpCapture={updateComposerSelectionStartSoon}
+                onMouseUpCapture={updateComposerSelectionStartSoon}
               >
                 <input
                   ref={chatCsvInputRef}
@@ -3354,7 +3710,7 @@ export function DataAssistantWorkspace({
                 )}
                 <ChatComposer
                   value={composerValue}
-                  onChange={setComposerValue}
+                  onChange={handleComposerValueChange}
                   onSubmit={handleSubmit}
                   onStop={stopStreaming}
                   isStopShown={isStreaming}
@@ -3656,7 +4012,7 @@ export function DataAssistantWorkspace({
                 }
               />
               <Section variant="transparent" className="assistant-artifact-body">
-                {activeArtifactContent?.status === "loading" ? (
+                {activeArtifactContent?.status === "loading" || (activeArtifactId && !activeArtifactContent) ? (
                   <HStack gap={2} vAlign="center" className="assistant-artifact-loading">
                     <Icon icon={LoaderCircle} size="sm" color="secondary" className="assistant-message-status-spinner" />
                     <Text type="body" color="secondary">报告 Artifact 加载中...</Text>
@@ -3665,11 +4021,13 @@ export function DataAssistantWorkspace({
                   <VStack gap={2} hAlign="stretch" className="assistant-artifact-error">
                     <Text type="label" color="primary">报告 Artifact 加载失败</Text>
                     <Text type="body" color="secondary">{activeArtifactContent.error}</Text>
-                    <ReportMarkdownViewer
-                      markdown={activeArtifactContent.markdown}
-                      components={markdownComponents}
-                      className="assistant-artifact-markdown"
-                    />
+                    {activeArtifactContent.markdown.trim() && (
+                      <ReportMarkdownViewer
+                        markdown={activeArtifactContent.markdown}
+                        components={markdownComponents}
+                        className="assistant-artifact-markdown"
+                      />
+                    )}
                   </VStack>
                 ) : (
                   <ReportMarkdownViewer

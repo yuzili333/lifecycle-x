@@ -105,6 +105,70 @@ describe("agent guidance", () => {
     expect(DEFAULT_DATA_ACCURACY_POLICY.requireToolResultForNumericConclusion).toBe(true);
   });
 
+  it("does not require prior report input for one-shot query analysis report requests", () => {
+    const result = new MissingInputDetector().detect({
+      conversationId: "conversation-1",
+      prompt: "1、查询 #风险等级 的全部数据。2、按类别统计总计合同数，统计分析每个类别合同总计数与样本总数量占比。分析每个类别的 #贷款余额 总计与全量样本的 #贷款余额 总计占比。3、统计分析输出报告。",
+      tempSources: [tempSource()],
+      selectedFieldRefs: [
+        selectedField({ rawText: "#风险等级", start: 4, end: 9 }),
+        selectedField({
+          tokenId: "token-balance",
+          fieldId: "loan_balance",
+          sourceHeader: "loan_balance",
+          physicalName: "loan_balance",
+          displayName: "贷款余额",
+          logicalType: "decimal",
+          sqliteType: "REAL",
+          rawText: "#贷款余额",
+          start: 65,
+          end: 70,
+        }),
+      ],
+      toolState: { conversationId: "conversation-1", toolCalls: [], updatedAt: "2026-07-17T00:00:00.000Z" },
+    });
+
+    expect(result.complete).toBe(true);
+    expect(result.missingInputs.map((item) => item.key)).not.toContain("report_input");
+  });
+
+  it("guides unclear task goals without template text or action buttons", () => {
+    const module = createAgentGuidanceModule({});
+    const detection = new MissingInputDetector().detect({
+      conversationId: "conversation-1",
+      prompt: "这个呢",
+      tempSources: [tempSource()],
+      selectedFieldRefs: [selectedField()],
+    });
+
+    const { guidance } = module.buildClarification({
+      conversationId: "conversation-1",
+      prompt: "这个呢",
+      detection,
+      context: {
+        tempSources: [tempSource()],
+        selectedFieldRefs: [selectedField()],
+        toolState: {
+          conversationId: "conversation-1",
+          latestSuccessfulSqlToolCallId: "sql-1",
+          latestSuccessfulSqlArtifactIds: ["sql-artifact-1"],
+          toolCalls: [],
+          updatedAt: "2026-07-17T00:00:00.000Z",
+        },
+      },
+    });
+    const markdown = renderGuidanceMarkdown(guidance);
+
+    expect(guidance.title).toBe("想执行哪类数据任务？");
+    expect(guidance.actions).toEqual([]);
+    expect(guidance.message).toContain("基于上一轮查询结果继续统计");
+    expect(guidance.message).toContain("查询或统计 loan.csv 中的字段");
+    expect(guidance.message).toContain("风险等级");
+    expect(markdown).not.toContain("可以继续处理，但当前还缺少必要信息");
+    expect(markdown).not.toContain("直接补充说明");
+    expect(markdown).not.toContain("取消本轮任务");
+  });
+
   it("offers sorted candidate fields instead of guessing ambiguous field mappings", () => {
     const result = new MissingInputDetector().detect({
       conversationId: "conversation-1",
@@ -155,6 +219,42 @@ describe("agent guidance", () => {
     expect(metric?.candidates?.[0]?.label).toBe("贷款余额");
   });
 
+  it("accepts explicit prompt field references for grouped amount distribution requests", () => {
+    const result = new MissingInputDetector().detect({
+      conversationId: "conversation-1",
+      prompt: "查询 #风险等级 全部分类数据，分析每一类数据的总计合同笔数和笔数占比，分析每一类数据的 #贷款余额（余额） 以及与全部样本贷款余额总计的占比。",
+      tempSources: [tempSource()],
+    });
+
+    expect(result.complete).toBe(true);
+    expect(result.missingInputs.map((item) => item.key)).not.toContain("classification_or_dimension_field");
+    expect(result.missingInputs.map((item) => item.key)).not.toContain("amount_metric_field");
+  });
+
+  it("recommends similar real fields for misspelled prompt field references", () => {
+    const module = createAgentGuidanceModule({});
+    const detection = new MissingInputDetector().detect({
+      conversationId: "conversation-1",
+      prompt: "查询 #风险等及 的分类汇总。",
+      tempSources: [tempSource()],
+    });
+    const fieldReferenceInput = detection.missingInputs.find((item) => item.key === "field_reference:#风险等及");
+
+    expect(detection.complete).toBe(false);
+    expect(fieldReferenceInput?.candidates?.[0]?.label).toBe("风险等级");
+
+    const { guidance } = module.buildClarification({
+      conversationId: "conversation-1",
+      prompt: "查询 #风险等及 的分类汇总。",
+      detection,
+      context: { tempSources: [tempSource()] },
+    });
+
+    expect(guidance.message).toContain("字段 #风险等及");
+    expect(guidance.message).toContain("风险等级");
+    expect(renderGuidanceMarkdown(guidance)).not.toContain("可以继续处理，但当前还缺少必要信息");
+  });
+
   it("detects missing chart type for generic visualization requests", () => {
     const result = new MissingInputDetector().detect({
       conversationId: "conversation-1",
@@ -171,6 +271,63 @@ describe("agent guidance", () => {
     expect(result.complete).toBe(false);
     expect(result.missingInputs.map((item) => item.key)).toContain("chart_type");
     expect(result.missingInputs.map((item) => item.key)).not.toContain("chart_input");
+  });
+
+  it("does not ask for source fields when charting from existing Python analysis result", () => {
+    const result = new MissingInputDetector().detect({
+      conversationId: "conversation-1",
+      prompt: "请根据数据分析结果绘制各分行的合同总数占比的饼图。",
+      tempSources: [tempSource()],
+      toolState: {
+        conversationId: "conversation-1",
+        latestSuccessfulPythonToolCallId: "python-1",
+        latestSuccessfulPythonArtifactIds: ["analysis-1"],
+        toolCalls: [],
+        updatedAt: "2026-07-18T00:00:00.000Z",
+      },
+    });
+
+    expect(result.complete).toBe(true);
+    expect(result.missingInputs.map((item) => item.key)).not.toContain("classification_or_dimension_field");
+    expect(result.missingInputs.map((item) => item.key)).not.toContain("chart_input");
+  });
+
+  it("uses existing Python analysis artifacts for chart requests before asking for source fields", () => {
+    const result = new MissingInputDetector().detect({
+      conversationId: "conversation-1",
+      prompt: "绘制各分行的合同总数占比饼图。",
+      tempSources: [tempSource()],
+      toolState: {
+        conversationId: "conversation-1",
+        latestSuccessfulPythonToolCallId: "python-1",
+        latestSuccessfulPythonArtifactIds: ["analysis-1"],
+        toolCalls: [],
+        updatedAt: "2026-07-18T00:00:00.000Z",
+      },
+    });
+
+    expect(result.complete).toBe(true);
+    expect(result.missingInputs.map((item) => item.key)).not.toContain("classification_or_dimension_field");
+    expect(result.missingInputs.map((item) => item.key)).not.toContain("amount_metric_field");
+  });
+
+  it("uses existing analysis and chart artifacts for report requests", () => {
+    const result = new MissingInputDetector().detect({
+      conversationId: "conversation-1",
+      prompt: "生成报告",
+      toolState: {
+        conversationId: "conversation-1",
+        latestSuccessfulPythonToolCallId: "python-1",
+        latestSuccessfulPythonArtifactIds: ["analysis-1"],
+        latestSuccessfulChartToolCallId: "chart-1",
+        latestSuccessfulChartArtifactIds: ["chart-1"],
+        toolCalls: [],
+        updatedAt: "2026-07-18T00:00:00.000Z",
+      },
+    });
+
+    expect(result.complete).toBe(true);
+    expect(result.missingInputs.map((item) => item.key)).not.toContain("report_input");
   });
 
   it("builds repair guidance for missing tool parameters", () => {
@@ -286,7 +443,7 @@ describe("agent guidance", () => {
     expect(emptyMarkdown.invalidParameters.map((item) => item.parameterName)).toContain("markdown");
   });
 
-  it("returns plain success summaries after SQL without interactive next-action buttons", () => {
+  it("does not return redundant success summaries after completed tools", () => {
     const normal = new NextActionRecommender().recommend({
       conversationId: "conversation-1",
       toolKind: "sql_query",
@@ -298,11 +455,14 @@ describe("agent guidance", () => {
       toolKind: "sql_query",
       rowCount: 0,
     });
+    const python = new NextActionRecommender().recommend({
+      conversationId: "conversation-1",
+      toolKind: "python_analysis",
+    });
 
-    expect(normal.message).toContain("1250 条记录");
-    expect(normal.actions).toEqual([]);
-    expect(empty.message).toContain("未返回数据");
-    expect(empty.actions).toEqual([]);
+    expect(normal).toBeNull();
+    expect(empty).toBeNull();
+    expect(python).toBeNull();
   });
 
   it("returns recoverable actions for tool errors", () => {

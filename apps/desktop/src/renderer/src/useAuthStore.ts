@@ -22,6 +22,7 @@ type LogoutOptions = {
 
 export function useAuthStore() {
   const logoutPromiseRef = useRef<Promise<void> | null>(null);
+  const authEpochRef = useRef(0);
   const [state, setState] = useState<AuthState>({
     status: "checking",
     accessToken: null,
@@ -31,13 +32,26 @@ export function useAuthStore() {
     lastError: null,
   });
 
-  const applySuccess = useCallback(async (result: Awaited<ReturnType<typeof authApi.loginPassword>>) => {
+  const applySuccess = useCallback(async (result: Awaited<ReturnType<typeof authApi.loginPassword>>, epoch = authEpochRef.current) => {
+    if (epoch !== authEpochRef.current) {
+      return false;
+    }
+
     if (!isAuthSuccess(result)) {
       setState((current) => ({ ...current, status: "anonymous", lastError: result }));
       return false;
     }
 
     await window.lifecycleX?.auth.setRefreshToken(result.refreshToken);
+    if (epoch !== authEpochRef.current) {
+      try {
+        await window.lifecycleX?.auth.clearRefreshToken();
+      } catch {
+        // A stale login or refresh response must not keep the authenticated route alive.
+      }
+      return false;
+    }
+
     setState({
       status: "authenticated",
       accessToken: result.accessToken,
@@ -50,15 +64,22 @@ export function useAuthStore() {
   }, []);
 
   const initialize = useCallback(async () => {
+    const epoch = authEpochRef.current;
     const refreshToken = (await window.lifecycleX?.auth.getRefreshToken()) ?? null;
+    if (epoch !== authEpochRef.current) {
+      return;
+    }
     if (!refreshToken) {
       setState((current) => ({ ...current, status: "anonymous" }));
       return;
     }
 
     const result = await authApi.refresh(refreshToken);
+    if (epoch !== authEpochRef.current) {
+      return;
+    }
     if (isAuthSuccess(result)) {
-      await applySuccess(result);
+      await applySuccess(result, epoch);
       return;
     }
 
@@ -79,16 +100,20 @@ export function useAuthStore() {
 
   const loginWithPassword = useCallback(
     async (identifier: string, password: string) => {
+      const epoch = authEpochRef.current + 1;
+      authEpochRef.current = epoch;
       const result = await authApi.loginPassword(identifier, password);
-      return applySuccess(result);
+      return applySuccess(result, epoch);
     },
     [applySuccess],
   );
 
   const completeSso = useCallback(
     async (stateToken: string) => {
+      const epoch = authEpochRef.current + 1;
+      authEpochRef.current = epoch;
       const result = await authApi.completeSso(stateToken);
-      return applySuccess(result);
+      return applySuccess(result, epoch);
     },
     [applySuccess],
   );
@@ -130,6 +155,7 @@ export function useAuthStore() {
 
     const shouldLogoutRemote = options.remote ?? true;
     const logoutPromise = (async () => {
+      authEpochRef.current += 1;
       let refreshToken: string | null = null;
       if (shouldLogoutRemote) {
         try {
@@ -152,8 +178,12 @@ export function useAuthStore() {
   }, [clearLocalAuth]);
 
   const refreshSession = useCallback(async (options: RefreshSessionOptions = {}): Promise<AuthSuccess | false> => {
+    const epoch = authEpochRef.current;
     const clearOnFailure = options.clearOnFailure ?? true;
     const refreshToken = (await window.lifecycleX?.auth.getRefreshToken()) ?? null;
+    if (epoch !== authEpochRef.current) {
+      return false;
+    }
     if (!refreshToken) {
       if (clearOnFailure) {
         await clearLocalAuth();
@@ -162,8 +192,11 @@ export function useAuthStore() {
     }
 
     const result = await authApi.refresh(refreshToken);
+    if (epoch !== authEpochRef.current) {
+      return false;
+    }
     if (isAuthSuccess(result)) {
-      await applySuccess(result);
+      await applySuccess(result, epoch);
       return result;
     }
 

@@ -374,12 +374,15 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
   const [isSavingSettings, setIsSavingSettings] = useState(false);
 
   const openSessionExpiredConfirm = useCallback(() => {
+    if (auth.status !== "authenticated") {
+      return;
+    }
     if (sessionExpiredPromptPhaseRef.current !== "idle") {
       return;
     }
     sessionExpiredPromptPhaseRef.current = "prompting";
     setIsSessionExpiredConfirmOpen(true);
-  }, []);
+  }, [auth.status]);
 
   const requestWithRefresh = useCallback(
     async <T extends { success: true }>(call: (accessToken: string) => Promise<ApiResult<T>>): Promise<ApiResult<T>> => {
@@ -578,6 +581,12 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
     setIsSessionExpiredLogoutPending(false);
   };
 
+  const beginSessionExpiredLogout = () => {
+    sessionExpiredPromptPhaseRef.current = "logging-out";
+    setIsSessionExpiredConfirmOpen(false);
+    setIsSessionExpiredLogoutPending(true);
+  };
+
   const confirmLogout = async () => {
     setIsLogoutConfirmOpen(false);
     dismissSessionExpiredPrompt();
@@ -588,11 +597,11 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
     if (sessionExpiredPromptPhaseRef.current === "logging-out" || sessionExpiredPromptPhaseRef.current === "handled") {
       return;
     }
-    setIsSessionExpiredLogoutPending(true);
-    dismissSessionExpiredPrompt();
+    beginSessionExpiredLogout();
     try {
       await auth.logout({ remote: false });
     } finally {
+      sessionExpiredPromptPhaseRef.current = "handled";
       setIsSessionExpiredLogoutPending(false);
     }
   };

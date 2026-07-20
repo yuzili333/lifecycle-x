@@ -52,6 +52,7 @@ import {
   SQLiteWorkflowCheckpointStore,
   type AgentGuidance,
   type InvalidToolParameter,
+  type MissingInputDetectionResult,
 } from "./agentGuidance";
 
 const require = createRequire(import.meta.url);
@@ -158,6 +159,7 @@ export type AssistantSendInput = {
   userId: string;
   conversationId?: string;
   clientRequestId: string;
+  assistantMessageId?: string;
   prompt: string;
   modelName: string;
   dataSourceId?: string | null;
@@ -285,6 +287,7 @@ type ToolDetection = {
 const SILICONFLOW_CHAT_COMPLETIONS_URL = "https://api.siliconflow.cn/v1/chat/completions";
 const MAX_STORED_MESSAGES_FOR_CONTEXT = 12;
 const MAX_STREAM_CHARS = 120_000;
+const MODEL_STREAM_TIMEOUT_MS = 90_000;
 const PYTHON_TIMEOUT_MS = 5_000;
 const MAX_TOOL_CONTEXT_CHARS = 30_000;
 const WORKFLOW_DATASET_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -398,9 +401,77 @@ function parseCsvAliasJson(value: string | undefined) {
 }
 
 function extractFencedCode(prompt: string, language: AssistantToolKind) {
-  const pattern = new RegExp("```" + language + "\\s*([\\s\\S]*?)```", "i");
+  const pattern = new RegExp("```" + language + "(?:\\s|\\r?\\n)([\\s\\S]*?)```", "i");
   const match = prompt.match(pattern);
   return match?.[1]?.trim() ?? null;
+}
+
+function extractFencedTool(prompt: string): ToolDetection | null {
+  const pattern = /```([a-zA-Z0-9_-]+)?\s*([\s\S]*?)```/g;
+  for (const match of prompt.matchAll(pattern)) {
+    const language = (match[1] ?? "").trim().toLowerCase();
+    const script = (match[2] ?? "").trim();
+    if (!script) {
+      continue;
+    }
+    if ((language === "sql" || language === "sqlite" || language === "sqlite3") && isReadonlySql(script)) {
+      return { kind: "sql", script };
+    }
+    if (language === "python") {
+      return { kind: "python", script };
+    }
+  }
+  return null;
+}
+
+function extractJsonSqlTool(prompt: string): ToolDetection | null {
+  const fencedJsonBlocks = Array.from(prompt.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)).map((match) => match[1]?.trim()).filter(Boolean);
+  const candidates = fencedJsonBlocks.length ? fencedJsonBlocks : [prompt];
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate) as unknown;
+      const sql = typeof parsed === "object" && parsed !== null && "sql" in parsed
+        ? (parsed as { sql?: unknown }).sql
+        : undefined;
+      if (typeof sql === "string" && isReadonlySql(sql)) {
+        return { kind: "sql", script: sql.trim() };
+      }
+    } catch {
+      // Plain assistant prose commonly contains non-JSON text; ignore it.
+    }
+  }
+  return null;
+}
+
+function extractBareReadonlySql(prompt: string): ToolDetection | null {
+  const lines = prompt.split(/\r?\n/);
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!/^\s*(select|with|pragma)\b/i.test(lines[index])) {
+      continue;
+    }
+    const sqlLines: string[] = [];
+    for (let cursor = index; cursor < lines.length; cursor += 1) {
+      const line = lines[cursor];
+      if (/^\s*```/.test(line)) {
+        break;
+      }
+      if (cursor > index && !line.trim()) {
+        break;
+      }
+      if (cursor > index && /^\s*(?:[#*-]|\*\*)/.test(line) && !/^\s*(?:and|or|from|join|where|group\s+by|order\s+by|having|limit|offset|union|select|with|pragma)\b/i.test(line)) {
+        break;
+      }
+      sqlLines.push(line);
+      if (/;\s*$/.test(line)) {
+        break;
+      }
+    }
+    const sql = sqlLines.join("\n").trim().replace(/;\s*$/, "");
+    if (sql && isReadonlySql(sql)) {
+      return { kind: "sql", script: sql };
+    }
+  }
+  return null;
 }
 
 function detectTool(prompt: string): ToolDetection | null {
@@ -426,56 +497,168 @@ function detectTool(prompt: string): ToolDetection | null {
   return null;
 }
 
-function detectToolFromAssistantOutput(content: string): ToolDetection | null {
-  const fencedTool = detectTool(content);
+export function detectToolFromAssistantOutput(content: string): ToolDetection | null {
+  const fencedTool = detectTool(content) ?? extractFencedTool(content);
   if (fencedTool) {
     return fencedTool;
   }
-
-  const sqlMatch = content.match(/(?:^|\n)\s*((?:select|with|pragma)\b[\s\S]*?)(?:;|\n\s*\n|$)/i);
-  const sql = sqlMatch?.[1]?.trim();
-  if (sql && isReadonlySql(sql)) {
-    return { kind: "sql", script: sql };
+  const jsonTool = extractJsonSqlTool(content);
+  if (jsonTool) {
+    return jsonTool;
   }
 
-  return null;
+  return extractBareReadonlySql(content);
+}
+
+export function shouldEagerStartToolFromAssistantStream(content: string) {
+  return Boolean(extractFencedTool(content) ?? extractJsonSqlTool(content));
+}
+
+export function shouldKeepProviderToolActivityMessage(providerToolActivity: boolean, latestMessage: AssistantMessage, content: string) {
+  return providerToolActivity && hasVisibleAssistantContent(latestMessage) && !detectToolFromAssistantOutput(content);
 }
 
 function replaceToolBlock(blocks: AssistantBlock[], toolBlock: AssistantBlock) {
   return [...blocks.filter((block) => block.toolCallId !== toolBlock.toolCallId), toolBlock];
 }
 
-function replaceToolSuccessSummaryBlock(blocks: AssistantBlock[], toolCallId: string, content: string) {
-  const id = `tool-success-summary-${toolCallId}`;
-  const summaryBlock: AssistantBlock = {
-    id,
-    type: "text",
-    content,
-  };
-  const nextBlocks = blocks.filter((block) => block.id !== id);
-  return [...nextBlocks, summaryBlock];
-}
-
 function hasRenderableNonToolContent(message: AssistantMessage) {
   return message.blocks.some((block) => !block.toolCallId && block.content.trim().length > 0);
+}
+
+function hasVisibleAssistantContent(message: AssistantMessage) {
+  return Boolean(message.content.trim()) || message.blocks.some((block) => Boolean(block.toolCallId) || block.content.trim().length > 0);
+}
+
+export function formatStoppedGenerationMessage(startedAtMs: number, stoppedAtMs = Date.now()) {
+  const totalSeconds = Math.max(0, Math.round((stoppedAtMs - startedAtMs) / 1000));
+  const formatted = totalSeconds >= 60
+    ? `${Math.floor(totalSeconds / 60)}m ${totalSeconds % 60}s`
+    : `${totalSeconds}s`;
+  return `你在 ${formatted} 后停止了`;
+}
+
+class AssistantOperationCancelledError extends Error {
+  constructor() {
+    super("用户已停止生成。");
+    this.name = "AssistantOperationCancelledError";
+  }
+}
+
+function throwIfAssistantOperationCancelled(signal?: AbortSignal) {
+  if (signal?.aborted) {
+    throw new AssistantOperationCancelledError();
+  }
+}
+
+function isAssistantOperationCancelled(error: unknown) {
+  return error instanceof AssistantOperationCancelledError || (error instanceof Error && error.name === "AbortError");
+}
+
+export function isPreToolTextGuidanceRequiredInputs(inputs: Array<{ key?: string; type?: string }> | undefined) {
+  return Boolean(inputs?.length) && inputs!.every((input) =>
+    input.key === "analysis_goal" ||
+    input.type === "analysis_rule" ||
+    input.key === "data_source" ||
+    input.type === "data_source"
+  );
+}
+
+export function shouldUseModelForUnclearTaskGoal(detection: MissingInputDetectionResult) {
+  return isPreToolTextGuidanceRequiredInputs(detection.missingInputs);
+}
+
+function isPreToolTextGuidanceCheckpoint(checkpoint: { pendingGuidance?: AgentGuidance; activeIssue?: { missingInputs?: Array<{ key?: string; type?: string }> } }) {
+  const guidance = checkpoint.pendingGuidance;
+  return (
+    isPreToolTextGuidanceRequiredInputs(guidance?.requiredInputs) ||
+    isPreToolTextGuidanceRequiredInputs(checkpoint.activeIssue?.missingInputs) ||
+    guidance?.type === "data_source_selection" ||
+    (guidance?.type === "clarification" && /(任务目标|数据任务|需要补充任务目标|想执行哪类数据任务)/i.test(guidance.title))
+  );
+}
+
+function isPreToolTextGuidance(guidance: AgentGuidance | undefined) {
+  return Boolean(
+    guidance &&
+    (
+      isPreToolTextGuidanceRequiredInputs(guidance.requiredInputs) ||
+      guidance.type === "data_source_selection" ||
+      (guidance.type === "clarification" && /(任务目标|数据任务|需要补充任务目标|想执行哪类数据任务)/i.test(guidance.title))
+    )
+  );
+}
+
+function preToolTextGuidanceContent(guidance: AgentGuidance | undefined, fallback: string) {
+  if (guidance?.type === "data_source_selection" || guidance?.requiredInputs?.some((input) => input.key === "data_source" || input.type === "data_source")) {
+    return "当前还没有可用于执行查询或分析的数据源。可以通过“文件”手动上传 CSV，也可以在数据管理中导入 CSV，或连接数据库后选择数据源。添加数据源后，可以用 # 选择真实表字段并写清筛选值、分组维度或统计指标。";
+  }
+  if (guidance?.requiredInputs?.some((input) => input.key === "analysis_goal" || input.type === "analysis_rule") || guidance?.type === "clarification") {
+    return "我没有识别到可以直接执行的查询、分析、绘图或报告任务。可以说明要查询哪个字段、按哪个字段分组统计，或基于上一轮查询结果继续分析。";
+  }
+  return fallback;
+}
+
+export function selectedFieldReferencesMarkdown(selectedFieldRefs: ChatCsvSelectedFieldRef[] | undefined) {
+  const fields = (selectedFieldRefs ?? [])
+    .filter((field) => field.status === "valid" && field.rawText && field.physicalName)
+    .filter((field, index, all) => all.findIndex((item) => item.rawText === field.rawText && item.physicalName === field.physicalName) === index)
+    .sort((left, right) => right.rawText.length - left.rawText.length);
+  if (fields.length === 0) {
+    return null;
+  }
+  return [
+    "## 本轮字段引用映射（最高优先级）",
+    "",
+    "用户消息中的 #字段名称 是客户端已解析的真实字段引用，不是普通文本。生成 SQL、Python、图表和报告时，必须优先使用下表映射；只有下表不存在对应字段时，才允许查看全表字段清单做补充匹配。",
+    "禁止把较长字段拆成较短字段加普通文本，例如必须将 #最新风险分类结果 作为一个完整字段引用处理，不得拆成 #最新风险分类 + 结果。",
+    "",
+    "| 用户文本 | 实际字段名 | SQLite 字段（已转义） | 展示名称 | 推断类型 | SQLite 类型 |",
+    "|---|---|---|---|---|---|",
+    ...fields.map((field) =>
+      `| ${escapePromptMarkdownTable(field.rawText)} | ${escapePromptMarkdownTable(field.physicalName)} | ${escapePromptMarkdownTable(quoteIdentifier(field.physicalName))} | ${escapePromptMarkdownTable(field.displayName)} | ${escapePromptMarkdownTable(field.logicalType)} | ${escapePromptMarkdownTable(field.sqliteType)} |`
+    ),
+  ].join("\n");
+}
+
+function escapePromptMarkdownTable(value: unknown) {
+  return String(value ?? "").replaceAll("|", "\\|").replace(/\r?\n/g, " ");
 }
 
 export function shouldAnalyzePriorSqlResult(prompt: string) {
   return (
     /(sql\s*查询结果|查询数据结果|查询结果数据|查询结果|上一轮|上一次|工具调用结果|结果数据)/i.test(prompt) &&
-    /(统计|占比|对比|排名|前三|top\s*3|报告|分析)/i.test(prompt)
+    /(统计|计数|总计|数量|笔数|条数|个数|多少\s*(例|笔|条|个)?|各有多少|共有多少|占比|对比|排名|前三|top\s*3|报告|分析)/i.test(prompt)
   );
 }
 
 export function shouldAutoStartPythonReport(prompt: string) {
   const asksForReport = /(输出|生成|形成|给出|撰写|渲染|绘制|展示|放入|放到).{0,24}(分析)?报告|分析报告|报告输出|报告中/i.test(prompt);
   const asksForChart = /(柱状图|条形图|折线图|饼图|图表|可视化)/i.test(prompt);
-  const asksForAnalysis = /(统计|汇总|计数|总计|数量|占比|比例|分布|排序|倒序|排名|对比|分析)/i.test(prompt);
-  return asksForReport || (asksForChart && asksForAnalysis) || (/分析/i.test(prompt) && /(汇总|占比|比例|分布|统计|对比)/i.test(prompt));
+  const asksForAnalysis = /(统计|汇总|计数|总计|数量|笔数|条数|个数|多少\s*(例|笔|条|个)?|各有多少|共有多少|占比|比例|分布|排序|倒序|排名|对比|分析)/i.test(prompt);
+  return (
+    asksForReport ||
+    (asksForChart && asksForAnalysis) ||
+    (/分析/i.test(prompt) && /(汇总|占比|比例|分布|统计|对比)/i.test(prompt)) ||
+    (asksForAnalysis && /(查询|查|导入|数据|样本|字段|分行|合同)/i.test(prompt))
+  );
+}
+
+export function shouldForceGenericSqlResultAnalysisScript(prompt: string | undefined, script: string, selectedFieldRefs?: ChatCsvSelectedFieldRef[]) {
+  const text = prompt?.trim() ?? "";
+  if (!text) {
+    return false;
+  }
+  const asksStructuredAnalysis = /(按.{0,12}(分类|类别|维度)|每个分类|每一类|各类|分类维度|总计多少|多少\s*(笔|条|个|例)|笔数|合同数|占比|比例|统计|汇总|分析|报告)/i.test(text);
+  const referencesFields = /#[^\s，,。；;]+/.test(text) || (selectedFieldRefs?.some((field) => field.status === "valid") ?? false);
+  const weakRowCountOnlyScript =
+    /(返回记录数|返回行数|row\s*count|row_count|len\s*\(\s*rows\s*\)|len\s*\(\s*data\s*\))/i.test(script) &&
+    !/Counter|groupby|group\s+by|pivot|占比|\|.*\|/i.test(script);
+  return asksStructuredAnalysis && referencesFields && (weakRowCountOnlyScript || shouldAutoStartPythonReport(text));
 }
 
 function shouldFallbackStartDataToolWorkflow(prompt: string, assistantContent: string) {
-  const asksForDataWork = /(查询|统计|汇总|计数|总计|筛选|分布|占比|比例|分析|报告)/i.test(prompt);
+  const asksForDataWork = /(查询|统计|汇总|计数|总计|数量|笔数|条数|个数|多少\s*(例|笔|条|个)?|各有多少|共有多少|筛选|分布|占比|比例|分析|报告)/i.test(prompt);
   const acknowledgedWithoutResult = /(正在|我将|将为|为您|请稍候|稍候|提取|查询|统计).{0,40}(数据|结果|报告|汇总)/i.test(assistantContent.trim());
   return asksForDataWork && (shouldAutoStartPythonReport(prompt) || acknowledgedWithoutResult);
 }
@@ -495,10 +678,11 @@ function promptSliceAfterField(prompt: string, field: ChatCsvSelectedFieldRef) {
 
 function extractPromptFilterValue(prompt: string, field: ChatCsvSelectedFieldRef) {
   const afterField = promptSliceAfterField(prompt, field);
-  const quoted = afterField.match(/^[\s:：,，]*[“"']([^”"']{1,80})[”"']/)?.[1]?.trim();
-  const unquoted = afterField.match(/^[\s:：,，]*([^，,。；;\n#]{1,80}?)(?=(?:的数据|数据中|中|下|里|的|不同|各个|各|每个|分类|类别|汇总|统计|分析|报告|占比|比例|$))/i)?.[1]?.trim();
-  const value = quoted || unquoted;
-  if (!value || /^(不同|各个|各|每个|分类|类别|数据|汇总|统计|分析|报告|占比|比例)/i.test(value)) {
+  const quoted = afterField.match(/^[\s:：,，]*(?:字段)?\s*(?:为|是|等于|=|:|：)?\s*[“"']([^”"']{1,80})[”"']/)?.[1]?.trim();
+  const operatorUnquoted = afterField.match(/^[\s:：,，]*(?:字段)?\s*(?:为|是|等于|=|:|：)\s*([^，,。；;\n#]{1,80}?)(?=(?:的数据|数据中|中|下|里|的|不同|各个|各|每个|分类|类别|汇总|统计|分析|报告|占比|比例|$))/i)?.[1]?.trim();
+  const directUnquoted = afterField.match(/^[\s:：,，]*([^，,。；;\n#]{1,80}?)(?=(?:的数据|数据中|中|下|里|的|不同|各个|各|每个|分类|类别|汇总|统计|分析|报告|占比|比例|$))/i)?.[1]?.trim();
+  const value = quoted || operatorUnquoted || directUnquoted;
+  if (!value || /^(的|全部|所有|全量|总计|合计|小计|每一类|每类|不同|各个|各|每个|分类|类别|数据|汇总|统计|分析|报告|占比|比例|以及|并|和|与)/i.test(value)) {
     return null;
   }
   return value;
@@ -523,6 +707,19 @@ function likelyMetricColumns(source: ConversationTempCsvTable, selectedFieldName
     .slice(0, 4);
 }
 
+function isMetricSelectedField(field: ChatCsvSelectedFieldRef) {
+  const text = `${field.displayName}\n${field.sourceHeader}\n${field.physicalName}\n${field.logicalType}\n${field.sqliteType}`;
+  return /(金额|余额|本金|敞口|amount|balance|principal|decimal|number|integer|real|int|numeric)/i.test(text);
+}
+
+function sourceColumnForSelectedField(source: ConversationTempCsvTable, field: ChatCsvSelectedFieldRef) {
+  return source.columns.find((column) =>
+    column.sqliteColumnName === field.physicalName ||
+    column.sourceHeader === field.sourceHeader ||
+    column.displayName === field.displayName
+  );
+}
+
 export function buildFallbackTempCsvSqlForAnalysisRequest(
   prompt: string,
   source: ConversationTempCsvTable,
@@ -538,9 +735,15 @@ export function buildFallbackTempCsvSqlForAnalysisRequest(
   const filters = selectedFields
     .map((field) => ({ field, value: extractPromptFilterValue(prompt, field) }))
     .filter((item): item is { field: ChatCsvSelectedFieldRef; value: string } => Boolean(item.value));
-  const groupedFields = selectedFields.filter((field) => !hasPromptFilterValue(prompt, field));
+  const groupedFields = selectedFields.filter((field) => !hasPromptFilterValue(prompt, field) && !isMetricSelectedField(field));
   const selectedFieldNames = new Set(selectedFields.map((field) => field.physicalName));
-  const metrics = likelyMetricColumns(source, selectedFieldNames);
+  const selectedMetricColumns = selectedFields
+    .filter((field) => isMetricSelectedField(field))
+    .map((field) => sourceColumnForSelectedField(source, field))
+    .filter((column): column is ConversationTempCsvTable["columns"][number] => Boolean(column));
+  const metrics = [...selectedMetricColumns, ...likelyMetricColumns(source, selectedFieldNames)]
+    .filter((column, index, columns) => columns.findIndex((item) => item.sqliteColumnName === column.sqliteColumnName) === index)
+    .slice(0, 6);
   const tableName = quoteIdentifier(source.sqliteTableName);
   const whereClause = filters.length
     ? `\nwhere ${filters.map(({ field, value }) => `${quoteIdentifier(field.physicalName)} = ${quoteSqlLiteral(value)}`).join(" and ")}`
@@ -555,6 +758,14 @@ export function buildFallbackTempCsvSqlForAnalysisRequest(
       `from ${tableName}${whereClause}`,
       `group by ${groupBy}`,
       `order by "笔数" desc`,
+    ].join("\n");
+  }
+
+  if (metrics.length > 0) {
+    const metricSelect = metrics.map((column) => `sum(${quoteIdentifier(column.sqliteColumnName)}) as ${quoteIdentifier(`${column.displayName}合计`)}`);
+    return [
+      `select ${["count(*) as \"笔数\"", ...metricSelect].join(", ")}`,
+      `from ${tableName}${whereClause}`,
     ].join("\n");
   }
 
@@ -603,15 +814,18 @@ export function buildGenericSqlResultAnalysisPythonScript(prompt: string, rows: 
     "    text = str(value or '').strip()",
     "    return text if text else '--'",
     "",
+    "def compact_name(value):",
+    "    return re.sub(r'[\\s\\u00a0\\u3000\"\\'“”‘’`.,，。；;:：!?！？、/\\\\|()（）\\[\\]{}<>《》【】]+', '', str(value or '').lower())",
+    "",
     "def match_requested_fields(keys):",
     "    requested = [item.strip() for item in re.findall(r'#([^#\\s，,。；;：:、“”\"「」『』()（）]+)', question) if item.strip()]",
     "    matched = []",
-    "    lowered = {str(key).lower(): key for key in keys}",
+    "    compacted = {compact_name(key): key for key in keys}",
     "    for token in requested:",
-    "        token_lower = token.lower()",
-    "        match = lowered.get(token_lower)",
+    "        token_key = compact_name(token)",
+    "        match = compacted.get(token_key)",
     "        if not match:",
-    "            match = next((key for key in keys if token_lower in str(key).lower() or str(key).lower() in token_lower), None)",
+    "            match = next((key for key in keys if token_key in compact_name(key) or compact_name(key) in token_key), None)",
     "        if match and match not in matched:",
     "            matched.append(match)",
     "    return matched",
@@ -625,11 +839,39 @@ export function buildGenericSqlResultAnalysisPythonScript(prompt: string, rows: 
     "    numeric_ratio = len(numeric_values) / non_empty if non_empty else 0",
     "    return {'key': key, 'non_empty': non_empty, 'unique_count': unique_count, 'numeric_values': numeric_values, 'is_numeric': non_empty > 0 and numeric_ratio >= 0.9}",
     "",
+    "def count_field(keys):",
+    "    aliases = [",
+    "        '笔数', '总笔数', '合同笔数', '总计笔数',",
+    "        '合同总数', '总计合同数', '合同总计数', '合同数量',",
+    "        '总计数', '总数', '数量', '条数', '个数',",
+    "        'count', 'cnt', 'total_count', 'record_count', 'row_count'",
+    "    ]",
+    "    compact_aliases = [compact_name(item) for item in aliases]",
+    "    for key in keys:",
+    "        compact_key = compact_name(key)",
+    "        if compact_key in compact_aliases:",
+    "            return key",
+    "    for key in keys:",
+    "        compact_key = compact_name(key)",
+    "        if any(alias and (alias in compact_key or compact_key in alias) for alias in compact_aliases):",
+    "            return key",
+    "    return None",
+    "",
+    "def is_count_like_field(key):",
+    "    return count_field([key]) == key",
+    "",
     "def choose_dimensions(profiles, requested, total_rows):",
     "    requested_dimensions = [field for field in requested if not profiles[field]['is_numeric']]",
     "    dimensions = []",
     "    for field in requested_dimensions:",
     "        if field not in dimensions:",
+    "            dimensions.append(field)",
+    "    if dimensions:",
+    "        return dimensions[:2]",
+    "    for field, profile in profiles.items():",
+    "        if profile['is_numeric'] or is_count_like_field(field):",
+    "            continue",
+    "        if profile['unique_count'] <= max(total_rows, 20):",
     "            dimensions.append(field)",
     "    return dimensions[:2]",
     "",
@@ -646,6 +888,12 @@ export function buildGenericSqlResultAnalysisPythonScript(prompt: string, rows: 
     "",
     "def ratio_label(dimension):",
     "    return '全部分行占比' if '分行' in str(dimension) else '占比'",
+    "",
+    "def row_count_value(row, count_key):",
+    "    if count_key:",
+    "        value = to_number(row.get(count_key))",
+    "        return value if value is not None else 0",
+    "    return 1",
     "",
     "def requested_values():",
     "    quoted = re.findall(r'[“\"「『]([^”\"」』]+)[”\"」』]', question)",
@@ -682,6 +930,8 @@ export function buildGenericSqlResultAnalysisPythonScript(prompt: string, rows: 
     "    measures = choose_measures(profiles, requested)",
     "    analysis_rows = filter_rows_by_requested_values(rows, dimensions)",
     "    analysis_total = len(analysis_rows)",
+    "    count_key = count_field(keys)",
+    "    weighted_total = sum(row_count_value(row, count_key) for row in analysis_rows)",
     "    count_name = count_label()",
     "    if requested:",
     "        lines.append('- 已匹配用户指定字段：' + '、'.join(str(field) for field in requested))",
@@ -690,12 +940,24 @@ export function buildGenericSqlResultAnalysisPythonScript(prompt: string, rows: 
     "    lines.append('')",
     "    if dimensions:",
     "        for dimension in dimensions:",
-    "            counter = Counter(normalize_text(row.get(dimension)) for row in analysis_rows)",
+    "            counter = Counter()",
+    "            measure_totals = {measure: sum((to_number(row.get(measure)) or 0) for row in analysis_rows) for measure in measures}",
+    "            grouped_measures = {}",
+    "            for row in analysis_rows:",
+    "                key = normalize_text(row.get(dimension))",
+    "                counter[key] += row_count_value(row, count_key)",
+    "                grouped_measures.setdefault(key, {measure: 0 for measure in measures})",
+    "                for measure in measures:",
+    "                    grouped_measures[key][measure] += to_number(row.get(measure)) or 0",
     "            lines.append(f'## 按 {dimension} 汇总')",
-    "            lines.append(f'| {dimension} | {count_name} | {ratio_label(dimension)} |')",
-    "            lines.append('|---|---:|---:|')",
+    "            metric_headers = ''.join(f' {measure} | {measure}占比 |' for measure in measures)",
+    "            metric_align = ''.join('---:|---:|' for _ in measures)",
+    "            lines.append(f'| {dimension} | {count_name} | {ratio_label(dimension)} |{metric_headers}')",
+    "            lines.append(f'|---|---:|---:|{metric_align}')",
     "            for value, count in counter.most_common(20):",
-    "                lines.append(f'| {value} | {count} | {pct(count, analysis_total)}% |')",
+    "                metric_cells = ''.join(f' {round(grouped_measures[value][measure], 4)} | {pct(grouped_measures[value][measure], measure_totals.get(measure, 0))}% |' for measure in measures)",
+    "                display_count = int(count) if float(count).is_integer() else round(count, 4)",
+    "                lines.append(f'| {value} | {display_count} | {pct(count, weighted_total or analysis_total)}% |{metric_cells}')",
     "        lines.append('')",
     "    elif measures:",
     "        lines.append('## 指定字段合计')",
@@ -901,6 +1163,14 @@ export function isReportGenerationContent(userPrompt: string, content: string) {
     return false;
   }
   return isMarkdownLikeContent(content) || /^#{1,3}\s+/m.test(content) || /\|.+\|/m.test(content);
+}
+
+export function shouldRegisterAssistantGeneratedArtifacts(input: {
+  hasDetectedTool: boolean;
+  willStartFallbackTempCsvSql: boolean;
+  willStartSkillWorkflow: boolean;
+}) {
+  return !input.hasDetectedTool && !input.willStartFallbackTempCsvSql && !input.willStartSkillWorkflow;
 }
 
 export function shouldGenerateReportFromAnalysisResult(prompt: string) {
@@ -1194,6 +1464,7 @@ export class AssistantRuntime {
   private db: any;
   private integrityKey: string;
   private abortControllers = new Map<string, AbortController>();
+  private cancelledMessageIds = new Set<string>();
   private readonly options: AssistantRuntimeOptions;
   private readonly workflowStore: WorkflowStateStore;
   private readonly datasetStateManager: SQLiteDatasetStateManager;
@@ -1254,10 +1525,11 @@ export class AssistantRuntime {
 
   getConversationMessages(userId: string, conversationId: string): AssistantMessage[] {
     return this.db
-      .prepare("select * from messages where user_id = ? and conversation_id = ? order by created_at asc")
+      .prepare("select * from messages where user_id = ? and conversation_id = ? order by created_at asc, case role when 'user' then 0 else 1 end asc, rowid asc")
       .all(userId, conversationId)
       .map((row: Record<string, unknown>) => this.messageFromRow(row))
-      .map((message: AssistantMessage) => this.verifyMessageIntegrity(message));
+      .map((message: AssistantMessage) => this.verifyMessageIntegrity(message))
+      .map((message: AssistantMessage) => this.normalizePreToolGuidanceMessageForDisplay(message));
   }
 
   createConversation(userId: string, title = "新对话"): AssistantConversation {
@@ -1409,6 +1681,9 @@ export class AssistantRuntime {
       selectedFieldRefs: input.selectedFieldRefs,
       toolState,
     });
+    if (shouldUseModelForUnclearTaskGoal(detection)) {
+      return false;
+    }
     if (detection.complete) {
       return false;
     }
@@ -1416,6 +1691,12 @@ export class AssistantRuntime {
       conversationId: conversation.id,
       detection,
       prompt: input.prompt,
+      context: {
+        dataSourceLabel: input.dataSourceLabel,
+        tempSources,
+        selectedFieldRefs: input.selectedFieldRefs,
+        toolState,
+      },
     });
     this.agentGuidance.createCheckpoint({
       ...checkpoint,
@@ -1762,6 +2043,23 @@ export class AssistantRuntime {
     if (!checkpoint?.pendingGuidance?.blocking) {
       return { handled: false as const, input, resumed: false as const };
     }
+    if (
+      isPreToolTextGuidanceCheckpoint(checkpoint)
+    ) {
+      const cancelled = this.agentGuidance.cancelWorkflow({ checkpoint, reason: "前置引导改由模型输出文本，不再恢复为等待补充卡片。" });
+      await this.workflowMemoryBridge.writeWorkflowMemory({
+        conversationId: conversation.id,
+        userId: input.userId,
+        type: "workflow_cancelled",
+        summary: "已作废旧版前置缺参引导，改由模型输出文本引导。",
+        payload: {
+          workflowId: cancelled.workflowId,
+          checkpointId: cancelled.checkpointId,
+          reason: "pre_tool_text_guidance_bypassed",
+        },
+      });
+      return { handled: false as const, input, resumed: false as const };
+    }
 
     if (this.isWorkflowCancelPrompt(input.prompt)) {
       const cancelled = this.agentGuidance.cancelWorkflow({ checkpoint, reason: input.prompt });
@@ -1839,6 +2137,12 @@ export class AssistantRuntime {
       workflowId: checkpoint.workflowId,
       detection,
       prompt: input.prompt,
+      context: {
+        dataSourceLabel: input.dataSourceLabel,
+        tempSources,
+        selectedFieldRefs: input.selectedFieldRefs,
+        toolState,
+      },
     });
     const nextCheckpoint = {
       ...checkpoint,
@@ -1920,6 +2224,7 @@ export class AssistantRuntime {
       },
     });
     const assistantMessage = this.insertMessage({
+      id: input.assistantMessageId,
       conversationId: conversation.id,
       userId: input.userId,
       role: "assistant",
@@ -1931,6 +2236,11 @@ export class AssistantRuntime {
     this.options.emit({ type: "conversation", conversation });
     this.options.emit({ type: "message", conversationId: conversation.id, message: userMessage });
     this.options.emit({ type: "message", conversationId: conversation.id, message: assistantMessage });
+
+    if (this.cancelledMessageIds.has(assistantMessage.id)) {
+      this.markAssistantMessageStopped(conversation.id, assistantMessage.id, Date.now());
+      return { success: true, conversation, userMessage, assistantMessage: this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(assistantMessage.id)) };
+    }
 
     const resume = await this.resumeGuidedWorkflowIfPossible(effectiveInput, conversation, assistantMessage, tempSources);
     if (resume.handled) {
@@ -1944,7 +2254,9 @@ export class AssistantRuntime {
     } else if (!shouldRouteSkillThroughModel(effectiveInput.skill) && await this.routeOverallRiskSkillWorkflow(effectiveInput, conversation, assistantMessage)) {
       // Routed to the governed multi-step skill workflow.
     } else if (tool) {
-      void this.handleToolCall(effectiveInput, conversation, assistantMessage, tool);
+      this.runCancellableAssistantOperation(conversation.id, assistantMessage.id, (signal) =>
+        this.handleToolCall(effectiveInput, conversation, assistantMessage, tool, {}, signal),
+      );
     } else if (await this.routeLatestAnalysisReport(effectiveInput, conversation, assistantMessage)) {
       // Routed to report generation from the latest Python analysis result.
     } else if (await this.routePriorSqlAnalysis(effectiveInput, conversation, assistantMessage)) {
@@ -1985,7 +2297,26 @@ export class AssistantRuntime {
       return { success: true as const, toolCall: next, message };
     }
 
-    return this.executeToolCall(toolCall);
+    const controller = this.registerAbortController(toolCall.messageId);
+    const startedAtMs = Date.now();
+    try {
+      const result = await this.executeToolCall(toolCall, controller.signal);
+      if (!controller.signal.aborted) {
+        this.cancelledMessageIds.delete(toolCall.messageId);
+      }
+      return result;
+    } catch (error) {
+      if (controller.signal.aborted || isAssistantOperationCancelled(error)) {
+        const stopped = this.markAssistantMessageStopped(toolCall.conversationId, toolCall.messageId, startedAtMs);
+        const latestToolCall = this.toolCallFromRow(this.db.prepare("select * from tool_calls where id = ?").get(toolCall.id));
+        return { success: true as const, toolCall: latestToolCall, message: stopped };
+      }
+      throw error;
+    } finally {
+      if (this.abortControllers.get(toolCall.messageId) === controller) {
+        this.abortControllers.delete(toolCall.messageId);
+      }
+    }
   }
 
   async getWorkflowContext(userId: string, conversationId: string) {
@@ -2178,9 +2509,78 @@ export class AssistantRuntime {
   }
 
   cancelMessage(messageId: string) {
+    this.cancelledMessageIds.add(messageId);
     const controller = this.abortControllers.get(messageId);
     controller?.abort();
     this.abortControllers.delete(messageId);
+  }
+
+  private markAssistantMessageStopped(conversationId: string, messageId: string, startedAtMs: number, providerTraceId?: string) {
+    const stoppedText = formatStoppedGenerationMessage(startedAtMs);
+    const stopped = this.updateMessage(messageId, {
+      status: "stopped",
+      content: stoppedText,
+      blocks: [{ id: randomUUID(), type: "text", content: stoppedText }],
+      errorMessage: undefined,
+      providerTraceId,
+    });
+    this.options.emit({ type: "message", conversationId, message: stopped });
+    this.options.emit({
+      type: "stream-content",
+      conversationId,
+      event: {
+        type: "message_stream_completed",
+        messageId,
+        completedAt: stopped.updatedAt,
+      },
+    });
+    this.cancelledMessageIds.delete(messageId);
+    return stopped;
+  }
+
+  private runCancellableAssistantOperation(
+    conversationId: string,
+    messageId: string,
+    operation: (signal: AbortSignal) => Promise<void>,
+  ) {
+    const controller = this.registerAbortController(messageId);
+    const startedAtMs = Date.now();
+    void (async () => {
+      try {
+        throwIfAssistantOperationCancelled(controller.signal);
+        await operation(controller.signal);
+        if (!controller.signal.aborted) {
+          this.cancelledMessageIds.delete(messageId);
+        }
+      } catch (error) {
+        if (controller.signal.aborted || isAssistantOperationCancelled(error)) {
+          this.markAssistantMessageStopped(conversationId, messageId, startedAtMs);
+          return;
+        }
+        const messageText = error instanceof Error ? error.message : "消息处理失败。";
+        const failed = this.updateMessage(messageId, {
+          status: "error",
+          content: messageText,
+          blocks: [{ id: randomUUID(), type: "card", title: "消息异常", content: messageText }],
+          errorMessage: messageText,
+        });
+        this.options.emit({ type: "message", conversationId, message: failed });
+        this.options.emit({ type: "error", conversationId, messageId, message: messageText, traceId: sha256(messageText).slice(0, 12) });
+      } finally {
+        if (this.abortControllers.get(messageId) === controller) {
+          this.abortControllers.delete(messageId);
+        }
+      }
+    })();
+  }
+
+  private registerAbortController(messageId: string) {
+    const controller = new AbortController();
+    this.abortControllers.set(messageId, controller);
+    if (this.cancelledMessageIds.has(messageId)) {
+      controller.abort();
+    }
+    return controller;
   }
 
   async retryAssistantMessage(input: AssistantRetryInput): Promise<AssistantRetryResult> {
@@ -2197,7 +2597,7 @@ export class AssistantRuntime {
     if (sourceMessage.role !== "assistant") {
       throw new Error("仅支持重试助手消息。");
     }
-    if (sourceMessage.status !== "error") {
+    if (sourceMessage.status !== "error" && sourceMessage.status !== "recoverable_error") {
       throw new Error("当前消息状态不支持重试。");
     }
 
@@ -2223,14 +2623,13 @@ export class AssistantRuntime {
     }
 
     const sourceUserMessage = this.messageFromRow(sourceUserRow);
-    const assistantMessage = this.insertMessage({
-      conversationId: conversation.id,
-      userId: input.userId,
-      role: "assistant",
+    this.cancelledMessageIds.delete(sourceMessage.id);
+    const assistantMessage = this.updateMessage(sourceMessage.id, {
       status: "receiving",
       content: "",
       blocks: [{ id: randomUUID(), type: "text", content: "" }],
-      clientRequestId: input.clientRequestId,
+      errorMessage: undefined,
+      providerTraceId: undefined,
     });
 
     const nextConversation = this.findConversation(input.userId, conversation.id) ?? conversation;
@@ -2373,6 +2772,7 @@ export class AssistantRuntime {
   }
 
   private insertMessage(input: {
+    id?: string;
     conversationId: string;
     userId: string;
     role: AssistantMessageRole;
@@ -2388,7 +2788,7 @@ export class AssistantRuntime {
       .prepare("select integrity_hash from messages where conversation_id = ? order by created_at desc limit 1")
       .get(input.conversationId);
     const draft = {
-      id: randomUUID(),
+      id: input.id ?? randomUUID(),
       conversationId: input.conversationId,
       userId: input.userId,
       role: input.role,
@@ -2482,6 +2882,24 @@ export class AssistantRuntime {
       clientRequestId: (row.client_request_id as string | null) ?? undefined,
       providerTraceId: (row.provider_trace_id as string | null) ?? undefined,
       context: row.context_json ? (JSON.parse(row.context_json as string) as AssistantMessageContext) : undefined,
+    };
+  }
+
+  private normalizePreToolGuidanceMessageForDisplay(message: AssistantMessage) {
+    if (message.role !== "assistant") {
+      return message;
+    }
+    const guidance = message.blocks.find((block) => isPreToolTextGuidance(block.guidance))?.guidance;
+    if (!guidance) {
+      return message;
+    }
+    const content = preToolTextGuidanceContent(guidance, message.content);
+    return {
+      ...message,
+      status: "completed" as const,
+      content,
+      blocks: [{ id: `pre-tool-guidance-text-${message.id}`, type: "text" as const, content }],
+      errorMessage: undefined,
     };
   }
 
@@ -2635,7 +3053,9 @@ export class AssistantRuntime {
   }
 
   private async normalizePythonToolScript(input: { userId: string; conversationId: string; prompt?: string; script: string; selectedTempDataSourceIds?: string[]; selectedFieldRefs?: ChatCsvSelectedFieldRef[] }) {
-    const shouldReplaceScript = this.shouldReplacePythonScript(input.script);
+    const shouldReplaceScript =
+      this.shouldReplacePythonScript(input.script) ||
+      shouldForceGenericSqlResultAnalysisScript(input.prompt, input.script, input.selectedFieldRefs);
     const { latestSqlToolCall, rows } = await this.latestSqlRowsForConversation(input.userId, input.conversationId);
     if (latestSqlToolCall) {
       return shouldReplaceScript
@@ -2734,10 +3154,19 @@ export class AssistantRuntime {
       },
     );
 
-    await this.handleToolCall(input, conversation, assistantMessage, {
-      kind: "python",
-      script: this.buildPythonAnalysisScript(input.prompt, latestSqlToolCall, rows),
-    });
+    this.runCancellableAssistantOperation(conversation.id, assistantMessage.id, (signal) =>
+      this.handleToolCall(
+        input,
+        conversation,
+        assistantMessage,
+        {
+          kind: "python",
+          script: this.buildPythonAnalysisScript(input.prompt, latestSqlToolCall, rows),
+        },
+        {},
+        signal,
+      ),
+    );
     return true;
   }
 
@@ -2882,7 +3311,7 @@ export class AssistantRuntime {
     return true;
   }
 
-  private async routeFallbackTempCsvAnalysisSql(input: AssistantSendInput, conversation: AssistantConversation, assistantMessage: AssistantMessage, assistantContent: string) {
+  private async routeFallbackTempCsvAnalysisSql(input: AssistantSendInput, conversation: AssistantConversation, assistantMessage: AssistantMessage, assistantContent: string, signal?: AbortSignal) {
     if (!shouldFallbackStartDataToolWorkflow(input.prompt, assistantContent)) {
       return false;
     }
@@ -2917,7 +3346,7 @@ export class AssistantRuntime {
       },
     );
 
-    await this.handleToolCall(input, conversation, assistantMessage, { kind: "sql", script: sql }, { appendToMessage: true });
+    await this.handleToolCall(input, conversation, assistantMessage, { kind: "sql", script: sql }, { appendToMessage: true }, signal);
     return true;
   }
 
@@ -3176,7 +3605,8 @@ export class AssistantRuntime {
     };
   }
 
-  private async handleToolCall(input: AssistantSendInput, conversation: AssistantConversation, message: AssistantMessage, tool: ToolDetection, options: { appendToMessage?: boolean } = {}) {
+  private async handleToolCall(input: AssistantSendInput, conversation: AssistantConversation, message: AssistantMessage, tool: ToolDetection, options: { appendToMessage?: boolean } = {}, signal?: AbortSignal) {
+    throwIfAssistantOperationCancelled(signal);
     const normalizedTool: ToolDetection =
       tool.kind === "python"
         ? {
@@ -3191,6 +3621,7 @@ export class AssistantRuntime {
             }),
         }
         : tool;
+    throwIfAssistantOperationCancelled(signal);
     const toolMetadata = this.toolCallMetadataForInput(input);
 
     if (normalizedTool.kind === "sql" && !isReadonlySql(normalizedTool.script)) {
@@ -3319,10 +3750,11 @@ export class AssistantRuntime {
       return;
     }
 
-    await this.executeToolCall(toolCall);
+    await this.executeToolCall(toolCall, signal);
   }
 
-  private async executeToolCall(toolCall: AssistantToolCall) {
+  private async executeToolCall(toolCall: AssistantToolCall, signal?: AbortSignal) {
+    throwIfAssistantOperationCancelled(signal);
     const normalizedScript =
       toolCall.kind === "python"
         ? await this.normalizePythonToolScript({
@@ -3334,6 +3766,7 @@ export class AssistantRuntime {
             selectedFieldRefs: toolCall.metadata?.selectedFieldRefs,
           })
         : toolCall.script;
+    throwIfAssistantOperationCancelled(signal);
     const executableToolCall = normalizedScript === toolCall.script ? toolCall : this.updateToolCallScript(toolCall.id, normalizedScript);
     if (executableToolCall.script !== toolCall.script) {
       this.appendToolLog(executableToolCall, "python-script-normalize", "info", "Python 工具脚本已替换为基于 SQL 结果快照的标准库脚本。", {
@@ -3354,8 +3787,11 @@ export class AssistantRuntime {
     this.options.emit({ type: "tool", conversationId: executableToolCall.conversationId, toolCall: running, message: runningMessage });
 
     try {
+      throwIfAssistantOperationCancelled(signal);
       const sqlExecution = executableToolCall.kind === "sql" ? this.executeReadonlySql(executableToolCall.script, running) : null;
-      const result = sqlExecution ? sqlExecution.result : await this.executePython(running.script);
+      throwIfAssistantOperationCancelled(signal);
+      const result = sqlExecution ? sqlExecution.result : await this.executePython(running.script, signal);
+      throwIfAssistantOperationCancelled(signal);
       const completed = this.updateToolCall(toolCall.id, "completed", result);
       const sqlDataset = completed.kind === "sql" ? await this.registerSqlToolResultDataset(completed, sqlExecution?.rows) : null;
       this.appendToolLog(completed, "execution-complete", "success", "工具调用执行完成。", {
@@ -3366,21 +3802,10 @@ export class AssistantRuntime {
       const shouldRenderPythonReportCard = completed.kind === "python" && isPythonReportCardContent(sourcePrompt, result);
       const completedDisplay = shouldRenderPythonReportCard ? "Python 分析已完成，报告内容已生成，可点击报告卡片查看完整报告。" : result;
       const completedBlock = this.toolBlock(completed, completedDisplay);
-      const nextGuidance = this.agentGuidance.recommendNextActions({
-        conversationId: toolCall.conversationId,
-        toolKind: assistantToolKindToOrchestrationKind(completed.kind),
-        rowCount: completed.kind === "sql" ? sqlDataset?.rowCount ?? parseSqlToolRowCount(result) ?? undefined : undefined,
-        columnCount: completed.kind === "sql" ? sqlDataset?.columnCount : undefined,
-      });
-      const successSummary = nextGuidance?.message ?? completedDisplay;
-      const completedBlocks = replaceToolSuccessSummaryBlock(
-        preserveContent ? replaceToolBlock(currentBeforeComplete.blocks, completedBlock) : [completedBlock],
-        completed.id,
-        successSummary,
-      );
+      const completedBlocks = preserveContent ? replaceToolBlock(currentBeforeComplete.blocks, completedBlock) : [completedBlock];
       const message = this.updateMessage(toolCall.messageId, {
         status: "completed",
-        content: preserveContent ? currentBeforeComplete.content : successSummary,
+        content: preserveContent ? currentBeforeComplete.content : completedDisplay,
         blocks: completedBlocks,
       });
       this.options.emit({ type: "tool", conversationId: toolCall.conversationId, toolCall: completed, message });
@@ -3396,6 +3821,14 @@ export class AssistantRuntime {
       }
       return { success: true as const, toolCall: completed, message };
     } catch (error) {
+      if (isAssistantOperationCancelled(error) || signal?.aborted) {
+        const cancelled = this.updateToolCall(toolCall.id, "error", undefined, "用户已停止生成。");
+        this.appendToolLog(cancelled, "execution-cancelled", "info", "用户已停止本轮工具执行。", {
+          script: cancelled.script,
+        });
+        this.options.emit({ type: "tool", conversationId: toolCall.conversationId, toolCall: cancelled, message: runningMessage });
+        throw error;
+      }
       const messageText = error instanceof Error ? error.message : "工具调用失败。";
       const failed = this.updateToolCall(toolCall.id, "error", undefined, messageText);
       this.appendToolLog(failed, "execution-error", "error", messageText, {
@@ -3662,7 +4095,9 @@ export class AssistantRuntime {
       return true;
     }
 
-    void this.executeOverallRiskWorkflowFromSql(sqlRecord);
+    this.runCancellableAssistantOperation(conversation.id, assistantMessage.id, (signal) =>
+      this.executeOverallRiskWorkflowFromSql(sqlRecord, signal),
+    );
     return true;
   }
 
@@ -3745,8 +4180,12 @@ export class AssistantRuntime {
       return { success: true as const, toolCall: rejected, message: message ?? this.fallbackAssistantMessage(record, "用户已拒绝执行工具调用。") };
     }
 
+    const controller = record.messageId ? this.registerAbortController(record.messageId) : null;
+    const startedAtMs = Date.now();
+    const signal = controller?.signal;
+    try {
     if (record.toolKind === "sql_query") {
-      const completed = await this.executeOverallRiskSql(record);
+      const completed = await this.executeOverallRiskSql(record, signal);
       const python = await this.nextSkillWorkflowRecord(record, "python_analysis");
       let message = this.latestAssistantMessageForConversation(record.conversationId, userId) ?? this.fallbackAssistantMessage(record, "SQL 查询已完成。");
       if (python) {
@@ -3769,33 +4208,56 @@ export class AssistantRuntime {
     }
 
     if (record.toolKind === "python_analysis") {
-      const completed = await this.executeOverallRiskPython(record);
+      const completed = await this.executeOverallRiskPython(record, signal);
       const report = await this.nextSkillWorkflowRecord(record, "report_generation");
       let message = this.latestAssistantMessageForConversation(record.conversationId, userId) ?? this.fallbackAssistantMessage(record, "Python 分析已完成。");
       if (report) {
-        message = await this.executeOverallRiskReport(report);
+        message = await this.executeOverallRiskReport(report, signal);
       }
       await this.emitToolState(record.conversationId);
       return { success: true as const, toolCall: completed, message };
     }
 
-    const completed = await this.executeOverallRiskReport(record);
+    const completed = await this.executeOverallRiskReport(record, signal);
     return { success: true as const, toolCall: await this.toolResultRegistry.get(record.toolCallId), message: completed };
+    } catch (error) {
+      if (signal?.aborted || isAssistantOperationCancelled(error)) {
+        const stopped = record.messageId
+          ? this.markAssistantMessageStopped(record.conversationId, record.messageId, startedAtMs)
+          : this.fallbackAssistantMessage(record, "用户已停止生成。");
+        const latest = await this.toolResultRegistry.get(record.toolCallId);
+        return { success: true as const, toolCall: latest, message: stopped };
+      }
+      throw error;
+    } finally {
+      if (controller && record.messageId && this.abortControllers.get(record.messageId) === controller) {
+        this.abortControllers.delete(record.messageId);
+      }
+      if (!signal?.aborted && record.messageId) {
+        this.cancelledMessageIds.delete(record.messageId);
+      }
+    }
   }
 
-  private async executeOverallRiskWorkflowFromSql(sqlRecord: ToolCallRecord) {
+  private async executeOverallRiskWorkflowFromSql(sqlRecord: ToolCallRecord, signal?: AbortSignal) {
     try {
-      await this.executeOverallRiskSql(sqlRecord);
+      throwIfAssistantOperationCancelled(signal);
+      await this.executeOverallRiskSql(sqlRecord, signal);
       const python = await this.nextSkillWorkflowRecord(sqlRecord, "python_analysis");
+      throwIfAssistantOperationCancelled(signal);
       if (!python) {
         return;
       }
-      await this.executeOverallRiskPython(python);
+      await this.executeOverallRiskPython(python, signal);
       const report = await this.nextSkillWorkflowRecord(sqlRecord, "report_generation");
+      throwIfAssistantOperationCancelled(signal);
       if (report) {
-        await this.executeOverallRiskReport(report);
+        await this.executeOverallRiskReport(report, signal);
       }
     } catch (error) {
+      if (isAssistantOperationCancelled(error) || signal?.aborted) {
+        throw error;
+      }
       const messageText = error instanceof Error ? error.message : "整体风险分类分布工作流执行失败。";
       if (sqlRecord.messageId) {
         const current = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(sqlRecord.messageId));
@@ -3813,7 +4275,8 @@ export class AssistantRuntime {
     }
   }
 
-  private async executeOverallRiskSql(record: ToolCallRecord) {
+  private async executeOverallRiskSql(record: ToolCallRecord, signal?: AbortSignal) {
+    throwIfAssistantOperationCancelled(signal);
     const sql = typeof record.request.sql === "string" ? record.request.sql : this.defaultSqlForSkillWorkflow({
       dataSourceId: typeof record.request.dataSourceId === "string" ? record.request.dataSourceId : null,
       dataSourceLabel: typeof record.request.dataSourceLabel === "string" ? record.request.dataSourceLabel : null,
@@ -3822,7 +4285,9 @@ export class AssistantRuntime {
     await this.emitToolState(record.conversationId);
     const toolCall = this.orchestrationRecordAsAssistantTool(executing, "sql", sql, "running");
     try {
+      throwIfAssistantOperationCancelled(signal);
       const sqlExecution = this.executeReadonlySql(sql, toolCall);
+      throwIfAssistantOperationCancelled(signal);
       const completedToolCall = { ...toolCall, status: "completed" as const, result: sqlExecution.result, updatedAt: nowIso() };
       const dataset = await this.registerSqlToolResultDataset(completedToolCall, sqlExecution.rows);
       const artifactIds = dataset ? [`workflow-dataset:${dataset.datasetId}`] : [`assistant-sql-result:${record.toolCallId}`];
@@ -3861,6 +4326,21 @@ export class AssistantRuntime {
       await this.emitToolState(record.conversationId);
       return completed;
     } catch (error) {
+      if (isAssistantOperationCancelled(error) || signal?.aborted) {
+        await this.toolResultRegistry.update(record.toolCallId, {
+          status: "failed",
+          completedAt: nowIso(),
+          error: {
+            code: "TOOL_EXECUTION_FAILED",
+            message: "用户已停止生成。",
+            conversationId: record.conversationId,
+            toolCallId: record.toolCallId,
+            traceId: `trace_${randomUUID()}`,
+          },
+        });
+        await this.emitToolState(record.conversationId);
+        throw error;
+      }
       const failed = await this.toolResultRegistry.update(record.toolCallId, {
         status: "failed",
         completedAt: nowIso(),
@@ -3885,11 +4365,14 @@ export class AssistantRuntime {
     }
   }
 
-  private async executeOverallRiskPython(record: ToolCallRecord) {
+  private async executeOverallRiskPython(record: ToolCallRecord, signal?: AbortSignal) {
+    throwIfAssistantOperationCancelled(signal);
     const executing = await this.toolResultRegistry.update(record.toolCallId, { status: "executing" });
     await this.emitToolState(record.conversationId);
     try {
+      throwIfAssistantOperationCancelled(signal);
       const rows = await this.rowsForLatestSkillSqlRecord(executing.conversationId);
+      throwIfAssistantOperationCancelled(signal);
       const sourceSql = await this.toolResultRegistry.getLatestSuccessful(executing.conversationId, "sql_query");
       const dataSourceLabel = typeof executing.request.dataSourceLabel === "string"
         ? executing.request.dataSourceLabel
@@ -3936,6 +4419,21 @@ export class AssistantRuntime {
       await this.emitToolState(executing.conversationId);
       return completed;
     } catch (error) {
+      if (isAssistantOperationCancelled(error) || signal?.aborted) {
+        await this.toolResultRegistry.update(executing.toolCallId, {
+          status: "failed",
+          completedAt: nowIso(),
+          error: {
+            code: "TOOL_EXECUTION_FAILED",
+            message: "用户已停止生成。",
+            conversationId: executing.conversationId,
+            toolCallId: executing.toolCallId,
+            traceId: `trace_${randomUUID()}`,
+          },
+        });
+        await this.emitToolState(executing.conversationId);
+        throw error;
+      }
       const failed = await this.toolResultRegistry.update(executing.toolCallId, {
         status: "failed",
         completedAt: nowIso(),
@@ -3960,10 +4458,12 @@ export class AssistantRuntime {
     }
   }
 
-  private async executeOverallRiskReport(record: ToolCallRecord) {
+  private async executeOverallRiskReport(record: ToolCallRecord, signal?: AbortSignal) {
+    throwIfAssistantOperationCancelled(signal);
     const executing = await this.toolResultRegistry.update(record.toolCallId, { status: "executing" });
     await this.emitToolState(record.conversationId);
     try {
+    throwIfAssistantOperationCancelled(signal);
     const analysis = await this.toolResultRegistry.getLatestSuccessful(executing.conversationId, "python_analysis");
     const sourceSql = await this.toolResultRegistry.getLatestSuccessful(executing.conversationId, "sql_query");
     const dataSourceLabel = typeof executing.request.dataSourceLabel === "string"
@@ -3980,6 +4480,7 @@ export class AssistantRuntime {
           dataSourceLabel,
           version: executing.version,
         });
+    throwIfAssistantOperationCancelled(signal);
     const artifact = await this.toolArtifactManager.createArtifact({
       artifactId: `assistant-report-markdown:${executing.toolCallId}`,
       artifactType: "report_markdown",
@@ -4033,6 +4534,21 @@ export class AssistantRuntime {
     await this.emitToolState(executing.conversationId);
     return message;
     } catch (error) {
+      if (isAssistantOperationCancelled(error) || signal?.aborted) {
+        await this.toolResultRegistry.update(executing.toolCallId, {
+          status: "failed",
+          completedAt: nowIso(),
+          error: {
+            code: "TOOL_EXECUTION_FAILED",
+            message: "用户已停止生成。",
+            conversationId: executing.conversationId,
+            toolCallId: executing.toolCallId,
+            traceId: `trace_${randomUUID()}`,
+          },
+        });
+        await this.emitToolState(executing.conversationId);
+        throw error;
+      }
       const failed = await this.toolResultRegistry.update(executing.toolCallId, {
         status: "failed",
         completedAt: nowIso(),
@@ -5158,8 +5674,12 @@ export class AssistantRuntime {
     };
   }
 
-  private executePython(script: string) {
+  private executePython(script: string, signal?: AbortSignal) {
     return new Promise<string>((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(new AssistantOperationCancelledError());
+        return;
+      }
       const workingDirectory = join(tmpdir(), "cycle-probe-python-sandbox");
       mkdirSync(workingDirectory, { recursive: true });
       const child = spawn("python3", ["-I", "-S", "-c", script], {
@@ -5171,10 +5691,28 @@ export class AssistantRuntime {
 
       let stdout = "";
       let stderr = "";
-      const timer = setTimeout(() => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const finish = (callback: () => void) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        if (timer) {
+          clearTimeout(timer);
+        }
+        signal?.removeEventListener("abort", onAbort);
+        callback();
+      };
+      const onAbort = () => {
+        child.kill("SIGTERM");
+        finish(() => reject(new AssistantOperationCancelledError()));
+      };
+      timer = setTimeout(() => {
         child.kill("SIGKILL");
-        reject(new Error("Python 执行超时，已终止。"));
+        finish(() => reject(new Error("Python 执行超时，已终止。")));
       }, PYTHON_TIMEOUT_MS);
+      signal?.addEventListener("abort", onAbort, { once: true });
 
       child.stdout.on("data", (chunk) => {
         stdout += chunk.toString();
@@ -5183,21 +5721,21 @@ export class AssistantRuntime {
         stderr += chunk.toString();
       });
       child.on("error", (error) => {
-        clearTimeout(timer);
-        reject(error);
+        finish(() => reject(error));
       });
       child.on("close", (code) => {
-        clearTimeout(timer);
-        if (code !== 0) {
-          reject(new Error(stderr.trim() || `Python 退出码 ${code}`));
-          return;
-        }
-        const normalizedStdout = stdout.trim();
-        if (normalizedStdout && isMarkdownLikeContent(normalizedStdout)) {
-          resolve(normalizedStdout);
-          return;
-        }
-        resolve(JSON.stringify({ stdout: normalizedStdout, stderr: stderr.trim() || null }, null, 2));
+        finish(() => {
+          if (code !== 0) {
+            reject(new Error(stderr.trim() || `Python 退出码 ${code}`));
+            return;
+          }
+          const normalizedStdout = stdout.trim();
+          if (normalizedStdout && isMarkdownLikeContent(normalizedStdout)) {
+            resolve(normalizedStdout);
+            return;
+          }
+          resolve(JSON.stringify({ stdout: normalizedStdout, stderr: stderr.trim() || null }, null, 2));
+        });
       });
     });
   }
@@ -5217,6 +5755,10 @@ export class AssistantRuntime {
 
     const controller = new AbortController();
     this.abortControllers.set(assistantMessage.id, controller);
+    if (this.cancelledMessageIds.has(assistantMessage.id)) {
+      controller.abort();
+    }
+    const streamStartedAtMs = Date.now();
 	    let content = "";
 	    let providerTraceId = `trace_${assistantMessage.id}`;
 	    let providerToolActivity = false;
@@ -5232,10 +5774,19 @@ export class AssistantRuntime {
       });
       for (const tool of this.createAssistantRuntimeToolDefinitions(input, conversation, assistantMessage, () => {
         providerToolActivity = true;
-      })) {
+      }, controller.signal)) {
         adapter.registerTool(tool);
       }
-      const providerMessages = await this.buildProviderMessages(input.userId, conversation.id, input.prompt, input.dataSourceLabel, input.schemaContextMarkdown, input.skill, input.approvalMode);
+      const providerMessages = await this.buildProviderMessages(
+        input.userId,
+        conversation.id,
+        input.prompt,
+        input.dataSourceLabel,
+        input.schemaContextMarkdown,
+        input.skill,
+        input.approvalMode,
+        input.selectedFieldRefs,
+      );
       const messages = providerMessages.map((message, index): ConversationMessage => ({
         id: `provider-${assistantMessage.id}-${index}`,
         role: message.role as ConversationMessage["role"],
@@ -5250,6 +5801,7 @@ export class AssistantRuntime {
         model: input.modelName,
         contentType: "markdown",
         signal: controller.signal,
+        timeoutMs: MODEL_STREAM_TIMEOUT_MS,
       })) {
         providerTraceId = event.traceId ?? providerTraceId;
         if (event.type === "markdown-delta" || event.type === "text-delta") {
@@ -5281,6 +5833,9 @@ export class AssistantRuntime {
             },
           });
           this.options.emit({ type: "message-delta", conversationId: conversation.id, messageId: assistantMessage.id, content, blocks: updated.blocks, status: updated.status });
+          if (!providerToolActivity && shouldEagerStartToolFromAssistantStream(content)) {
+            break;
+          }
           continue;
         }
         if (event.type === "tool-call-start" || event.type === "tool-execution-start") {
@@ -5313,6 +5868,23 @@ export class AssistantRuntime {
         return;
       }
 
+      if (latestMessage.status === "awaiting_approval" || shouldKeepProviderToolActivityMessage(providerToolActivity, latestMessage, content)) {
+        this.options.emit({ type: "message", conversationId: conversation.id, message: latestMessage });
+        return;
+      }
+
+      if (!content.trim() && providerToolActivity) {
+        const fallbackStarted = await this.routeFallbackTempCsvAnalysisSql(input, conversation, latestMessage, content, controller.signal);
+        if (fallbackStarted) {
+          return;
+        }
+        content = "工具调用已触发，但模型未返回可执行参数或可见结果。请重新提交查询条件，或用 # 选择真实字段后说明筛选值、分组维度和统计指标。";
+      }
+
+      if (!content.trim() && !providerToolActivity) {
+        content = this.buildUnclearTaskTextGuidance(input, conversation);
+      }
+
       const completed = this.updateMessage(assistantMessage.id, {
         status: "completed",
         content,
@@ -5334,26 +5906,55 @@ export class AssistantRuntime {
       const shouldStartSkillWorkflow = !providerToolActivity && shouldStartOverallRiskWorkflowAfterModelText(input, content);
       const shouldStartFallbackTempCsvSql =
         !providerToolActivity && !tool && !shouldStartSkillWorkflow
-          ? await this.routeFallbackTempCsvAnalysisSql(input, conversation, completed, content)
+          ? await this.routeFallbackTempCsvAnalysisSql(input, conversation, completed, content, controller.signal)
           : false;
-      if (!shouldStartSkillWorkflow) {
+      if (shouldRegisterAssistantGeneratedArtifacts({
+        hasDetectedTool: Boolean(tool),
+        willStartFallbackTempCsvSql: shouldStartFallbackTempCsvSql,
+        willStartSkillWorkflow: shouldStartSkillWorkflow,
+      })) {
         await this.registerAssistantGeneratedArtifacts(input, completed);
       }
       if (tool && !shouldStartSkillWorkflow) {
-        await this.handleToolCall(input, conversation, completed, tool, { appendToMessage: true });
+        await this.handleToolCall(input, conversation, completed, tool, { appendToMessage: true }, controller.signal);
       } else if (shouldStartFallbackTempCsvSql) {
         return;
       } else if (shouldStartSkillWorkflow) {
         await this.routeOverallRiskSkillWorkflow(input, conversation, completed);
       }
     } catch (error) {
-      const aborted = controller.signal.aborted;
-      const messageText = aborted ? "用户已停止生成。" : error instanceof Error ? error.message : "消息接收失败。";
+      const aborted = controller.signal.aborted || isAssistantOperationCancelled(error);
+      if (aborted) {
+        this.markAssistantMessageStopped(conversation.id, assistantMessage.id, streamStartedAtMs, providerTraceId);
+        return;
+      }
+      const messageText = error instanceof Error ? error.message : "消息接收失败。";
+      const timeoutTool = /超时|timeout/i.test(messageText) ? detectToolFromAssistantOutput(content) : null;
+      if (timeoutTool) {
+        const completed = this.updateMessage(assistantMessage.id, {
+          status: "completed",
+          content,
+          blocks: parseAssistantBlocks(content),
+          providerTraceId,
+        });
+        this.options.emit({ type: "message", conversationId: conversation.id, message: completed });
+        this.options.emit({
+          type: "stream-content",
+          conversationId: conversation.id,
+          event: {
+            type: "message_stream_completed",
+            messageId: assistantMessage.id,
+            completedAt: completed.updatedAt,
+          },
+        });
+        await this.handleToolCall(input, conversation, completed, timeoutTool, { appendToMessage: true }, controller.signal);
+        return;
+      }
       const failed = this.updateMessage(assistantMessage.id, {
-        status: aborted ? "stopped" : "error",
+        status: "error",
         content: content || messageText,
         blocks: content ? parseAssistantBlocks(content) : [{ id: randomUUID(), type: "card", title: "消息异常", content: messageText }],
-        errorMessage: aborted ? undefined : messageText,
+        errorMessage: messageText,
         providerTraceId,
       });
       this.options.emit({ type: "message", conversationId: conversation.id, message: failed });
@@ -5364,41 +5965,42 @@ export class AssistantRuntime {
           type: "stream_error",
           messageId: assistantMessage.id,
           segmentId: generalStreamSegmentId(assistantMessage.id),
-          code: aborted ? "REPORT_TRANSITION_CANCELLED" : "UNKNOWN_ERROR",
+          code: "UNKNOWN_ERROR",
           message: messageText,
         },
       });
-      if (!aborted) {
-        this.options.emit({ type: "error", conversationId: conversation.id, messageId: assistantMessage.id, message: messageText, traceId: providerTraceId ?? sha256(messageText).slice(0, 12) });
-      }
+      this.options.emit({ type: "error", conversationId: conversation.id, messageId: assistantMessage.id, message: messageText, traceId: providerTraceId ?? sha256(messageText).slice(0, 12) });
     } finally {
       this.abortControllers.delete(assistantMessage.id);
+      if (!controller.signal.aborted) {
+        this.cancelledMessageIds.delete(assistantMessage.id);
+      }
     }
   }
 
-  private createAssistantRuntimeToolDefinitions(input: AssistantSendInput, conversation: AssistantConversation, assistantMessage: AssistantMessage, markProviderToolActivity: () => void): ToolDefinition[] {
+  private createAssistantRuntimeToolDefinitions(input: AssistantSendInput, conversation: AssistantConversation, assistantMessage: AssistantMessage, markProviderToolActivity: () => void, signal?: AbortSignal): ToolDefinition[] {
     if (isOverallRiskSkill(input.skill)) {
       return [];
     }
     return [
       {
         name: TOOL_NAMES.sql_query,
-        description: "请求执行受控只读 SQL 查询。必须提供只读 SQL 候选语句，系统会进行安全校验并按用户审批权限处理。",
+        description: "请求执行受控只读 SQL 查询。必须提供只读 SQL 候选语句，系统会进行安全校验并按用户审批权限处理。若用户使用 #字段，本轮字段引用映射是最高优先级字段来源；SQL 必须使用映射中的实际字段名并用 SQLite 双引号引用，不得把 # 前缀写入 SQL。",
         inputSchema: TOOL_SCHEMAS.sql_query,
         riskLevel: "high",
         handler: async (request, context) => {
           markProviderToolActivity();
-          return this.handleModelSqlTool(request as Record<string, unknown>, input, conversation, assistantMessage, context.toolCallId);
+          return this.handleModelSqlTool(request as Record<string, unknown>, input, conversation, assistantMessage, context.toolCallId, signal);
         },
       },
       {
         name: TOOL_NAMES.python_analysis,
-        description: "请求执行受控 Python 数据分析。优先使用会话最新 SQL/Workflow 数据集作为输入；如提供 script，系统会按用户审批权限处理。",
+        description: "请求执行受控 Python 数据分析。优先使用会话最新 SQL/Workflow 数据集作为输入；如提供 script，系统会按用户审批权限处理。Python 脚本应读取 SQL/Workflow 结果中的真实列名，不要根据原始 #字段 文本重新猜测列名。",
         inputSchema: TOOL_SCHEMAS.python_analysis,
         riskLevel: "high",
         handler: async (request, context) => {
           markProviderToolActivity();
-          return this.handleModelPythonTool(request as Record<string, unknown>, input, conversation, assistantMessage, context.toolCallId);
+          return this.handleModelPythonTool(request as Record<string, unknown>, input, conversation, assistantMessage, context.toolCallId, signal);
         },
       },
       {
@@ -5413,7 +6015,7 @@ export class AssistantRuntime {
       },
       {
         name: TOOL_NAMES.report_generation,
-        description: "请求登记 Markdown 报告 Artifact。报告必须基于会话工具结果和 Artifact 摘要，不得伪造数据。",
+        description: "请求登记 Markdown 报告 Artifact。报告必须基于会话工具结果、Artifact 摘要和本轮字段引用映射，不得伪造数据或自行扩展用户未要求的字段、章节和指标。",
         inputSchema: TOOL_SCHEMAS.report_generation,
         riskLevel: "low",
         handler: async (request, context) => {
@@ -5424,13 +6026,36 @@ export class AssistantRuntime {
     ];
   }
 
+  private buildUnclearTaskTextGuidance(input: AssistantSendInput, conversation: AssistantConversation) {
+    const tempSources = this.activeTempSources(input.userId, conversation.id, input.selectedTempDataSourceIds);
+    const sourceNames = [
+      input.dataSourceLabel,
+      ...tempSources.map((source) => source.fileName),
+    ].filter((value): value is string => Boolean(value?.trim())).slice(0, 2);
+    const fieldNames = (input.selectedFieldRefs ?? [])
+      .filter((field) => field.status === "valid")
+      .map((field) => field.displayName || field.sourceHeader || field.physicalName)
+      .filter(Boolean)
+      .slice(0, 3);
+    const sourceText = sourceNames.length ? `当前已选择 ${sourceNames.join("、")}。` : "当前还没有可用数据源。可以通过“文件”上传 CSV，也可以在数据管理中导入 CSV 或连接数据库后再选择数据源。";
+    const fieldText = fieldNames.length ? `已选字段包括 ${fieldNames.join("、")}。` : "查询时可以在输入框用 # 选择表字段，例如“查询 #一级分行名称 上海分行的数据”。";
+    return [
+      "我没有识别到可以直接执行的查询、分析、绘图或报告任务。",
+      sourceText,
+      fieldText,
+      "可以补充成明确指令，例如“统计 #字段 按分行的数量分布”“查询 #字段 为某个值的合同数据”或“根据上一轮分析结果生成报告”。",
+    ].join("\n");
+  }
+
   private async handleModelSqlTool(
     request: Record<string, unknown>,
     input: AssistantSendInput,
     conversation: AssistantConversation,
     assistantMessage: AssistantMessage,
     modelToolCallId: string,
+    signal?: AbortSignal,
   ) {
+    throwIfAssistantOperationCancelled(signal);
     if (shouldAnalyzePriorSqlResult(input.prompt)) {
       const { latestSqlToolCall, rows } = await this.latestSqlRowsForConversation(input.userId, conversation.id);
       if (latestSqlToolCall) {
@@ -5459,6 +6084,7 @@ export class AssistantRuntime {
             script: this.buildPythonAnalysisScript(input.prompt, latestSqlToolCall, rows),
           },
           { appendToMessage: true },
+          signal,
         );
         return {
           status: input.approvalMode === "request_approval" ? "waiting_approval" : "submitted",
@@ -5499,6 +6125,7 @@ export class AssistantRuntime {
       currentMessage,
       { kind: "sql", script },
       { appendToMessage: true },
+      signal,
     );
     return {
       status: input.approvalMode === "request_approval" ? "waiting_approval" : "submitted",
@@ -5513,7 +6140,9 @@ export class AssistantRuntime {
     conversation: AssistantConversation,
     assistantMessage: AssistantMessage,
     modelToolCallId: string,
+    signal?: AbortSignal,
   ) {
+    throwIfAssistantOperationCancelled(signal);
     const toolState = await this.toolResultRegistry.getConversationState(conversation.id);
     const repair = this.agentGuidance.validateToolRequest({ toolKind: "python_analysis", request, toolState });
     const scriptParameterMissing = typeof request.script !== "string" || !request.script.trim();
@@ -5558,6 +6187,7 @@ export class AssistantRuntime {
       currentMessage,
       { kind: "python", script },
       { appendToMessage: true },
+      signal,
     );
     return {
       status: input.approvalMode === "request_approval" ? "waiting_approval" : "submitted",
@@ -5719,9 +6349,12 @@ export class AssistantRuntime {
     schemaContextMarkdown: string | null | undefined,
     skill: AssistantSkill | null | undefined,
     approvalMode: AssistantApprovalMode,
+    selectedFieldRefs?: ChatCsvSelectedFieldRef[],
   ) {
     const recentToolContext = this.recentToolContext(userId, conversationId);
     const workflowContext = await this.workflowContextBuilder.buildMarkdown(conversationId);
+    const schemaContextHasSelectedFields = Boolean(schemaContextMarkdown?.includes("Schema Context Mode：selected_fields"));
+    const fieldReferenceContext = schemaContextHasSelectedFields ? null : selectedFieldReferencesMarkdown(selectedFieldRefs);
     const history = this.getConversationMessages(userId, conversationId)
       .filter((message) => (message.role === "user" || message.role === "assistant") && message.status === "completed" && message.content.trim())
       .slice(-MAX_STORED_MESSAGES_FOR_CONTEXT)
@@ -5735,9 +6368,19 @@ export class AssistantRuntime {
         role: "system",
         content: [
           "你是 Cycle Probe 的数据助手。请用中文回答。",
+          `当前用户任务：${prompt}`,
+          fieldReferenceContext ? `\n${fieldReferenceContext}` : undefined,
+          `当前数据源：${dataSourceLabel || "未选择"}`,
+          `当前 Skill：${skill || "未选择"}`,
+          `审批权限：${approvalMode}`,
           "所有模型回复必须流式输出。默认普通问答、说明和简短结论使用流式 text；只有报告、方案、结构化分析、代码块、SQL 候选语句、工具调用执行结果和需要长期查看的产物使用流式 markdown。",
           "不要编造数据库结果；需要查询数据源时，应优先使用 request_sql_query_execution 语义生成候选只读 SQL、查询目的和结果用途，SQL 必须先经过安全校验、权限校验、风险评估和用户审批。",
           "当用户要求统计、筛选或读取数据源内容时，必须输出单个 ```sql 代码块承载候选只读 SQL；客户端会自动捕获该 SQL 并进入安全校验、审批和工具执行流程。",
+          "字段引用规则：用户文本中的 #字段名称 表示客户端已验证的结构化字段引用。生成 SQL 时把“#字段 为/是/等于 ‘值’”转换为 where 条件，字段名必须使用“本轮已选字段/字段引用映射”中的实际字段名并用 SQLite 双引号引用；不得保留 # 前缀到 SQL、Python 或报告指标字段中。",
+          "字段解析优先级：本轮已选字段/字段引用映射 > Workflow/工具结果字段 > 全表字段清单。若 Schema Context Mode 为 selected_fields，不要扫描全表字段清单或重新比较字段别名；只有用户明确要求未选字段、字段探索或字段映射缺失时，才使用全表字段清单做补充匹配。",
+          "工具调用字段约束：SQL 查询阶段按字段映射生成候选 SQL；Python 分析阶段优先读取 SQL 工具返回字段或工作流数据集字段，不得根据原始 #字段 文本重新猜列名；报告生成阶段只使用已完成工具结果、Artifact 和明确字段映射，不自行扩展字段。",
+          "如果用户表达过短、只有代词或无法识别明确查询/分析/绘图/报告目标，不要输出预制模板、等待补充、Resume Token 或操作按钮文案；应结合当前数据源、已选字段和历史工具结果，用普通 text 简短说明可继续怎么提问。",
+          "当缺少数据源时，直接说明可通过“文件”手动上传 CSV、在数据管理中导入 CSV，或连接数据库后选择数据源；当需要查询数据时，引导用户用 # 选择真实表字段并写清筛选值、分组维度或统计指标。",
           "当 Workflow Context 中存在 activeDataset 且用户提到上一轮、当前结果、这批数据或刚才的数据时，候选 SQL 必须优先查询 activeDataset 的 sqliteTableName；不要重新访问原始业务表，除非用户明确要求重新查询原始数据源。",
           "如果用户明确要求“根据 SQL 查询结果/上一轮查询结果/工具调用结果”继续统计、对比或生成报告，必须复用最近工具结果，不得重新生成 SQL；需要计算时输出单个 ```python 代码块，报告正文必须为 Markdown。",
           "Python 工具运行在受限本地沙箱中，只能使用 Python 标准库；不得 import pandas、numpy、openpyxl、matplotlib 或任何第三方库。需要读取工作流数据集时使用 sqlite3 连接 Workflow Context 中的 sqliteDatabasePath，并读取 activeDataset.sqliteTableName。",
@@ -5748,12 +6391,9 @@ export class AssistantRuntime {
           "当前会话可能包含用户临时上传的 CSV 数据源。临时 CSV 数据源的 SQLite 表字段可以是中文、英文或中英文混合。生成 SQLite SQL 时必须使用 Schema Context 中给出的真实表名和字段名，并对表名、字段名使用 SQLite 双引号转义。不要假设临时 CSV 字段具备 businessFieldId。需要精确查询、统计、排序、聚合或筛选时，必须调用 SQL 查询工具。",
           TOOL_ORCHESTRATION_SYSTEM_PROMPT,
           "仅在本地脚本调试场景才输出 /sql 或 /python 代码块，客户端会按审批权限处理。",
-          `当前数据源：${dataSourceLabel || "未选择"}`,
-          `当前 Skill：${skill || "未选择"}`,
           !skill ? "当前未选择 Skill。必须严格按用户自然语言请求生成内容；只能使用用户显式点名的字段、筛选条件、统计指标和分析维度。不得自行添加用户未要求的报告章节、模板栏目、字段概览、交叉分布、数值字段汇总、核心风险指标、数据质量说明或口径说明。若用户只要求查询或分析，只输出与该请求直接相关的结果和必要解释。" : undefined,
           selectedSkillSystemPrompt(skill),
-          `审批权限：${approvalMode}`,
-          schemaContextMarkdown ? `\n以下是已授权数据源 Schema Context。请遵守其中 Usage Policy、安全约束和工具调用要求，不要基于样例行推断全量结论。\n${schemaContextMarkdown}` : undefined,
+          schemaContextMarkdown ? `\n以下是已授权数据源 Schema Context。请遵守其中 Usage Policy、安全约束和工具调用要求，不要基于样例行推断全量结论。若本轮字段引用映射已经覆盖用户点名字段，不要在全表字段清单中重复搜索这些字段；全表字段清单仅用于补充未选择字段或生成 select * / 明细查询。\n${schemaContextMarkdown}` : undefined,
           workflowContext ? `\n${workflowContext}` : undefined,
           recentToolContext ? `\n${recentToolContext}` : undefined,
         ].filter(Boolean).join("\n"),

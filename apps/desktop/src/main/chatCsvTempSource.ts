@@ -28,6 +28,22 @@ export type ChatCsvImportError = {
 
 export type ChatCsvLogicalType = "string" | "integer" | "decimal" | "boolean" | "date" | "datetime" | "category" | "text" | "unknown";
 export type ChatCsvSqliteType = "TEXT" | "INTEGER" | "REAL" | "NUMERIC" | "BLOB";
+export type SchemaContextMode = "selected_fields" | "full_schema" | "schema_summary";
+
+export function resolveSchemaContextMode(input: {
+  selectedFieldRefs?: ChatCsvSelectedFieldRef[];
+  requiresFullSchema?: boolean;
+  userRequestedFieldDiscovery?: boolean;
+}): SchemaContextMode {
+  const selectedFieldCount = input.selectedFieldRefs?.filter((field) => field.status === "valid").length ?? 0;
+  if (selectedFieldCount > 0 && !input.requiresFullSchema && !input.userRequestedFieldDiscovery) {
+    return "selected_fields";
+  }
+  if (input.requiresFullSchema || input.userRequestedFieldDiscovery) {
+    return "full_schema";
+  }
+  return "schema_summary";
+}
 
 export type ChatCsvColumnMetadata = {
   ordinalPosition: number;
@@ -596,7 +612,15 @@ export class ConversationTempSourceManager {
     }
   }
 
-  buildSchemaContextMarkdown(input: { conversationId: string; userId: string; tempDataSourceIds?: string[]; selectedFieldRefs?: ChatCsvSelectedFieldRef[]; maxFieldsPerSource?: number }) {
+  buildSchemaContextMarkdown(input: {
+    conversationId: string;
+    userId: string;
+    tempDataSourceIds?: string[];
+    selectedFieldRefs?: ChatCsvSelectedFieldRef[];
+    maxFieldsPerSource?: number;
+    requiresFullSchema?: boolean;
+    userRequestedFieldDiscovery?: boolean;
+  }) {
     const sources = input.tempDataSourceIds?.length
       ? input.tempDataSourceIds
         .map((id) => this.getTempSource(id, input.userId, input.conversationId))
@@ -604,6 +628,10 @@ export class ConversationTempSourceManager {
       : this.listByConversation(input.conversationId, input.userId);
     if (sources.length === 0) {
       return null;
+    }
+    const mode = resolveSchemaContextMode(input);
+    if (mode === "selected_fields") {
+      return this.buildSelectedFieldsSchemaContextMarkdown(sources, input.selectedFieldRefs);
     }
     const maxFieldsPerSource = Number.isFinite(input.maxFieldsPerSource)
       ? Math.max(0, Math.floor(input.maxFieldsPerSource as number))
@@ -620,7 +648,9 @@ export class ConversationTempSourceManager {
     return [
       "## 本轮 CSV 全表字段清单",
       "",
-      "用户在自然语言中通过 # 选择的字段主要用于表达查询条件或关注维度；实际 SQL、Python、图表和报告分析可使用本节列出的当前临时 CSV 表字段。生成 SQLite SQL 时必须使用 SQLite 双引号安全引用表名和字段名。",
+      `Schema Context Mode：${mode === "full_schema" ? "full_schema" : "schema_summary"}`,
+      "用户在自然语言中通过 # 选择的字段主要用于表达查询条件或关注维度；如模型上下文中存在“本轮字段引用映射”，必须优先使用该映射中的实际字段名。本节全表字段清单仅用于补充未选择字段、select * 明细查询或用户明确要求使用全字段时的字段范围确认。",
+      "生成 SQLite SQL 时必须使用 SQLite 双引号安全引用表名和字段名；不得把 # 前缀写入 SQL、Python、图表或报告字段名。",
       typeof maxFieldsPerSource === "number"
         ? `字段注入策略：用户拒绝全量字段导入，本轮每个临时 CSV 仅注入前 ${maxFieldsPerSource} 个字段。`
         : "字段注入策略：已注入当前临时 CSV 的全表字段清单。",
@@ -646,6 +676,77 @@ export class ConversationTempSourceManager {
         ),
         "",
       ]),
+    ].join("\n");
+  }
+
+  private buildSelectedFieldsSchemaContextMarkdown(sources: ConversationTempCsvTable[], selectedFieldRefs: ChatCsvSelectedFieldRef[] | undefined) {
+    const validRefs = (selectedFieldRefs ?? [])
+      .filter((field) => field.status === "valid")
+      .filter((field, index, all) => all.findIndex((item) => item.fieldId === field.fieldId && item.tempDataSourceId === field.tempDataSourceId) === index);
+    if (validRefs.length === 0) {
+      return [
+        "## 本轮已选字段",
+        "",
+        "Schema Context Mode：selected_fields",
+        "当前消息包含字段引用，但没有可用的 valid 字段。请重新通过 # 选择字段后再执行查询、分析、绘图或报告生成。",
+      ].join("\n");
+    }
+
+    const sourceById = new Map(sources.map((source) => [source.tempDataSourceId, source]));
+    const rows = validRefs.flatMap((field) => {
+      const source = sourceById.get(field.tempDataSourceId);
+      if (!source) {
+        return [];
+      }
+      const column = source.columns.find((item) => item.sqliteColumnName === field.physicalName || item.sourceHeader === field.sourceHeader);
+      if (!column) {
+        return [];
+      }
+      return [{
+        source,
+        field,
+        displayName: field.displayName || column.displayName,
+        physicalName: column.sqliteColumnName,
+        logicalType: field.logicalType || column.inferredLogicalType,
+        sqliteType: field.sqliteType || column.sqliteType,
+      }];
+    });
+
+    if (rows.length === 0) {
+      return [
+        "## 本轮已选字段",
+        "",
+        "Schema Context Mode：selected_fields",
+        "当前已选字段与会话临时表不匹配，字段可能已过期或数据源已被移除。请重新上传 CSV 或重新通过 # 选择字段。",
+      ].join("\n");
+    }
+
+    const sourceLines = Array.from(new Map(rows.map((row) => [row.source.tempDataSourceId, row.source])).values()).flatMap((source) => [
+      `### ${source.fileName}`,
+      "",
+      `- 临时数据源 ID：${source.tempDataSourceId}`,
+      `- 临时表 ID：${source.tempTableId}`,
+      `- SQLite 临时表：${source.sqliteTableName}`,
+      `- SQLite 临时表（已转义）：${quoteSqliteIdentifier(source.sqliteTableName)}`,
+      `- 行数：${source.rowCount}`,
+      `- 表字段总数：${source.columns.length}`,
+      `- 本轮注入字段数：${rows.filter((row) => row.source.tempDataSourceId === source.tempDataSourceId).length}`,
+      "",
+    ]);
+
+    return [
+      "## 本轮已选字段",
+      "",
+      "Schema Context Mode：selected_fields",
+      "以下字段来自 ChatComposer 的 # 字段选择，已由客户端确认存在。模型无需搜索全表字段、比较字段别名或重新推断物理字段。",
+      "生成 SQL 时使用表名和 SQL字段引用；生成 Python 时使用实际字段名；生成图表和报告时使用展示名称。",
+      "",
+      ...sourceLines,
+      "| 字段 ID | 用户文本 | 展示名称 | 实际字段名 | SQL字段引用 | 逻辑类型 | SQLite 类型 |",
+      "|---|---|---|---|---|---|---|",
+      ...rows.map(({ field, displayName, physicalName, logicalType, sqliteType }) =>
+        `| ${escapeMarkdownTable(field.fieldId)} | ${escapeMarkdownTable(field.rawText)} | ${escapeMarkdownTable(displayName)} | ${escapeMarkdownTable(physicalName)} | ${escapeMarkdownTable(quoteSqliteIdentifier(physicalName))} | ${escapeMarkdownTable(logicalType)} | ${escapeMarkdownTable(sqliteType)} |`
+      ),
     ].join("\n");
   }
 

@@ -4,6 +4,7 @@ import {
   CHAT_CSV_MAX_FILE_SIZE_BYTES,
   ConversationTempSourceManager,
   quoteSqliteIdentifier,
+  resolveSchemaContextMode,
 } from "./chatCsvTempSource";
 
 const require = createRequire(import.meta.url);
@@ -259,5 +260,65 @@ describe("ConversationTempSourceManager", () => {
     expect(limitedMarkdown).toContain("- 本轮注入字段数：100");
     expect(limitedMarkdown).toContain("字段100");
     expect(limitedMarkdown).not.toContain("字段101");
+  });
+
+  it("uses selected_fields schema context when chat field refs are selected", () => {
+    const { manager } = createManager();
+    const header = Array.from({ length: 500 }, (_, index) => `字段${index + 1}`).join(",");
+    const row = Array.from({ length: 500 }, (_, index) => index + 1).join(",");
+    const attachment = manager.importCsv(importInput(`${header}\n${row}`));
+    const markdown = manager.buildSchemaContextMarkdown({
+      conversationId: "conversation-1",
+      userId: "user-1",
+      tempDataSourceIds: [attachment.tempDataSourceId!],
+      selectedFieldRefs: [
+        {
+          tokenId: "token-field-2",
+          type: "csv_field",
+          tempDataSourceId: attachment.tempDataSourceId!,
+          tempTableId: attachment.tempTableId!,
+          fieldId: "field-2",
+          sourceHeader: "字段2",
+          physicalName: "字段2",
+          displayName: "字段2",
+          logicalType: "integer",
+          sqliteType: "INTEGER",
+          rawText: "#字段2",
+          start: 0,
+          end: 4,
+          createdAt: "2026-07-20T00:00:00.000Z",
+          status: "valid",
+        },
+        {
+          tokenId: "token-field-499",
+          type: "csv_field",
+          tempDataSourceId: attachment.tempDataSourceId!,
+          tempTableId: attachment.tempTableId!,
+          fieldId: "field-499",
+          sourceHeader: "字段499",
+          physicalName: "字段499",
+          displayName: "字段499",
+          logicalType: "integer",
+          sqliteType: "INTEGER",
+          rawText: "#字段499",
+          start: 5,
+          end: 11,
+          createdAt: "2026-07-20T00:00:00.000Z",
+          status: "valid",
+        },
+      ],
+    });
+
+    expect(resolveSchemaContextMode({ selectedFieldRefs: [] })).toBe("schema_summary");
+    expect(resolveSchemaContextMode({ selectedFieldRefs: [{ status: "valid" } as never] })).toBe("selected_fields");
+    expect(resolveSchemaContextMode({ selectedFieldRefs: [{ status: "valid" } as never], requiresFullSchema: true })).toBe("full_schema");
+    expect(markdown).toContain("Schema Context Mode：selected_fields");
+    expect(markdown).toContain("- 表字段总数：500");
+    expect(markdown).toContain("- 本轮注入字段数：2");
+    expect(markdown).toContain("| field-2 | #字段2 | 字段2 | 字段2 | \"字段2\" | integer | INTEGER |");
+    expect(markdown).toContain("| field-499 | #字段499 | 字段499 | 字段499 | \"字段499\" | integer | INTEGER |");
+    expect(markdown).not.toContain("字段498");
+    expect(markdown).not.toContain("字段500");
+    expect(markdown).not.toContain("脱敏样例");
   });
 });

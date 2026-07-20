@@ -57,6 +57,8 @@ describe("tool orchestration", () => {
     expect(priorResultAnalysis.intents.map((item) => item.toolKind)).toEqual(["python_analysis"]);
     await expect(tools.detectIntent({ conversationId: "c1", userMessage: "请根据分析结果生成报告" }))
       .resolves.toMatchObject({ intents: [{ toolKind: "report_generation" }] });
+    await expect(tools.detectIntent({ conversationId: "c1", userMessage: "请根据数据分析结果绘制各分行的合同总数占比的饼图。" }))
+      .resolves.toMatchObject({ intents: [{ toolKind: "chart_rendering" }] });
 
     const combined = await tools.detectIntent({
       conversationId: "c1",
@@ -64,6 +66,13 @@ describe("tool orchestration", () => {
     });
     expect(combined.intents.map((item) => item.toolKind)).toEqual(["sql_query", "python_analysis", "chart_rendering", "report_generation"]);
     expect(combined.intents.find((item) => item.toolKind === "report_generation")?.dependsOn).toEqual(["chart_rendering"]);
+
+    const countByBranch = await tools.detectIntent({
+      conversationId: "c1",
+      userMessage: "查询导入的数据样本中共有多少例 #最新风险分类 字段为“关注”的合同数据，以及分布在每个分行 #一级分行名称 各有多少例。",
+    });
+    expect(countByBranch.intents.map((item) => item.toolKind)).toEqual(["sql_query", "python_analysis"]);
+    expect(countByBranch.intents.find((item) => item.toolKind === "python_analysis")?.dependsOn).toEqual(["sql_query"]);
   });
 
   it("builds dependency ordered plans without global fixed order", async () => {
@@ -97,6 +106,16 @@ describe("tool orchestration", () => {
     expect(reportFromAnalysisPlan.steps[0].dependencies).toEqual([]);
     expect(reportFromAnalysisPlan.steps[0].inputStrategy).toBe("latest_python");
 
+    const chartFromAnalysisPlan = await tools.buildPlan({
+      conversationId: "c2",
+      userId: "u",
+      userMessage: "请根据数据分析结果绘制各分行的合同总数占比的饼图。",
+    });
+    expect(chartFromAnalysisPlan.steps).toHaveLength(1);
+    expect(chartFromAnalysisPlan.steps[0].toolKind).toBe("chart_rendering");
+    expect(chartFromAnalysisPlan.steps[0].dependencies).toEqual([]);
+    expect(chartFromAnalysisPlan.steps[0].inputStrategy).toBe("latest_python");
+
     const fullPlan = await tools.buildPlan({
       conversationId: "c2",
       userId: "u",
@@ -105,6 +124,43 @@ describe("tool orchestration", () => {
     expect(() => tools.validatePlan(fullPlan)).not.toThrow();
     expect(fullPlan.steps.map((item) => item.toolKind)).toEqual(["sql_query", "python_analysis", "chart_rendering", "report_generation"]);
     expect(fullPlan.steps[1].dependencies).toEqual([fullPlan.steps[0].stepId]);
+  });
+
+  it("uses existing artifacts before planning upstream tools", async () => {
+    const { tools } = moduleWithBridges();
+    await tools.executeSingleTool({ conversationId: "c-history", userId: "u", userMessage: "查询合同明细", toolKind: "sql_query" });
+
+    const analysisPlan = await tools.buildPlan({
+      conversationId: "c-history",
+      userId: "u",
+      userMessage: "统计各分行合同总数占比。",
+    });
+    expect(analysisPlan.steps).toHaveLength(1);
+    expect(analysisPlan.steps[0].toolKind).toBe("python_analysis");
+    expect(analysisPlan.steps[0].dependencies).toEqual([]);
+    expect(analysisPlan.steps[0].inputStrategy).toBe("latest_sql");
+
+    await tools.executeSingleTool({ conversationId: "c-history", userId: "u", userMessage: "统计各分行合同总数占比。", toolKind: "python_analysis" });
+    const chartPlan = await tools.buildPlan({
+      conversationId: "c-history",
+      userId: "u",
+      userMessage: "绘制各分行的合同总数占比饼图。",
+    });
+    expect(chartPlan.steps).toHaveLength(1);
+    expect(chartPlan.steps[0].toolKind).toBe("chart_rendering");
+    expect(chartPlan.steps[0].dependencies).toEqual([]);
+    expect(chartPlan.steps[0].inputStrategy).toBe("latest_python");
+
+    await tools.executeSingleTool({ conversationId: "c-history", userId: "u", userMessage: "绘制各分行的合同总数占比饼图。", toolKind: "chart_rendering" });
+    const reportPlan = await tools.buildPlan({
+      conversationId: "c-history",
+      userId: "u",
+      userMessage: "生成报告。",
+    });
+    expect(reportPlan.steps).toHaveLength(1);
+    expect(reportPlan.steps[0].toolKind).toBe("report_generation");
+    expect(reportPlan.steps[0].dependencies).toEqual([]);
+    expect(reportPlan.steps[0].inputStrategy).toBe("latest_python");
   });
 
   it("updates latest successful state, versions and lineage while failed calls do not overwrite", async () => {
