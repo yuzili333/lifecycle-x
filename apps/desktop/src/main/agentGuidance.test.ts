@@ -332,13 +332,13 @@ describe("agent guidance", () => {
 
   it("builds repair guidance for missing tool parameters", () => {
     const repair = new ParameterRepairEngine().validateToolRequest({
-      toolKind: "report_generation",
+      toolKind: "sql_query",
       request: {},
       toolState: { conversationId: "conversation-1", toolCalls: [], updatedAt: "2026-07-17T00:00:00.000Z" },
     });
     const guidance = createAgentGuidanceModule({}).buildParameterRepair({
       conversationId: "conversation-1",
-      toolKind: "report_generation",
+      toolKind: "sql_query",
       invalidParameters: repair.invalidParameters,
     });
 
@@ -363,9 +363,9 @@ describe("agent guidance", () => {
     expect(scriptAlias.valid).toBe(true);
   });
 
-  it("requires real upstream data for Python analysis unless an artifact is provided", () => {
+  it("validates Python analysis parameters without enforcing upstream tool order", () => {
     const engine = new ParameterRepairEngine();
-    const missingInput = engine.validateToolRequest({
+    const noUpstreamInput = engine.validateToolRequest({
       toolKind: "python_analysis",
       request: { script: "print('ok')" },
       toolState: { conversationId: "conversation-1", toolCalls: [], updatedAt: "2026-07-17T00:00:00.000Z" },
@@ -387,8 +387,7 @@ describe("agent guidance", () => {
       toolState: { conversationId: "conversation-1", toolCalls: [], updatedAt: "2026-07-17T00:00:00.000Z" },
     });
 
-    expect(missingInput.valid).toBe(false);
-    expect(missingInput.invalidParameters.map((item) => item.parameterName)).toContain("inputArtifactIds");
+    expect(noUpstreamInput.valid).toBe(true);
     expect(latestSqlInput.valid).toBe(true);
     expect(explicitInput.valid).toBe(true);
   });
@@ -412,15 +411,36 @@ describe("agent guidance", () => {
       },
       toolState: { conversationId: "conversation-1", toolCalls: [], updatedAt: "2026-07-17T00:00:00.000Z" },
     });
+    const declarativeChart = engine.validateToolRequest({
+      toolKind: "chart_rendering",
+      request: {
+        userRequest: "根据分析结果绘制不良关注率横向排名条形图",
+        purpose: "展示行业不良关注率排名",
+        chartType: "horizontal_bar",
+        dimensionFields: ["行业分类"],
+        measureFields: ["不良关注率"],
+        sortBy: "不良关注率",
+        sortDirection: "desc",
+      },
+      toolState: {
+        conversationId: "conversation-1",
+        latestSuccessfulPythonToolCallId: "python-1",
+        latestSuccessfulPythonArtifactIds: ["analysis-artifact-1"],
+        toolCalls: [],
+        updatedAt: "2026-07-17T00:00:00.000Z",
+      },
+    });
 
     expect(missingSpec.valid).toBe(false);
-    expect(missingSpec.invalidParameters.map((item) => item.parameterName)).toEqual(expect.arrayContaining(["inputArtifactIds", "visualizationSpec.title", "visualizationSpec.encoding"]));
+    expect(missingSpec.invalidParameters.map((item) => item.parameterName)).toEqual(expect.arrayContaining(["visualizationSpec.title", "visualizationSpec.encoding"]));
+    expect(missingSpec.invalidParameters.map((item) => item.parameterName)).not.toContain("inputArtifactIds");
     expect(trustedInline.valid).toBe(true);
+    expect(declarativeChart.valid).toBe(true);
   });
 
-  it("validates report inputs without allowing fabricated markdown", () => {
+  it("validates report parameters without enforcing upstream tool order", () => {
     const engine = new ParameterRepairEngine();
-    const missingInput = engine.validateToolRequest({
+    const noUpstreamInput = engine.validateToolRequest({
       toolKind: "report_generation",
       request: {},
       toolState: { conversationId: "conversation-1", toolCalls: [], updatedAt: "2026-07-17T00:00:00.000Z" },
@@ -436,8 +456,7 @@ describe("agent guidance", () => {
       toolState: { conversationId: "conversation-1", toolCalls: [], updatedAt: "2026-07-17T00:00:00.000Z" },
     });
 
-    expect(missingInput.valid).toBe(false);
-    expect(missingInput.invalidParameters.map((item) => item.parameterName)).toContain("inputArtifactIds");
+    expect(noUpstreamInput.valid).toBe(true);
     expect(explicitArtifact.valid).toBe(true);
     expect(emptyMarkdown.valid).toBe(false);
     expect(emptyMarkdown.invalidParameters.map((item) => item.parameterName)).toContain("markdown");

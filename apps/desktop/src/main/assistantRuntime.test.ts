@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { buildFallbackTempCsvSqlForAnalysisRequest, buildGenericSqlResultAnalysisPythonScript, buildOverallRiskDistributionMarkdown, detectToolFromAssistantOutput, formatStoppedGenerationMessage, generalStreamSegmentId, generalTextStreamSegmentId, generatedReportArtifactId, generatedReportToolCallId, inferReportTitle, isPreToolTextGuidanceRequiredInputs, isPythonReportCardContent, isReportGenerationContent, normalizeAnalysisReportMarkdown, normalizeAnalysisReportTitle, reportStreamSegmentId, selectedFieldReferencesMarkdown, shouldAnalyzePriorSqlResult, shouldAutoStartPythonReport, shouldEagerStartToolFromAssistantStream, shouldForceGenericSqlResultAnalysisScript, shouldGenerateReportFromAnalysisResult, shouldKeepProviderToolActivityMessage, shouldRegisterAssistantGeneratedArtifacts, shouldRouteSkillThroughModel, shouldStartOverallRiskWorkflowAfterModelText, shouldUseModelForUnclearTaskGoal } from "./assistantRuntime";
+import { appendVisualizationReferencesToReport, buildFallbackTempCsvSqlForAnalysisRequest, buildGenericSqlResultAnalysisPythonScript, buildModelToolParameterIssueFeedback, buildOverallRiskDistributionMarkdown, detectToolFromAssistantOutput, formatStoppedGenerationMessage, generalStreamSegmentId, generalTextStreamSegmentId, generatedReportArtifactId, generatedReportToolCallId, inferReportTitle, isPreToolTextGuidanceRequiredInputs, isPythonReportCardContent, isReportGenerationContent, normalizeAnalysisReportMarkdown, normalizeAnalysisReportTitle, providerToolFallbackText, renderLocalToolPlanContext, reportStreamSegmentId, selectedFieldReferencesMarkdown, shouldAnalyzePriorSqlResult, shouldAutoStartPythonReport, shouldDeferChartUntilUpstreamTools, shouldDeferReportUntilChartTool, shouldEagerStartToolFromAssistantStream, shouldForceGenericSqlResultAnalysisScript, shouldGenerateReportFromAnalysisResult, shouldKeepProviderToolActivityMessage, shouldRegisterAssistantGeneratedArtifacts, shouldRequireDetailSqlForCompositeAnalysis, shouldRouteDeterministicTempCsvToolPlan, shouldRouteSkillThroughModel, shouldStartOverallRiskWorkflowAfterModelText, shouldUseModelForPriorResultVisualization, shouldUseModelForUnclearTaskGoal } from "./assistantRuntime";
+import { TOOL_NAMES, type ToolExecutionPlan } from "./toolOrchestration";
 import { MissingInputDetector } from "./agentGuidance";
 import type { ChatCsvSelectedFieldRef, ConversationTempCsvTable } from "./chatCsvTempSource";
 
@@ -48,6 +49,261 @@ describe("AssistantRuntime workflow intent", () => {
     });
     expect(shouldKeepProviderToolActivityMessage(true, message, content)).toBe(false);
     expect(shouldKeepProviderToolActivityMessage(true, { ...message, content: "正在查询数据。", blocks: [{ id: "block-2", type: "text" as const, content: "正在查询数据。" }] }, "正在查询数据。")).toBe(true);
+  });
+
+  it("does not claim a tool call was triggered without a local tool record", () => {
+    expect(providerToolFallbackText(false)).toContain("本地未创建工具调用记录");
+    expect(providerToolFallbackText(false)).not.toContain("工具调用已触发");
+    expect(providerToolFallbackText(true)).toContain("工具调用已触发");
+  });
+
+  it("defers chart calls to upstream query and analysis for one-shot data requests", () => {
+    const request = {
+      userRequest: "根据 #客户所属国标行业名称字段的前缀“F51/F52”查询和区分“批发/零售业”的数据，根据查询结果分析 #最新风险五级分类 为“不良”和“关注”的占比率，绘制“批发业/零售业”的条形图表。",
+      purpose: "绘制批发业和零售业不良关注占比条形图",
+      chartType: "bar",
+    };
+    expect(shouldDeferChartUntilUpstreamTools({
+      request,
+      invalidParameters: [{ parameterName: "inputArtifactIds", reason: "missing", message: "缺少真实数据输入" }],
+      toolState: { conversationId: "conversation-1", toolCalls: [], updatedAt: "2026-07-20T00:00:00.000Z" },
+    })).toBe(true);
+    expect(shouldDeferChartUntilUpstreamTools({
+      request: { userRequest: "绘制条形图", purpose: "画图", chartType: "bar" },
+      invalidParameters: [{ parameterName: "inputArtifactIds", reason: "missing", message: "缺少真实数据输入" }],
+      toolState: { conversationId: "conversation-1", toolCalls: [], updatedAt: "2026-07-20T00:00:00.000Z" },
+    })).toBe(false);
+  });
+
+  it("requires detail SQL for composite query, analysis, and chart requests", () => {
+    const prompt = "根据 #客户所属国标行业名称字段的前缀“F51/F52”查询和区分“批发/零售业”的数据，根据查询结果分析 #最新风险五级分类 为“不良”和“关注”的占比率，绘制“批发业/零售业”的条形图表。";
+    expect(shouldRequireDetailSqlForCompositeAnalysis({
+      prompt,
+      sql: 'select "行业", count(*) as "合同数" from "loans" group by "行业"',
+    })).toBe(true);
+    expect(shouldRequireDetailSqlForCompositeAnalysis({
+      prompt,
+      sql: 'select "行业", "最新风险五级分类", "合同编号" from "loans" where "行业" like \'F51%\' or "行业" like \'F52%\'',
+    })).toBe(false);
+    expect(shouldRequireDetailSqlForCompositeAnalysis({
+      prompt: "仅需 SQL 直接返回汇总统计。",
+      sql: 'select "行业", count(*) as "合同数" from "loans" group by "行业"',
+    })).toBe(false);
+  });
+
+  it("does not allow report generation to replace an explicitly requested chart", () => {
+    const request = {
+      userRequest: "根据查询结果分析占比率，绘制批发业/零售业条形图表。",
+      purpose: "生成报告",
+    };
+    expect(shouldDeferReportUntilChartTool({
+      request,
+      toolState: {
+        conversationId: "conversation-1",
+        latestSuccessfulPythonToolCallId: "python-1",
+        latestSuccessfulPythonArtifactIds: ["analysis-artifact-1"],
+        toolCalls: [],
+        updatedAt: "2026-07-20T00:00:00.000Z",
+      },
+    })).toBe(true);
+    expect(shouldDeferReportUntilChartTool({
+      request,
+      toolState: {
+        conversationId: "conversation-1",
+        latestSuccessfulChartToolCallId: "chart-1",
+        latestSuccessfulChartArtifactIds: ["chart-artifact-1"],
+        toolCalls: [],
+        updatedAt: "2026-07-20T00:00:00.000Z",
+      },
+    })).toBe(false);
+  });
+
+  it("embeds chart artifact references into report markdown when chart and report are both requested", () => {
+    const markdown = appendVisualizationReferencesToReport("# 风险分析报告\n\n已完成分析。", {
+      userRequest: "绘制风险分布图并生成报告",
+      chartToolCallId: "chart-1",
+      chartArtifactIds: ["chart-artifact-1"],
+    });
+
+    expect(markdown).toContain("```visualization");
+    expect(markdown).toContain('"artifactId": "chart-artifact-1"');
+    expect(markdown).toContain('"sourceRequestId": "chart-1"');
+    expect(appendVisualizationReferencesToReport(markdown, {
+      userRequest: "绘制风险分布图并生成报告",
+      chartToolCallId: "chart-1",
+      chartArtifactIds: ["chart-artifact-1"],
+    }).match(/```visualization/g)).toHaveLength(1);
+  });
+
+  it("renders compact local tool planning context without full prompt content", () => {
+    const plan: ToolExecutionPlan = {
+      planId: "plan-1",
+      conversationId: "conversation-1",
+      userId: "user-1",
+      userMessage: "查询敏感业务描述，绘制图表并生成报告",
+      requestType: "compound",
+      requestedOutputs: ["chart", "report"],
+      steps: [
+        {
+          stepId: "step-sql",
+          toolKind: "sql_query",
+          toolName: TOOL_NAMES.sql_query,
+          purpose: "自动补充 SQL",
+          dependencies: [],
+          inputStrategy: "none",
+          inputResolution: "auto_sql_fallback",
+          status: "planned",
+        },
+        {
+          stepId: "step-chart",
+          toolKind: "chart_rendering",
+          toolName: TOOL_NAMES.chart_rendering,
+          purpose: "绘图",
+          dependencies: ["step-sql"],
+          inputStrategy: "none",
+          inputResolution: "current_round_result",
+          status: "planned",
+        },
+        {
+          stepId: "step-report",
+          toolKind: "report_generation",
+          toolName: TOOL_NAMES.report_generation,
+          purpose: "报告",
+          dependencies: ["step-chart"],
+          inputStrategy: "none",
+          inputResolution: "current_round_result",
+          status: "planned",
+        },
+      ],
+      status: "ready",
+      metrics: {
+        conversationId: "conversation-1",
+        requestType: "compound",
+        requestedToolCount: 2,
+        plannedToolCount: 3,
+        promptCharacterCount: 18,
+        planningDurationMs: 3,
+        planningModelCallCount: 0,
+        explicitChartRequested: true,
+        chartToolIncluded: true,
+        sqlDependencyAutoAdded: true,
+        reusedExistingSqlResult: false,
+        createdAt: "2026-07-21T00:00:00.000Z",
+      },
+      createdAt: "2026-07-21T00:00:00.000Z",
+      updatedAt: "2026-07-21T00:00:00.000Z",
+    };
+
+    const context = renderLocalToolPlanContext(plan);
+
+    expect(context).toContain("本地一次工具规划");
+    expect(context).toContain("request_chart_rendering");
+    expect(context).toContain("request_markdown_report_generation");
+    expect(context).toContain("sqlDependencyAutoAdded：true");
+    expect(context).not.toContain("敏感业务描述");
+    expect(context.length).toBeLessThan(700);
+  });
+
+  it("routes only deterministic single-temp-source local plans before model streaming", () => {
+    const plan: ToolExecutionPlan = {
+      planId: "plan-1",
+      conversationId: "conversation-1",
+      userId: "user-1",
+      userMessage: "查询数据并绘制图表",
+      requestType: "compound",
+      requestedOutputs: ["analysis", "chart"],
+      steps: [
+        {
+          stepId: "step-sql",
+          toolKind: "sql_query",
+          toolName: TOOL_NAMES.sql_query,
+          purpose: "自动补充 SQL",
+          dependencies: [],
+          inputStrategy: "none",
+          inputResolution: "auto_sql_fallback",
+          status: "planned",
+        },
+        {
+          stepId: "step-chart",
+          toolKind: "chart_rendering",
+          toolName: TOOL_NAMES.chart_rendering,
+          purpose: "绘图",
+          dependencies: ["step-sql"],
+          inputStrategy: "none",
+          inputResolution: "current_round_result",
+          status: "planned",
+        },
+      ],
+      status: "ready",
+      metrics: {
+        conversationId: "conversation-1",
+        requestType: "compound",
+        requestedToolCount: 1,
+        plannedToolCount: 2,
+        promptCharacterCount: 8,
+        planningDurationMs: 1,
+        planningModelCallCount: 0,
+        explicitChartRequested: true,
+        chartToolIncluded: true,
+        sqlDependencyAutoAdded: true,
+        reusedExistingSqlResult: false,
+        createdAt: "2026-07-21T00:00:00.000Z",
+      },
+      createdAt: "2026-07-21T00:00:00.000Z",
+      updatedAt: "2026-07-21T00:00:00.000Z",
+    };
+
+    expect(shouldRouteDeterministicTempCsvToolPlan({
+      plan,
+      validation: { valid: true, errors: [], warnings: [] },
+      tempSourceCount: 1,
+      hasExplicitTool: false,
+    })).toBe(true);
+    expect(shouldRouteDeterministicTempCsvToolPlan({
+      plan,
+      validation: { valid: true, errors: [], warnings: [] },
+      tempSourceCount: 2,
+      hasExplicitTool: false,
+    })).toBe(false);
+    expect(shouldRouteDeterministicTempCsvToolPlan({
+      plan,
+      validation: { valid: true, errors: [], warnings: [] },
+      tempSourceCount: 1,
+      hasExplicitTool: true,
+    })).toBe(false);
+    expect(shouldRouteDeterministicTempCsvToolPlan({
+      plan,
+      validation: { valid: true, errors: [], warnings: [] },
+      tempSourceCount: 1,
+      hasExplicitTool: false,
+      skill: "overall-risk-classification-distribution",
+    })).toBe(false);
+  });
+
+  it("returns tool parameter issues to the model without guidance interruption fields", () => {
+    const feedback = buildModelToolParameterIssueFeedback({
+      toolKind: "python_analysis",
+      toolCallId: "call-python-1",
+      invalidParameters: [{
+        parameterName: "script",
+        reason: "missing",
+        message: "缺少 Python 分析脚本。",
+      }],
+      latestToolState: {
+        conversationId: "conversation-1",
+        latestSuccessfulSqlToolCallId: "sql-1",
+        latestSuccessfulSqlArtifactIds: ["workflow-dataset:sql-1"],
+        toolCalls: [],
+        updatedAt: "2026-07-20T00:00:00.000Z",
+      },
+    });
+    expect(feedback.status).toBe("parameter_issue");
+    expect(feedback.message).toContain("系统未中断对话");
+    expect(feedback.message).toContain("重新判断用户意图");
+    expect(feedback.latestSuccessfulToolCallIds.sql_query).toBe("sql-1");
+    expect(feedback.artifactIds).toEqual(["workflow-dataset:sql-1"]);
+    expect(feedback).not.toHaveProperty("resumeToken");
+    expect(feedback).not.toHaveProperty("guidanceId");
   });
 
   it("detects executable SQL from closed fenced blocks before the model stream naturally ends", () => {
@@ -165,6 +421,9 @@ describe("AssistantRuntime workflow intent", () => {
 
   it("recognizes query-result summary requests as prior SQL analysis", () => {
     expect(shouldAnalyzePriorSqlResult("根据查询数据结果汇总分行 #一级分行名称 的最新风险分类为“关注”的合同总数以及全部分行的占比。")).toBe(true);
+    expect(shouldAnalyzePriorSqlResult("行业分析中，能把批发业和零售业拆分开吗？同时把这张表变成行业不良+关注占比比率图。输出内容：1、行业按国标代码 F51（批发业）/ F52（零售业）拆分结果；2、不良+关注率横向排名条形图表（按比率降序）。")).toBe(true);
+    expect(shouldUseModelForPriorResultVisualization("根据查询结果绘制“不良+关注率”横向排名条形图表（按比率降序）。")).toBe(true);
+    expect(shouldUseModelForPriorResultVisualization("根据查询数据结果汇总分行 #一级分行名称 的最新风险分类为“关注”的合同总数以及全部分行的占比。")).toBe(false);
   });
 
   it("recognizes latest analysis result report generation requests", () => {
@@ -452,8 +711,11 @@ describe("AssistantRuntime workflow intent", () => {
 
     expect(sql).toContain('from "chat_csv_conv_1"');
     expect(sql).toContain('where "一级分行名称" = \'上海分行\'');
-    expect(sql).toContain('group by "最新风险五级分类"');
-    expect(sql).toContain('sum("贷款余额（万元）") as "贷款余额（万元）合计"');
+    expect(sql).toContain('"最新风险五级分类"');
+    expect(sql).toContain('"贷款余额（万元）"');
+    expect(sql).not.toContain("group by");
+    expect(sql).not.toContain("sum(");
+    expect(sql).not.toContain("limit");
     expect(sql).not.toContain("整体风险分类分布");
   });
 
@@ -531,8 +793,10 @@ describe("AssistantRuntime workflow intent", () => {
     const sql = buildFallbackTempCsvSqlForAnalysisRequest(prompt, source, fields);
 
     expect(sql).toContain('where "最新风险分类" = \'关注\'');
-    expect(sql).toContain('group by "一级分行名称"');
-    expect(sql).toContain('count(*) as "笔数"');
+    expect(sql).toContain('"一级分行名称"');
+    expect(sql).not.toContain("group by");
+    expect(sql).not.toContain("count(*)");
+    expect(sql).not.toContain("limit");
   });
 
   it("builds fallback CSV SQL for all-class risk summaries with selected amount metrics", () => {
@@ -602,13 +866,14 @@ describe("AssistantRuntime workflow intent", () => {
     ]);
 
     expect(sql).toContain('from "chat_csv_conv_1"');
-    expect(sql).toContain('group by "最新风险五级分类"');
-    expect(sql).toContain('count(*) as "笔数"');
-    expect(sql).toContain('sum("贷款余额(万元)") as "贷款余额(万元)合计"');
-    expect(sql).toContain('sum("合同金额(万元)") as "合同金额(万元)合计"');
+    expect(sql).toContain('"最新风险五级分类"');
+    expect(sql).toContain('"贷款余额(万元)"');
+    expect(sql).toContain('"合同金额(万元)"');
+    expect(sql).not.toContain("group by");
+    expect(sql).not.toContain("count(*)");
+    expect(sql).not.toContain("sum(");
+    expect(sql).not.toContain("limit");
     expect(sql).not.toContain('where "最新风险五级分类" = \'全部分类\'');
-    expect(sql).not.toContain('group by "贷款余额(万元)"');
-    expect(sql).not.toContain('group by "合同金额(万元)"');
   });
 
   it("builds fallback CSV SQL for numbered all-data analysis report prompts", () => {
@@ -685,9 +950,12 @@ describe("AssistantRuntime workflow intent", () => {
     const sql = buildFallbackTempCsvSqlForAnalysisRequest(prompt, source, fields);
 
     expect(sql).toContain('from "chat_csv_conv_1"');
-    expect(sql).toContain('group by "最新风险五级分类"');
-    expect(sql).toContain('count(*) as "笔数"');
-    expect(sql).toContain('sum("贷款余额(万元)") as "贷款余额(万元)合计"');
+    expect(sql).toContain('"最新风险五级分类"');
+    expect(sql).toContain('"贷款余额(万元)"');
+    expect(sql).not.toContain("group by");
+    expect(sql).not.toContain("count(*)");
+    expect(sql).not.toContain("sum(");
+    expect(sql).not.toContain("limit");
     expect(sql).not.toContain("where");
     expect(sql).not.toContain("的全部数据");
     expect(sql).not.toContain("总计与全量样本");

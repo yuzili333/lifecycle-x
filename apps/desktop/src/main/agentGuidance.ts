@@ -379,26 +379,15 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
 }
 
-function hasTrustedInlineRows(visualizationSpec: unknown) {
-  if (!isPlainRecord(visualizationSpec)) {
-    return false;
-  }
-  const data = visualizationSpec.data;
-  if (!isPlainRecord(data)) {
-    return false;
-  }
-  return data.mode === "inline" && data.trusted === true && Array.isArray(data.rows) && data.rows.length > 0;
-}
-
-function hasArtifactVisualizationData(visualizationSpec: unknown) {
-  if (!isPlainRecord(visualizationSpec)) {
-    return false;
-  }
-  const data = visualizationSpec.data;
-  if (!isPlainRecord(data)) {
-    return false;
-  }
-  return data.mode === "artifact" && nonEmptyString(data.artifactId);
+function hasDeclarativeChartRequest(request: Record<string, unknown>) {
+  return (
+    nonEmptyString(request.title) ||
+    nonEmptyString(request.chartType) ||
+    hasNonEmptyStringArray(request.dimensionFields) ||
+    hasNonEmptyStringArray(request.measureFields) ||
+    nonEmptyString(request.sortBy) ||
+    nonEmptyString(request.colorBy)
+  );
 }
 
 function promptMentionsCandidate(prompt: string, input: MissingWorkflowInput) {
@@ -717,16 +706,6 @@ export class MissingInputDetector {
       });
     }
 
-    if (asksForChart(prompt) && !hasSqlOrPythonResult(input.toolState)) {
-      missingInputs.push({
-        key: "chart_input",
-        label: "图表输入数据",
-        type: "report_requirement",
-        required: true,
-        description: "绘制图表前需要先获得真实查询或分析结果。",
-      });
-    }
-
     if (asksForChart(prompt) && !asksForSpecificChartType(prompt)) {
       missingInputs.push({
         key: "chart_type",
@@ -804,14 +783,6 @@ export class ParameterRepairEngine {
     }
 
     if (input.toolKind === "python_analysis") {
-      const hasInput = hasSqlOrPythonResult(input.toolState) || hasNonEmptyStringArray(input.request.inputArtifactIds);
-      if (!hasInput) {
-        invalidParameters.push({
-          parameterName: "inputArtifactIds",
-          reason: "missing",
-          message: "Python 分析缺少可分析的 SQL/Python 结果或数据集。请先执行查询，或指定已授权 Artifact。",
-        });
-      }
       if (input.request.script !== undefined && !nonEmptyString(input.request.script)) {
         invalidParameters.push({
           parameterName: "script",
@@ -823,45 +794,36 @@ export class ParameterRepairEngine {
     }
 
     if (input.toolKind === "chart_rendering") {
-      const hasInput =
-        hasSqlOrPythonResult(input.toolState) ||
-        hasNonEmptyStringArray(input.request.inputArtifactIds) ||
-        hasArtifactVisualizationData(input.request.visualizationSpec) ||
-        hasTrustedInlineRows(input.request.visualizationSpec);
-      if (!hasInput) {
+      const hasSpec = isPlainRecord(input.request.visualizationSpec);
+      const hasDeclarativeInput = hasDeclarativeChartRequest(input.request);
+      if (!hasSpec && !hasDeclarativeInput) {
         invalidParameters.push({
-          parameterName: "inputArtifactIds",
-          reason: "missing",
-          message: "图表生成缺少真实数据输入。请先完成 SQL/Python 工具，指定 Artifact，或提供可信小型 inline rows。",
-        });
-      }
-      if (!isPlainRecord(input.request.visualizationSpec)) {
-        invalidParameters.push({
-          parameterName: "visualizationSpec",
+          parameterName: "chartType",
           value: input.request.visualizationSpec,
           reason: "missing",
-          message: "图表生成需要提供合法 visualizationSpec 对象。",
+          message: "图表生成需要提供完整 visualizationSpec，或提供 chartType/title/dimensionFields/measureFields 等声明式图表参数。",
         });
-      } else {
-        if (!nonEmptyString(input.request.visualizationSpec.title)) {
+      } else if (hasSpec) {
+        const visualizationSpec = input.request.visualizationSpec as Record<string, unknown>;
+        if (!nonEmptyString(visualizationSpec.title)) {
           invalidParameters.push({
             parameterName: "visualizationSpec.title",
-            value: input.request.visualizationSpec.title,
+            value: visualizationSpec.title,
             reason: "missing",
             message: "visualizationSpec 缺少图表标题 title。",
           });
         }
-        if (!nonEmptyString(input.request.visualizationSpec.type)) {
+        if (!nonEmptyString(visualizationSpec.type)) {
           invalidParameters.push({
             parameterName: "visualizationSpec.type",
-            value: input.request.visualizationSpec.type,
+            value: visualizationSpec.type,
             reason: "missing",
             message: "visualizationSpec 缺少图表类型 type。",
           });
         }
-        const dimensions = input.request.visualizationSpec.dimensions;
-        const measures = input.request.visualizationSpec.measures;
-        const encoding = input.request.visualizationSpec.encoding;
+        const dimensions = visualizationSpec.dimensions;
+        const measures = visualizationSpec.measures;
+        const encoding = visualizationSpec.encoding;
         const hasEncoding = isPlainRecord(encoding) && Object.keys(encoding).length > 0;
         if ((!Array.isArray(dimensions) || dimensions.length === 0) && (!Array.isArray(measures) || measures.length === 0) && !hasEncoding) {
           invalidParameters.push({
@@ -874,15 +836,6 @@ export class ParameterRepairEngine {
     }
 
     if (input.toolKind === "report_generation") {
-      const hasMarkdown = nonEmptyString(input.request.markdown);
-      const hasInput = hasReportInputResult(input.toolState) || hasNonEmptyStringArray(input.request.inputArtifactIds);
-      if (!hasMarkdown && !hasInput) {
-        invalidParameters.push({
-          parameterName: "inputArtifactIds",
-          reason: "missing",
-          message: "报告生成缺少真实查询、分析或图表结果。请先查询/分析数据，或指定可引用的 Artifact。",
-        });
-      }
       if (input.request.markdown !== undefined && !nonEmptyString(input.request.markdown)) {
         invalidParameters.push({
           parameterName: "markdown",

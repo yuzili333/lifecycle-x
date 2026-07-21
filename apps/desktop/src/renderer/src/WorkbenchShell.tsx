@@ -42,6 +42,8 @@ const WORKBENCH_SETTINGS_CACHE_KEY_PREFIX = "cycle-probe:workbench:settings";
 const MODEL_CONFIG_PROMPT_CACHE_KEY_PREFIX = "cycle-probe:workbench:model-config-prompted";
 const APP_THEME_MODE_CACHE_KEY = "cycle-probe:theme-mode";
 const APP_THEME_MODE_EVENT = "cycle-probe:theme-mode-change";
+const SESSION_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
+const SESSION_ACTIVITY_THROTTLE_MS = 1000;
 const NEUTRAL_THEME_APPEARANCE_BY_MODE: Record<WorkbenchSettings["appearance"]["themeMode"], {
   themeMode: WorkbenchSettings["appearance"]["themeMode"];
   accentColor: string;
@@ -357,6 +359,8 @@ function NavAssetIcon({ src, size = "sm" }: { src: string; size?: "sm" | "lg" })
 export function WorkbenchShell({ auth }: WorkbenchShellProps) {
   const toast = useAppToast();
   const sessionExpiredPromptPhaseRef = useRef<SessionExpiredPromptPhase>("idle");
+  const sessionIdleTimerRef = useRef<number | null>(null);
+  const lastSessionActivityAtRef = useRef(0);
   const [activeModule, setActiveModule] = useState<WorkbenchModule>(() => readCachedWorkbenchModule(auth.user, auth.permissions));
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isLogoutConfirmOpen, setIsLogoutConfirmOpen] = useState(false);
@@ -382,8 +386,39 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
     setIsSessionExpiredConfirmOpen(true);
   }, [auth.status]);
 
+  const clearSessionIdleTimer = useCallback(() => {
+    if (sessionIdleTimerRef.current !== null) {
+      window.clearTimeout(sessionIdleTimerRef.current);
+      sessionIdleTimerRef.current = null;
+    }
+  }, []);
+
+  const scheduleSessionIdleTimeout = useCallback(() => {
+    clearSessionIdleTimer();
+    if (auth.status !== "authenticated" || sessionExpiredPromptPhaseRef.current !== "idle") {
+      return;
+    }
+    sessionIdleTimerRef.current = window.setTimeout(() => {
+      sessionIdleTimerRef.current = null;
+      openSessionExpiredConfirm();
+    }, SESSION_IDLE_TIMEOUT_MS);
+  }, [auth.status, clearSessionIdleTimer, openSessionExpiredConfirm]);
+
+  const refreshSessionIdleTimer = useCallback((options?: { force?: boolean }) => {
+    if (auth.status !== "authenticated" || sessionExpiredPromptPhaseRef.current !== "idle") {
+      return;
+    }
+    const now = Date.now();
+    if (!options?.force && now - lastSessionActivityAtRef.current < SESSION_ACTIVITY_THROTTLE_MS) {
+      return;
+    }
+    lastSessionActivityAtRef.current = now;
+    scheduleSessionIdleTimeout();
+  }, [auth.status, scheduleSessionIdleTimeout]);
+
   const requestWithRefresh = useCallback(
     async <T extends { success: true }>(call: (accessToken: string) => Promise<ApiResult<T>>): Promise<ApiResult<T>> => {
+      refreshSessionIdleTimer({ force: true });
       if (sessionExpiredPromptPhaseRef.current === "logging-out" || sessionExpiredPromptPhaseRef.current === "handled") {
         return {
           success: false,
@@ -424,7 +459,7 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
       }
       return retryResult;
     },
-    [auth, openSessionExpiredConfirm],
+    [auth, openSessionExpiredConfirm, refreshSessionIdleTimer],
   );
 
   const showError = useCallback(
@@ -442,6 +477,36 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
     },
     [openSessionExpiredConfirm, toast],
   );
+
+  useEffect(() => {
+    if (auth.status !== "authenticated") {
+      clearSessionIdleTimer();
+      lastSessionActivityAtRef.current = 0;
+      return undefined;
+    }
+
+    refreshSessionIdleTimer({ force: true });
+    const handleActivity = () => refreshSessionIdleTimer();
+    const events: Array<keyof WindowEventMap> = [
+      "mousemove",
+      "mousedown",
+      "click",
+      "keydown",
+      "wheel",
+      "scroll",
+      "touchstart",
+      "pointerdown",
+    ];
+    for (const eventName of events) {
+      window.addEventListener(eventName, handleActivity, { passive: true });
+    }
+    return () => {
+      for (const eventName of events) {
+        window.removeEventListener(eventName, handleActivity);
+      }
+      clearSessionIdleTimer();
+    };
+  }, [auth.status, clearSessionIdleTimer, refreshSessionIdleTimer]);
 
   useEffect(() => {
     setActiveModule(readCachedWorkbenchModule(auth.user, auth.permissions));

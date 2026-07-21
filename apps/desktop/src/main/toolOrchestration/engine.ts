@@ -71,7 +71,7 @@ export class ToolExecutionEngine {
         toolKind: step.toolKind,
         explicitInputRefs: step.explicitInputRefs,
       });
-      if (resolvedInput.mode === "no_input" && step.toolKind !== "sql_query" && step.toolKind !== "report_generation") {
+      if (resolvedInput.mode === "no_input" && step.toolKind !== "sql_query") {
         await this.createRecord(plan, step, resolvedInput, "waiting_input");
         waitingInputStepIds.add(step.stepId);
         hasWaitingInput = true;
@@ -139,10 +139,12 @@ export class ToolExecutionEngine {
 
   async executeSingleTool(input: ExecuteSingleToolInput) {
     const builder = new ToolPlanBuilder();
+    const toolState = await this.config.resultRegistry.getConversationState(input.conversationId);
     const plan = builder.build({
       conversationId: input.conversationId,
       userId: input.userId,
       userMessage: input.userMessage,
+      toolState,
       intentResult: {
         conversationId: input.conversationId,
         userMessage: input.userMessage,
@@ -350,8 +352,11 @@ export class ToolExecutionEngine {
       purpose: step.purpose,
       userRequest: plan.userMessage,
       inputArtifactIds: resolvedInput.sourceArtifactIds,
+      visualizationArtifactIds: resolvedInput.sourceToolKind === "chart_rendering" ? resolvedInput.sourceArtifactIds : undefined,
+      includeVisualizations: resolvedInput.sourceToolKind === "chart_rendering",
       sourceSqlToolCallId: resolvedInput.sourceToolKind === "sql_query" ? resolvedInput.sourceToolCallId : undefined,
       sourcePythonToolCallId: resolvedInput.sourceToolKind === "python_analysis" ? resolvedInput.sourceToolCallId : undefined,
+      sourceChartToolCallIds: resolvedInput.sourceToolKind === "chart_rendering" && resolvedInput.sourceToolCallId ? [resolvedInput.sourceToolCallId] : undefined,
     } as ReportGenerationToolInput, context);
   }
 

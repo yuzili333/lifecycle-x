@@ -19,22 +19,28 @@ import {
   type WorkflowStateStore,
 } from "./workflowRuntime";
 import { rewriteCompoundOrderByForSqlite } from "./sqliteSqlRewrite";
-import { parseVisualizationSpecJson, type VisualizationRenderError, type VisualizationSpec } from "../shared/visualization";
+import { parseVisualizationSpecJson, visualizationTypes, type VisualizationRenderError, type VisualizationSpec } from "../shared/visualization";
 import {
   SQLiteArtifactManager,
   SQLiteToolResultRegistry,
   TOOL_SCHEMAS,
   TOOL_NAMES,
   TOOL_ORCHESTRATION_SYSTEM_PROMPT,
+  ToolIntentRouter,
+  ToolPlanBuilder,
+  ToolPlanValidator,
   type ArtifactManager,
+  type AgentPlanningMetrics,
   type ConversationToolState,
   type ArtifactRecord,
+  type ToolExecutionPlan,
+  type ToolPlanValidationResult,
   type ToolCallRecord,
   type ToolCallStatus,
   type ToolKind,
   type ToolResultRegistry,
 } from "./toolOrchestration";
-import { createStreamingModelAdapter, type ConversationMessage, type ToolDefinition } from "./streamingModelAdapter";
+import { createStreamingModelAdapter, type ConversationMessage, type ModelStreamEvent, type ToolDefinition } from "./streamingModelAdapter";
 import {
   chatCsvError,
   ConversationTempSourceManager,
@@ -311,7 +317,7 @@ function selectedSkillSystemPrompt(skill: AssistantSkill | null | undefined) {
     "字段契约：优先使用上传表字典的 businessFieldId 理解字段，SQL 必须使用 BusinessFieldResolver 解析出的 physicalName，报告和结论使用 displayNameZh。",
     "当前标准字典必需 businessFieldId：bf.loan_contract.contract_serial、bf.loan_contract.latest_risk、bf.loan_contract.loan_balance_10k。兼容风险字段：bf.loan_contract.latest_five_level_risk、credit.five_level_classification。可选：bf.loan_contract.latest_risk_result、bf.loan_contract.contract_amount_10k、bf.loan_contract.p_date、bf.loan_contract.branch_name、bf.loan_contract.product_name。",
     "兼容旧字段：credit.contract_id、credit.five_level_classification、credit.loan_balance、credit.twelve_level_classification、credit.contract_amount。缺少合同唯一标识或五级分类时阻止完整执行；缺少贷款余额时仅允许笔数分析；缺少十二级分类或合同金额时必须降级说明，不得伪造。",
-    "SQL 查询必须保留后续报告计算所需字段，优先读取明细样本后交由 Python 统一计算；除非用户只要求 SQL 聚合结果，否则不要只返回按风险分类聚合后的少量行。",
+    "SQL 查询必须保留后续报告计算所需字段，优先读取明细行后交由 Python 统一计算；除非用户只要求 SQL 聚合结果，否则不要只返回按风险分类聚合后的少量行。",
     "口径：不良类=次级+可疑+损失；关注加不良=关注+次级+可疑+损失；风险边界默认=正常3+全部关注类。",
     "报告必须区分笔数维度和金额维度，包含五级分类表、十二级分类明细、核心指标、图表引用、数据质量说明、计算口径和 Artifact 数据血缘。",
     "禁止使用报告模板或示例中的数字作为真实分析结果；不得基于 preview rows 推断全量结论；不得将完整源表数据注入模型上下文。",
@@ -343,6 +349,399 @@ function formatReportDateTime(value: string | Date = new Date()) {
   const minutes = String(date.getMinutes()).padStart(2, "0");
   const seconds = String(date.getSeconds()).padStart(2, "0");
   return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+}
+
+function isPlainRecordValue(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function stringValue(value: unknown) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function stringArrayValue(value: unknown) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.map((item) => stringValue(item)).filter(Boolean);
+}
+
+function isVisualizationTypeValue(value: string): value is VisualizationSpec["type"] {
+  return (visualizationTypes as readonly string[]).includes(value);
+}
+
+function normalizeChartType(request: Record<string, unknown>, spec: Record<string, unknown>): VisualizationSpec["type"] {
+  const explicit = stringValue(spec.type || request.chartType).toLowerCase();
+  if (isVisualizationTypeValue(explicit)) {
+    return explicit;
+  }
+  const text = `${stringValue(request.userRequest)} ${stringValue(request.purpose)} ${stringValue(request.title)}`;
+  if (/(横向|horizontal).*(条形|柱状|bar)|(条形|柱状|bar).*(横向|horizontal)/i.test(text)) {
+    return "horizontal_bar";
+  }
+  if (/折线|趋势|line/i.test(text)) {
+    return "line";
+  }
+  if (/热力|heatmap/i.test(text)) {
+    return "heatmap";
+  }
+  if (/散点|scatter/i.test(text)) {
+    return "scatter";
+  }
+  if (/表格|明细表|table/i.test(text)) {
+    return "table";
+  }
+  return "bar";
+}
+
+function firstArtifactInput(request: Record<string, unknown>, toolState: ConversationToolState) {
+  const explicitArtifactIds = stringArrayValue(request.inputArtifactIds);
+  if (explicitArtifactIds[0]) {
+    return {
+      artifactId: explicitArtifactIds[0],
+      sourceType: "workflow_dataset" as const,
+      sourceRequestId: stringValue(request.sourcePythonToolCallId) || stringValue(request.sourceSqlToolCallId) || undefined,
+    };
+  }
+  if (toolState.latestSuccessfulPythonArtifactIds?.[0]) {
+    return {
+      artifactId: toolState.latestSuccessfulPythonArtifactIds[0],
+      sourceType: "python" as const,
+      sourceRequestId: stringValue(request.sourcePythonToolCallId) || toolState.latestSuccessfulPythonToolCallId,
+    };
+  }
+  if (toolState.latestSuccessfulSqlArtifactIds?.[0]) {
+    return {
+      artifactId: toolState.latestSuccessfulSqlArtifactIds[0],
+      sourceType: "sql" as const,
+      sourceRequestId: stringValue(request.sourceSqlToolCallId) || toolState.latestSuccessfulSqlToolCallId,
+    };
+  }
+  return null;
+}
+
+function normalizeChartVisualizationSpec(
+  request: Record<string, unknown>,
+  toolState: ConversationToolState,
+  modelToolCallId: string,
+): Record<string, unknown> {
+  const spec = isPlainRecordValue(request.visualizationSpec) ? request.visualizationSpec : {};
+  const dimensions = Array.isArray(spec.dimensions) ? spec.dimensions : stringArrayValue(request.dimensionFields).map((field) => ({
+    field,
+    label: field,
+    dataType: "category",
+    role: "category",
+  }));
+  const measures = Array.isArray(spec.measures) ? spec.measures : stringArrayValue(request.measureFields).map((field) => {
+    const text = `${field} ${stringValue(request.userRequest)} ${stringValue(request.purpose)}`;
+    const isRate = /率|占比|百分|rate|ratio|percent/i.test(text);
+    return {
+      field,
+      label: field,
+      dataType: isRate ? "percentage" : "number",
+      role: isRate ? "rate" : "value",
+      aggregation: "none",
+      format: isRate ? { type: "percentage", decimals: 2 } : { type: "number", decimals: 2 },
+    };
+  });
+  const firstDimension = isPlainRecordValue(dimensions[0]) ? stringValue(dimensions[0].field) : stringArrayValue(request.dimensionFields)[0];
+  const firstMeasure = isPlainRecordValue(measures[0]) ? stringValue(measures[0].field) : stringArrayValue(request.measureFields)[0];
+  const encoding = isPlainRecordValue(spec.encoding)
+    ? spec.encoding
+    : {
+        x: firstDimension || undefined,
+        y: firstMeasure ? [firstMeasure] : undefined,
+        category: firstDimension || undefined,
+        value: firstMeasure || undefined,
+        colorBy: stringValue(request.colorBy) || undefined,
+      };
+  const artifactInput = firstArtifactInput(request, toolState);
+  const data = isPlainRecordValue(spec.data)
+    ? spec.data
+    : artifactInput
+      ? {
+          mode: "artifact",
+          artifactId: artifactInput.artifactId,
+          expectedSchema: Object.fromEntries(
+            [...stringArrayValue(request.dimensionFields), ...stringArrayValue(request.measureFields)].map((field) => [field, "unknown"]),
+          ),
+        }
+      : undefined;
+  const metadata = isPlainRecordValue(spec.metadata) ? { ...spec.metadata } : {};
+  const sortBy = stringValue(request.sortBy);
+  const sortDirection = stringValue(request.sortDirection);
+  return {
+    ...spec,
+    specVersion: "1.0",
+    visualizationId: stringValue(spec.visualizationId) || `viz_${modelToolCallId.replace(/[^a-zA-Z0-9_-]/g, "_")}`,
+    type: normalizeChartType(request, spec),
+    title: stringValue(spec.title) || stringValue(request.title) || stringValue(request.purpose) || "数据可视化图表",
+    businessSemantic: stringValue(spec.businessSemantic) || "generic_analysis",
+    data,
+    dimensions: dimensions.length > 0 ? dimensions : spec.dimensions,
+    measures: measures.length > 0 ? measures : spec.measures,
+    encoding,
+    interaction: isPlainRecordValue(spec.interaction) ? spec.interaction : { tooltip: true, legend: true, exportable: true },
+    display: isPlainRecordValue(spec.display) ? spec.display : { responsive: true, showDataSource: true, showWarnings: true },
+    provenance: isPlainRecordValue(spec.provenance)
+      ? spec.provenance
+      : {
+          sourceType: artifactInput?.sourceType ?? "workflow_dataset",
+          sourceRequestId: artifactInput?.sourceRequestId,
+          generatedAt: nowIso(),
+        },
+    metadata: {
+      ...metadata,
+      declarativeChartRequest: !isPlainRecordValue(request.visualizationSpec),
+      ...(sortBy ? { sortBy } : {}),
+      ...(sortDirection === "asc" || sortDirection === "desc" ? { sortDirection } : {}),
+      ...(stringValue(request.colorBy) ? { colorBy: stringValue(request.colorBy) } : {}),
+    },
+  };
+}
+
+function toolRequestText(request: Record<string, unknown>, fallbackPrompt = "") {
+  return [
+    stringValue(request.userRequest),
+    stringValue(request.purpose),
+    stringValue(request.title),
+    fallbackPrompt,
+  ].filter(Boolean).join(" ");
+}
+
+function hasChartIntentText(text: string) {
+  return /(绘制|画图|绘图|图表|可视化|条形图|柱状图|折线图|饼图|热力图|散点图|比率图|占比图|排名图|变成.{0,12}图|改为.{0,12}图)/i.test(text);
+}
+
+function inferChartTypeFromText(text: string): VisualizationSpec["type"] {
+  if (/(横向|horizontal).*(条形|柱状|bar)|(条形|柱状|bar).*(横向|horizontal)/i.test(text)) {
+    return "horizontal_bar";
+  }
+  if (/折线|趋势|line/i.test(text)) {
+    return "line";
+  }
+  if (/饼图|pie/i.test(text)) {
+    return "bar";
+  }
+  if (/热力|heatmap/i.test(text)) {
+    return "heatmap";
+  }
+  if (/散点|scatter/i.test(text)) {
+    return "scatter";
+  }
+  if (/表格|明细表|table/i.test(text)) {
+    return "table";
+  }
+  return "bar";
+}
+
+function inferChartTitleFromText(text: string) {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  const quoted = normalized.match(/[“"「『]([^”"」』]{2,60}(?:图|图表|可视化|排名|占比|比率|分布))[^”"」』]*[”"」』]/)?.[1]?.trim();
+  if (quoted) {
+    return quoted;
+  }
+  if (/不良.*关注.*(占比|比率|率)/i.test(normalized)) {
+    return "不良+关注率图表";
+  }
+  if (/占比|比率|率/i.test(normalized)) {
+    return "占比率图表";
+  }
+  if (/分布/i.test(normalized)) {
+    return "分布图表";
+  }
+  return "数据分析图表";
+}
+
+function isLikelyMeasureFieldName(value: string) {
+  return /(金额|余额|本金|敞口|占比|比例|比率|率|数量|笔数|条数|总计|合计|count|amount|balance|rate|ratio|percent|total|sum)/i.test(value);
+}
+
+function hasAnalysisIntentText(text: string) {
+  return /(分析|计算|统计|汇总|总计|占比|比例|比率|率|排名|排序|分布)/i.test(text);
+}
+
+function hasDataPreparationIntentText(text: string) {
+  return /(查询|筛选|检索|读取|区分|拆分|分组|按.+前缀|根据.+前缀|数据源|样本|明细|全部数据|汇总数据)/i.test(text);
+}
+
+function sqlLooksAggregated(script: string) {
+  const normalized = script.replace(/--.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, " ");
+  return /\bgroup\s+by\b/i.test(normalized) ||
+    /\b(count|sum|avg|min|max)\s*\(/i.test(normalized) ||
+    /\bselect\s+distinct\b/i.test(normalized);
+}
+
+export function shouldRequireDetailSqlForCompositeAnalysis(input: { request?: Record<string, unknown>; prompt?: string; sql: string }) {
+  const text = toolRequestText(input.request ?? {}, input.prompt);
+  if (!text.trim() || !sqlLooksAggregated(input.sql)) {
+    return false;
+  }
+  if (/(只需|仅需|直接|使用)\s*sql.{0,8}(统计|汇总|聚合)|sql.{0,8}(直接)?返回(统计|汇总|聚合)/i.test(text)) {
+    return false;
+  }
+  return hasDataPreparationIntentText(text) && hasAnalysisIntentText(text);
+}
+
+export function shouldDeferChartUntilUpstreamTools(input: {
+  request: Record<string, unknown>;
+  prompt?: string;
+  invalidParameters: InvalidToolParameter[];
+  toolState?: ConversationToolState | null;
+}) {
+  const missingInput = input.invalidParameters.some((item) => item.parameterName === "inputArtifactIds");
+  if (!missingInput) {
+    return false;
+  }
+  const hasUpstreamArtifact = Boolean(
+    input.toolState?.latestSuccessfulPythonArtifactIds?.length ||
+    input.toolState?.latestSuccessfulSqlArtifactIds?.length ||
+    stringArrayValue(input.request.inputArtifactIds).length,
+  );
+  if (hasUpstreamArtifact) {
+    return false;
+  }
+  const text = toolRequestText(input.request, input.prompt);
+  return hasChartIntentText(text) && hasDataPreparationIntentText(text) && hasAnalysisIntentText(text);
+}
+
+export function shouldDeferReportUntilChartTool(input: {
+  request: Record<string, unknown>;
+  prompt?: string;
+  toolState?: ConversationToolState | null;
+}) {
+  const text = toolRequestText(input.request, input.prompt);
+  if (!hasChartIntentText(text)) {
+    return false;
+  }
+  return !Boolean(input.toolState?.latestSuccessfulChartToolCallId && input.toolState.latestSuccessfulChartArtifactIds?.length);
+}
+
+export function buildModelToolParameterIssueFeedback(input: {
+  toolKind: ToolKind;
+  toolCallId: string;
+  invalidParameters: InvalidToolParameter[];
+  latestToolState?: ConversationToolState | null;
+}) {
+  const invalidParameters = input.invalidParameters.map((item) => ({
+    parameterName: item.parameterName,
+    reason: item.reason,
+    message: item.message,
+    candidates: item.candidates?.map((candidate) => ({
+      label: candidate.label,
+      value: candidate.value,
+      description: candidate.description,
+    })),
+  }));
+  return {
+    status: "parameter_issue",
+    toolCallId: input.toolCallId,
+    toolKind: input.toolKind,
+    message: [
+      "本次工具调用参数未满足执行条件，系统未中断对话，也未向用户展示参数补充卡片。",
+      "请把以下参数异常作为补充上下文，重新判断用户意图和后续工具步骤；能通过改写工具参数、切换工具顺序或复用已有 Artifact 继续时，应直接继续调用合适工具；只有确实缺少用户输入时，才用自然语言向用户说明需要补充什么。",
+      ...invalidParameters.map((item) => `- ${item.parameterName}：${item.message}`),
+    ].join("\n"),
+    invalidParameters,
+    latestSuccessfulToolCallIds: {
+      sql_query: input.latestToolState?.latestSuccessfulSqlToolCallId,
+      python_analysis: input.latestToolState?.latestSuccessfulPythonToolCallId,
+      chart_rendering: input.latestToolState?.latestSuccessfulChartToolCallId,
+      report_generation: input.latestToolState?.latestSuccessfulReportToolCallId,
+    },
+    artifactIds: [
+      ...(input.latestToolState?.latestSuccessfulSqlArtifactIds ?? []),
+      ...(input.latestToolState?.latestSuccessfulPythonArtifactIds ?? []),
+      ...(input.latestToolState?.latestSuccessfulChartArtifactIds ?? []),
+      ...(input.latestToolState?.latestSuccessfulReportArtifactIds ?? []),
+    ],
+  };
+}
+
+export function appendVisualizationReferencesToReport(
+  markdown: string,
+  input: { userRequest: string; chartToolCallId?: string; chartArtifactIds: string[] },
+) {
+  if (!hasChartIntentText(input.userRequest) || input.chartArtifactIds.length === 0 || /```(?:visualization|visualization-json|viz|chart-spec)\b/i.test(markdown)) {
+    return markdown;
+  }
+  const blocks = input.chartArtifactIds.map((artifactId, index) => {
+    const spec: VisualizationSpec = {
+      specVersion: "1.0",
+      visualizationId: `report_viz_${index + 1}_${sha256(artifactId).slice(0, 8)}`,
+      type: "table",
+      title: index === 0 ? "报告引用图表" : `报告引用图表 ${index + 1}`,
+      data: {
+        mode: "artifact",
+        artifactId,
+      },
+      dimensions: [{ field: "artifactId", dataType: "identifier", role: "category" }],
+      measures: [],
+      encoding: { category: "artifactId" },
+      provenance: {
+        sourceType: "workflow_dataset",
+        sourceRequestId: input.chartToolCallId,
+        generatedAt: nowIso(),
+      },
+      metadata: {
+        reportEmbeddedVisualization: true,
+        artifactId,
+      },
+    };
+    return [
+      "```visualization",
+      JSON.stringify(spec, null, 2),
+      "```",
+    ].join("\n");
+  });
+  return [markdown.trim(), "", "## 图表", "", ...blocks].join("\n");
+}
+
+export function renderLocalToolPlanContext(plan: ToolExecutionPlan) {
+  if (plan.steps.length === 0) {
+    return "";
+  }
+  const stepLines = plan.steps.map((step, index) => {
+    const dependencyIndexes = step.dependencies
+      .map((dependency) => plan.steps.findIndex((candidate) => candidate.stepId === dependency) + 1)
+      .filter((item) => item > 0);
+    return [
+      `${index + 1}. ${step.toolName}`,
+      `输入=${step.inputResolution ?? step.inputStrategy}`,
+      dependencyIndexes.length ? `依赖步骤=${dependencyIndexes.join(",")}` : "无依赖",
+    ].join("；");
+  });
+  return [
+    "本地一次工具规划（程序已校验显式目标覆盖，模型必须按该计划调用工具；不要复述计划）：",
+    `- requestType：${plan.requestType ?? "single_tool"}`,
+    `- requestedOutputs：${(plan.requestedOutputs ?? []).join(", ") || "none"}`,
+    `- planningModelCallCount：${plan.metrics?.planningModelCallCount ?? 0}`,
+    `- sqlDependencyAutoAdded：${plan.metrics?.sqlDependencyAutoAdded ? "true" : "false"}`,
+    `- reusedExistingSqlResult：${plan.metrics?.reusedExistingSqlResult ? "true" : "false"}`,
+    ...stepLines,
+  ].join("\n");
+}
+
+export function shouldRouteDeterministicTempCsvToolPlan(input: {
+  plan?: ToolExecutionPlan | null;
+  validation?: ToolPlanValidationResult | null;
+  tempSourceCount: number;
+  hasExplicitTool: boolean;
+  skill?: AssistantSkill | null;
+}) {
+  if (!input.plan || !input.validation?.valid || input.hasExplicitTool || isOverallRiskSkill(input.skill)) {
+    return false;
+  }
+  if (input.tempSourceCount !== 1) {
+    return false;
+  }
+  const requestedOutputs = input.plan.requestedOutputs ?? [];
+  const asksForDownstreamDataTool = requestedOutputs.some((goal) => goal === "analysis" || goal === "chart" || goal === "report");
+  return Boolean(
+    asksForDownstreamDataTool &&
+    input.plan.metrics?.sqlDependencyAutoAdded &&
+    input.plan.steps.some((step) => step.toolKind === "sql_query" && step.inputResolution === "auto_sql_fallback"),
+  );
 }
 
 function sha256(value: string) {
@@ -521,6 +920,12 @@ export function shouldKeepProviderToolActivityMessage(providerToolActivity: bool
   return providerToolActivity && hasVisibleAssistantContent(latestMessage) && !detectToolFromAssistantOutput(content);
 }
 
+export function providerToolFallbackText(hasRecordedToolActivity: boolean) {
+  return hasRecordedToolActivity
+    ? "工具调用已触发，但模型未返回可执行参数或可见结果。请重新提交查询条件，或用 # 选择真实字段后说明筛选值、分组维度和统计指标。"
+    : "模型尝试发起工具调用，但未返回可执行工具参数，本地未创建工具调用记录。请重新提交查询条件，或用 # 选择真实字段后说明筛选值、分组维度和统计指标。";
+}
+
 function replaceToolBlock(blocks: AssistantBlock[], toolBlock: AssistantBlock) {
   return [...blocks.filter((block) => block.toolCallId !== toolBlock.toolCallId), toolBlock];
 }
@@ -630,8 +1035,15 @@ function escapePromptMarkdownTable(value: unknown) {
 
 export function shouldAnalyzePriorSqlResult(prompt: string) {
   return (
-    /(sql\s*查询结果|查询数据结果|查询结果数据|查询结果|上一轮|上一次|工具调用结果|结果数据)/i.test(prompt) &&
-    /(统计|计数|总计|数量|笔数|条数|个数|多少\s*(例|笔|条|个)?|各有多少|共有多少|占比|对比|排名|前三|top\s*3|报告|分析)/i.test(prompt)
+    /(sql\s*查询结果|查询数据结果|查询结果数据|查询结果|上一轮|上一次|工具调用结果|结果数据|这张表|该表|当前表|这份表|这张数据表|当前数据表)/i.test(prompt) &&
+    /(统计|计数|总计|数量|笔数|条数|个数|多少\s*(例|笔|条|个)?|各有多少|共有多少|占比|比例|比率|对比|排名|前三|top\s*3|报告|分析|拆分|图表|画图|绘图|可视化|条形图|柱状图|折线图|饼图)/i.test(prompt)
+  );
+}
+
+export function shouldUseModelForPriorResultVisualization(prompt: string) {
+  return (
+    /(sql\s*查询结果|查询数据结果|查询结果数据|查询结果|上一轮|上一次|工具调用结果|结果数据|这张表|该表|当前表|这份表|这张数据表|当前数据表)/i.test(prompt) &&
+    /(绘制|画图|绘图|图表|可视化|变成.{0,12}图|改为.{0,12}图|转换成.{0,12}图|条形图|柱状图|折线图|饼图|热力图|散点图|比率图|占比图|排名图)/i.test(prompt)
   );
 }
 
@@ -738,8 +1150,10 @@ export function buildFallbackTempCsvSqlForAnalysisRequest(
   const filters = selectedFields
     .map((field) => ({ field, value: extractPromptFilterValue(prompt, field) }))
     .filter((item): item is { field: ChatCsvSelectedFieldRef; value: string } => Boolean(item.value));
-  const groupedFields = selectedFields.filter((field) => !hasPromptFilterValue(prompt, field) && !isMetricSelectedField(field));
   const selectedFieldNames = new Set(selectedFields.map((field) => field.physicalName));
+  const selectedColumns = selectedFields
+    .map((field) => sourceColumnForSelectedField(source, field))
+    .filter((column): column is ConversationTempCsvTable["columns"][number] => Boolean(column));
   const selectedMetricColumns = selectedFields
     .filter((field) => isMetricSelectedField(field))
     .map((field) => sourceColumnForSelectedField(source, field))
@@ -751,29 +1165,17 @@ export function buildFallbackTempCsvSqlForAnalysisRequest(
   const whereClause = filters.length
     ? `\nwhere ${filters.map(({ field, value }) => `${quoteIdentifier(field.physicalName)} = ${quoteSqlLiteral(value)}`).join(" and ")}`
     : "";
-
-  if (groupedFields.length > 0) {
-    const groupSelect = groupedFields.map((field) => `${quoteIdentifier(field.physicalName)} as ${quoteIdentifier(field.displayName)}`);
-    const metricSelect = metrics.map((column) => `sum(${quoteIdentifier(column.sqliteColumnName)}) as ${quoteIdentifier(`${column.displayName}合计`)}`);
-    const groupBy = groupedFields.map((field) => quoteIdentifier(field.physicalName)).join(", ");
-    return [
-      `select ${[...groupSelect, "count(*) as \"笔数\"", ...metricSelect].join(", ")}`,
-      `from ${tableName}${whereClause}`,
-      `group by ${groupBy}`,
-      `order by "笔数" desc`,
-    ].join("\n");
-  }
-
-  if (metrics.length > 0) {
-    const metricSelect = metrics.map((column) => `sum(${quoteIdentifier(column.sqliteColumnName)}) as ${quoteIdentifier(`${column.displayName}合计`)}`);
-    return [
-      `select ${["count(*) as \"笔数\"", ...metricSelect].join(", ")}`,
-      `from ${tableName}${whereClause}`,
-    ].join("\n");
-  }
-
-  const selectColumns = source.columns.map((column) => quoteIdentifier(column.sqliteColumnName)).join(", ");
-  return `select ${selectColumns}\nfrom ${tableName}${whereClause}\nlimit 500`;
+  const detailColumns = [...selectedColumns, ...metrics]
+    .filter((column, index, columns) => columns.findIndex((item) => item.sqliteColumnName === column.sqliteColumnName) === index);
+  const outputColumns = detailColumns.length > 0 ? detailColumns : source.columns;
+  const selectColumns = outputColumns
+    .map((column) => {
+      const raw = quoteIdentifier(column.sqliteColumnName);
+      const alias = quoteIdentifier(column.displayName || column.sourceHeader || column.sqliteColumnName);
+      return raw === alias ? raw : `${raw} as ${alias}`;
+    })
+    .join(", ");
+  return `select ${selectColumns}\nfrom ${tableName}${whereClause}`;
 }
 
 function parseSqlToolRows(result: string | undefined) {
@@ -1610,6 +2012,7 @@ export class AssistantRuntime {
   }
 
   getConversationMessages(userId: string, conversationId: string): AssistantMessage[] {
+    this.stopOrphanedRunningMessages(userId, conversationId);
     return this.db
       .prepare("select * from messages where user_id = ? and conversation_id = ? order by created_at asc, case role when 'user' then 0 else 1 end asc, rowid asc")
       .all(userId, conversationId)
@@ -2347,6 +2750,8 @@ export class AssistantRuntime {
       // Routed to report generation from the latest Python analysis result.
     } else if (await this.routePriorSqlAnalysis(effectiveInput, conversation, assistantMessage)) {
       // Routed to a governed Python tool call.
+    } else if (await this.routeDeterministicTempCsvToolPlan(effectiveInput, conversation, assistantMessage, tempSources, Boolean(tool))) {
+      // Routed by the local deterministic tool plan before invoking the model.
     } else {
       void this.streamModelResponse(effectiveInput, conversation, assistantMessage);
     }
@@ -2599,9 +3004,32 @@ export class AssistantRuntime {
     const controller = this.abortControllers.get(messageId);
     controller?.abort();
     this.abortControllers.delete(messageId);
+    const row = this.db.prepare("select * from messages where id = ?").get(messageId);
+    if (!row) {
+      return;
+    }
+    const message = this.messageFromRow(row);
+    if (message.role !== "assistant" || (message.status !== "receiving" && message.status !== "processing")) {
+      return;
+    }
+    const startedAtMs = Date.parse(message.createdAt);
+    this.markAssistantMessageStopped(
+      message.conversationId,
+      message.id,
+      Number.isFinite(startedAtMs) ? startedAtMs : Date.now(),
+      message.providerTraceId,
+    );
   }
 
   private markAssistantMessageStopped(conversationId: string, messageId: string, startedAtMs: number, providerTraceId?: string) {
+    const currentRow = this.db.prepare("select * from messages where id = ?").get(messageId);
+    if (!currentRow) {
+      throw new Error("待停止消息不存在。");
+    }
+    const current = this.messageFromRow(currentRow);
+    if (current.role === "assistant" && current.status === "stopped") {
+      return current;
+    }
     const stoppedText = formatStoppedGenerationMessage(startedAtMs);
     const stopped = this.updateMessage(messageId, {
       status: "stopped",
@@ -2622,6 +3050,25 @@ export class AssistantRuntime {
     });
     this.cancelledMessageIds.delete(messageId);
     return stopped;
+  }
+
+  private stopOrphanedRunningMessages(userId: string, conversationId: string) {
+    const rows = this.db
+      .prepare("select * from messages where user_id = ? and conversation_id = ? and role = 'assistant' and status in ('receiving', 'processing')")
+      .all(userId, conversationId) as Array<Record<string, unknown>>;
+    for (const row of rows) {
+      const message = this.messageFromRow(row);
+      if (this.abortControllers.has(message.id)) {
+        continue;
+      }
+      const startedAtMs = Date.parse(message.createdAt);
+      this.markAssistantMessageStopped(
+        message.conversationId,
+        message.id,
+        Number.isFinite(startedAtMs) ? startedAtMs : Date.parse(message.updatedAt) || Date.now(),
+        message.providerTraceId,
+      );
+    }
   }
 
   private runCancellableAssistantOperation(
@@ -3223,8 +3670,46 @@ export class AssistantRuntime {
     );
   }
 
+  private async recentToolArtifactContext(conversationId: string) {
+    const state = await this.toolResultRegistry.getConversationState(conversationId);
+    const lines = [
+      state.latestSuccessfulSqlToolCallId
+        ? `- sql_query: toolCallId=${state.latestSuccessfulSqlToolCallId}; artifactIds=${(state.latestSuccessfulSqlArtifactIds ?? []).join(", ") || "--"}`
+        : null,
+      state.latestSuccessfulPythonToolCallId
+        ? `- python_analysis: toolCallId=${state.latestSuccessfulPythonToolCallId}; artifactIds=${(state.latestSuccessfulPythonArtifactIds ?? []).join(", ") || "--"}`
+        : null,
+      state.latestSuccessfulChartToolCallId
+        ? `- chart_rendering: toolCallId=${state.latestSuccessfulChartToolCallId}; artifactIds=${(state.latestSuccessfulChartArtifactIds ?? []).join(", ") || "--"}`
+        : null,
+      state.latestSuccessfulReportToolCallId
+        ? `- report_generation: toolCallId=${state.latestSuccessfulReportToolCallId}; artifactIds=${(state.latestSuccessfulReportArtifactIds ?? []).join(", ") || "--"}`
+        : null,
+    ].filter((line): line is string => Boolean(line));
+    if (lines.length === 0) {
+      return null;
+    }
+    return [
+      "最近成功工具结果指针（用于后续工具入参注入）：",
+      ...lines,
+      "入参注入规则：生成图表时优先把 python_analysis artifactIds 填入 inputArtifactIds，并填 sourcePythonToolCallId；没有 Python 结果时使用 sql_query artifactIds 和 sourceSqlToolCallId。生成报告时优先引用 python_analysis，并引用最近 chart_rendering Artifact。",
+    ].join("\n");
+  }
+
+  private async hasRecordedToolActivityForMessage(conversationId: string, messageId: string) {
+    const legacyToolCall = this.db.prepare("select id from tool_calls where message_id = ? limit 1").get(messageId);
+    if (legacyToolCall) {
+      return true;
+    }
+    const records = await this.toolResultRegistry.listByConversation(conversationId);
+    return records.some((record) => record.messageId === messageId);
+  }
+
   private async routePriorSqlAnalysis(input: AssistantSendInput, conversation: AssistantConversation, assistantMessage: AssistantMessage) {
     if (!shouldAnalyzePriorSqlResult(input.prompt)) {
+      return false;
+    }
+    if (shouldUseModelForPriorResultVisualization(input.prompt)) {
       return false;
     }
 
@@ -3591,6 +4076,123 @@ export class AssistantRuntime {
         log.status,
         log.message,
         log.detail ? JSON.stringify(log.detail) : null,
+        log.createdAt,
+      );
+
+    try {
+      mkdirSync(dirname(this.options.toolLogPath), { recursive: true });
+      appendFileSync(this.options.toolLogPath, `${JSON.stringify(log)}\n`, "utf8");
+    } catch {
+      // SQLite logs remain available if file logging is temporarily unavailable.
+    }
+  }
+
+  private appendModelObservationLog(input: AssistantSendInput, conversationId: string, messageId: string, event: ModelStreamEvent) {
+    const payload = event.payload as {
+      phase?: unknown;
+      status?: unknown;
+      message?: unknown;
+      detail?: unknown;
+    };
+    const phase = typeof payload.phase === "string" ? payload.phase : "model-observation";
+    const status = payload.status === "success" || payload.status === "error" ? payload.status : "info";
+    const message = typeof payload.message === "string" ? payload.message : "模型请求观测日志。";
+    const detail = {
+      ...(isPlainRecordValue(payload.detail) ? payload.detail : {}),
+      eventId: event.eventId,
+      traceId: event.traceId,
+      messageId,
+      provider: event.provider,
+      model: event.model,
+    };
+    const log = {
+      id: randomUUID(),
+      toolCallId: null as string | null,
+      conversationId,
+      userId: input.userId,
+      kind: "model",
+      phase,
+      status,
+      message,
+      detail,
+      createdAt: nowIso(),
+    };
+    this.db
+      .prepare(
+        `insert into tool_call_logs
+          (id, tool_call_id, conversation_id, user_id, kind, phase, status, message, detail_json, created_at)
+         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        log.id,
+        log.toolCallId,
+        log.conversationId,
+        log.userId,
+        log.kind,
+        log.phase,
+        log.status,
+        log.message,
+        JSON.stringify(log.detail),
+        log.createdAt,
+      );
+
+    try {
+      mkdirSync(dirname(this.options.toolLogPath), { recursive: true });
+      appendFileSync(this.options.toolLogPath, `${JSON.stringify(log)}\n`, "utf8");
+    } catch {
+      // SQLite logs remain available if file logging is temporarily unavailable.
+    }
+  }
+
+  private appendAgentPlanningLog(input: {
+    conversationId: string;
+    userId: string;
+    messageId: string;
+    plan: ToolExecutionPlan;
+    validation: { valid: boolean; errors: string[]; warnings: string[] };
+  }) {
+    const detail = {
+      messageId: input.messageId,
+      planId: input.plan.planId,
+      requestType: input.plan.requestType,
+      requestedOutputs: input.plan.requestedOutputs,
+      steps: input.plan.steps.map((step) => ({
+        stepId: step.stepId,
+        toolName: step.toolName,
+        dependsOn: step.dependencies,
+        inputResolution: step.inputResolution,
+      })),
+      metrics: input.plan.metrics,
+      validation: input.validation,
+    };
+    const log = {
+      id: randomUUID(),
+      toolCallId: null as string | null,
+      conversationId: input.conversationId,
+      userId: input.userId,
+      kind: "planning",
+      phase: "agent-planning",
+      status: input.validation.valid ? "success" : "error",
+      message: input.validation.valid ? "本地工具执行计划已生成。" : "本地工具执行计划校验未通过。",
+      detail,
+      createdAt: nowIso(),
+    };
+    this.db
+      .prepare(
+        `insert into tool_call_logs
+          (id, tool_call_id, conversation_id, user_id, kind, phase, status, message, detail_json, created_at)
+         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        log.id,
+        log.toolCallId,
+        log.conversationId,
+        log.userId,
+        log.kind,
+        log.phase,
+        log.status,
+        log.message,
+        JSON.stringify(log.detail),
         log.createdAt,
       );
 
@@ -3979,10 +4581,16 @@ export class AssistantRuntime {
         result,
         sqlDataset: sqlDataset ?? undefined,
       });
+      if (completed.kind === "python") {
+        await this.maybeCreateAutoChartArtifact(completed, message, toolRecord);
+      }
       if (shouldRenderPythonReportCard) {
         await this.registerPythonReportCard(completed, result, message, toolRecord);
       }
       if (completed.kind === "sql") {
+        if (!shouldAutoStartPythonReport(sourcePrompt)) {
+          await this.maybeCreateAutoChartArtifact(completed, message, toolRecord);
+        }
         await this.maybeCreateAutoPythonReportApproval(completed, message, sqlExecution?.rows);
       }
       return { success: true as const, toolCall: completed, message };
@@ -4142,6 +4750,68 @@ export class AssistantRuntime {
       },
       { appendToMessage: true },
     );
+  }
+
+  private async maybeCreateAutoChartArtifact(
+    toolCall: AssistantToolCall,
+    message: AssistantMessage,
+    sourceRecord: ToolCallRecord,
+  ) {
+    const sourcePrompt = this.sourcePromptForToolCall(toolCall);
+    if (!sourcePrompt || !hasChartIntentText(sourcePrompt)) {
+      return null;
+    }
+    const modelToolCallId = `auto_${toolCall.id}`;
+    const chartToolCallId = `chart_${modelToolCallId}`;
+    const existing = await this.toolResultRegistry.get(chartToolCallId);
+    if (existing?.status === "completed") {
+      return existing;
+    }
+    const inputArtifactIds = sourceRecord.outputArtifactIds ?? sourceRecord.result?.artifactIds ?? [];
+    if (inputArtifactIds.length === 0) {
+      return null;
+    }
+    const selectedFieldNames = this.toolRecordSelectedFieldNames(sourceRecord);
+    const dimensionFields = selectedFieldNames.filter((field) => !isLikelyMeasureFieldName(field)).slice(0, 2);
+    const explicitMeasures = selectedFieldNames.filter((field) => isLikelyMeasureFieldName(field)).slice(0, 3);
+    const inferredMeasures = [
+      /占比|比例|比率|率/i.test(sourcePrompt) ? "占比" : null,
+      /笔数|条数|数量|总数|总计|多少/i.test(sourcePrompt) ? "笔数" : null,
+    ].filter((field): field is string => Boolean(field));
+    const measureFields = uniqueValues([...explicitMeasures, ...inferredMeasures]).slice(0, 3);
+    const request: Record<string, unknown> = {
+      userRequest: sourcePrompt,
+      purpose: "根据已完成的真实工具结果生成用户明确要求的图表。",
+      title: inferChartTitleFromText(sourcePrompt),
+      chartType: inferChartTypeFromText(sourcePrompt),
+      inputArtifactIds,
+      ...(dimensionFields.length > 0 ? { dimensionFields } : {}),
+      ...(measureFields.length > 0 ? { measureFields } : {}),
+      ...(sourceRecord.toolKind === "python_analysis" ? { sourcePythonToolCallId: sourceRecord.toolCallId } : {}),
+      ...(sourceRecord.toolKind === "sql_query" ? { sourceSqlToolCallId: sourceRecord.toolCallId } : {}),
+      sortDirection: /降序|倒序|desc/i.test(sourcePrompt) ? "desc" : /升序|asc/i.test(sourcePrompt) ? "asc" : undefined,
+    };
+    this.appendToolLog(toolCall, "workflow-routing", "info", "已根据显式图表目标自动登记图表工具结果。", {
+      sourcePrompt,
+      sourceToolCallId: sourceRecord.toolCallId,
+      chartToolCallId,
+      inputArtifactIds,
+      dimensionFields,
+      measureFields,
+    });
+    const result = await this.handleModelChartTool(request, {
+      userId: toolCall.userId,
+      conversationId: toolCall.conversationId,
+      clientRequestId: `auto-chart-${toolCall.id}`,
+      prompt: sourcePrompt,
+      modelName: "local-workflow",
+      approvalMode: toolCall.approvalMode,
+      dataSourceId: toolCall.metadata?.dataSourceId ?? null,
+      dataSourceLabel: toolCall.metadata?.dataSourceLabel ?? null,
+      selectedTempDataSourceIds: toolCall.metadata?.selectedTempDataSourceIds ?? [],
+      selectedFieldRefs: toolCall.metadata?.selectedFieldRefs ?? [],
+    }, message, modelToolCallId);
+    return result;
   }
 
   private async routeOverallRiskSkillWorkflow(input: AssistantSendInput, conversation: AssistantConversation, assistantMessage: AssistantMessage) {
@@ -5183,11 +5853,30 @@ export class AssistantRuntime {
     }
 
     const reportContext = this.analysisReportContextFromRecords([pythonRecord]);
+    const sourcePrompt = this.sourcePromptForToolCall(toolCall);
+    const autoChartRecord = await this.toolResultRegistry.get(`chart_auto_${toolCall.id}`);
+    if (hasChartIntentText(sourcePrompt) && autoChartRecord?.status !== "completed") {
+      this.appendToolLog(toolCall, "workflow-routing", "error", "用户同时要求图表和报告，但本轮图表 Artifact 尚未生成，已阻止登记缺少图表引用的报告。", {
+        sourcePrompt,
+        expectedChartToolCallId: `chart_auto_${toolCall.id}`,
+      });
+      return null;
+    }
+    const chartState = await this.toolResultRegistry.getConversationState(toolCall.conversationId);
+    const chartToolCallId = autoChartRecord?.status === "completed" ? autoChartRecord.toolCallId : chartState.latestSuccessfulChartToolCallId;
+    const chartArtifactIds = autoChartRecord?.status === "completed"
+      ? autoChartRecord.outputArtifactIds ?? autoChartRecord.result?.artifactIds ?? []
+      : chartState.latestSuccessfulChartArtifactIds ?? [];
+    const markdownWithCharts = appendVisualizationReferencesToReport(markdown, {
+      userRequest: sourcePrompt,
+      chartToolCallId,
+      chartArtifactIds,
+    });
     const title = normalizeAnalysisReportTitle({
       sourceName: reportContext.sourceName,
-      markdown,
+      markdown: markdownWithCharts,
     });
-    const normalizedMarkdown = normalizeAnalysisReportMarkdown(markdown, {
+    const normalizedMarkdown = normalizeAnalysisReportMarkdown(markdownWithCharts, {
       title,
       sourceName: reportContext.sourceName,
       selectedFieldNames: reportContext.selectedFieldNames,
@@ -5282,7 +5971,7 @@ export class AssistantRuntime {
       title,
       createdAt: artifact.createdAt,
       completedAt,
-      markdown,
+      markdown: normalizedMarkdown,
     });
     this.options.emit({
       type: "tool-state",
@@ -5965,6 +6654,100 @@ export class AssistantRuntime {
     });
   }
 
+  private async buildLocalToolPlan(input: AssistantSendInput, conversation: AssistantConversation, assistantMessage: AssistantMessage) {
+    if (isOverallRiskSkill(input.skill)) {
+      return null;
+    }
+    const startedAtMs = Date.now();
+    const tempSources = this.activeTempSources(input.userId, conversation.id, input.selectedTempDataSourceIds);
+    const selectedDataSourceAvailable = Boolean(input.dataSourceId || input.dataSourceLabel || tempSources.length > 0);
+    const activeTableCount = tempSources.length > 0 ? tempSources.length : selectedDataSourceAvailable ? 1 : 0;
+    const router = new ToolIntentRouter({ resultRegistry: this.toolResultRegistry });
+    const intentResult = await router.detect({ conversationId: conversation.id, userMessage: input.prompt });
+    if (intentResult.intents.length === 0) {
+      return null;
+    }
+    const toolState = await this.toolResultRegistry.getConversationState(conversation.id);
+    const plan = new ToolPlanBuilder().build({
+      conversationId: conversation.id,
+      userId: input.userId,
+      userMessage: input.prompt,
+      userMessageId: assistantMessage.id,
+      intentResult,
+      toolState,
+      selectedDataSourceAvailable,
+      activeTableCount,
+      planningStartedAtMs: startedAtMs,
+    });
+    if (plan.metrics) {
+      plan.metrics = {
+        ...plan.metrics,
+        planningModelCallCount: 0,
+      };
+    }
+    const validation = new ToolPlanValidator().validateDetailed(plan);
+    this.appendAgentPlanningLog({
+      conversationId: conversation.id,
+      userId: input.userId,
+      messageId: assistantMessage.id,
+      plan,
+      validation,
+    });
+    return {
+      plan,
+      validation,
+      context: validation.valid ? renderLocalToolPlanContext(plan) : null,
+    };
+  }
+
+  private async buildLocalToolPlanningContext(input: AssistantSendInput, conversation: AssistantConversation, assistantMessage: AssistantMessage) {
+    const planning = await this.buildLocalToolPlan(input, conversation, assistantMessage);
+    return planning?.context ?? null;
+  }
+
+  private async routeDeterministicTempCsvToolPlan(
+    input: AssistantSendInput,
+    conversation: AssistantConversation,
+    assistantMessage: AssistantMessage,
+    tempSources: ConversationTempCsvTable[],
+    hasExplicitTool: boolean,
+  ) {
+    const planning = await this.buildLocalToolPlan(input, conversation, assistantMessage);
+    if (!shouldRouteDeterministicTempCsvToolPlan({
+      plan: planning?.plan,
+      validation: planning?.validation,
+      tempSourceCount: tempSources.length,
+      hasExplicitTool,
+      skill: input.skill,
+    })) {
+      return false;
+    }
+    const started = await this.routeFallbackTempCsvAnalysisSql(
+      input,
+      conversation,
+      assistantMessage,
+      "正在查询数据，后续将按本地工具计划继续执行分析、绘图或报告生成。",
+    );
+    if (started) {
+      this.appendToolLog(
+        {
+          conversationId: conversation.id,
+          userId: input.userId,
+          kind: "sql",
+        },
+        "local-tool-plan-routing",
+        "info",
+        "已跳过模型等待，按本地确定性工具计划直接创建 CSV SQL 查询步骤。",
+        {
+          planId: planning?.plan.planId,
+          requestedOutputs: planning?.plan.requestedOutputs,
+          stepTools: planning?.plan.steps.map((step) => step.toolName),
+        },
+      );
+    }
+    return started;
+  }
+
   private async streamModelResponse(input: AssistantSendInput, conversation: AssistantConversation, assistantMessage: AssistantMessage) {
     const apiKey = await this.options.getModelApiKey(input.userId);
     if (!apiKey) {
@@ -6002,6 +6785,7 @@ export class AssistantRuntime {
       }, controller.signal)) {
         adapter.registerTool(tool);
       }
+      const localToolPlanContext = await this.buildLocalToolPlanningContext(input, conversation, assistantMessage);
       const providerMessages = await this.buildProviderMessages(
         input.userId,
         conversation.id,
@@ -6011,6 +6795,7 @@ export class AssistantRuntime {
         input.skill,
         input.approvalMode,
         input.selectedFieldRefs,
+        localToolPlanContext,
       );
       const messages = providerMessages.map((message, index): ConversationMessage => ({
         id: `provider-${assistantMessage.id}-${index}`,
@@ -6030,6 +6815,10 @@ export class AssistantRuntime {
       })) {
         throwIfAssistantOperationCancelled(controller.signal);
         providerTraceId = event.traceId ?? providerTraceId;
+        if (event.type === "model-observation") {
+          this.appendModelObservationLog(input, conversation.id, assistantMessage.id, event);
+          continue;
+        }
         if (event.type === "markdown-delta" || event.type === "text-delta") {
           const delta = typeof event.payload.delta === "string" ? event.payload.delta : "";
           if (!delta) {
@@ -6097,7 +6886,11 @@ export class AssistantRuntime {
         return;
       }
 
-      if (latestMessage.status === "awaiting_approval" || shouldKeepProviderToolActivityMessage(providerToolActivity, latestMessage, content)) {
+      const hasRecordedToolActivity = providerToolActivity
+        ? await this.hasRecordedToolActivityForMessage(conversation.id, assistantMessage.id)
+        : false;
+
+      if (latestMessage.status === "awaiting_approval" || (hasRecordedToolActivity && shouldKeepProviderToolActivityMessage(providerToolActivity, latestMessage, content))) {
         this.options.emit({ type: "message", conversationId: conversation.id, message: latestMessage });
         return;
       }
@@ -6107,7 +6900,13 @@ export class AssistantRuntime {
         if (fallbackStarted) {
           return;
         }
-        content = "工具调用已触发，但模型未返回可执行参数或可见结果。请重新提交查询条件，或用 # 选择真实字段后说明筛选值、分组维度和统计指标。";
+        content = providerToolFallbackText(hasRecordedToolActivity);
+      } else if (content.trim() && providerToolActivity && !hasRecordedToolActivity) {
+        content = [
+          content.trim(),
+          "",
+          providerToolFallbackText(false),
+        ].join("\n");
       }
 
       if (!content.trim() && !providerToolActivity) {
@@ -6216,7 +7015,7 @@ export class AssistantRuntime {
     return [
       {
         name: TOOL_NAMES.sql_query,
-        description: "请求执行受控只读 SQL 查询。必须提供只读 SQL 候选语句，系统会进行安全校验并按用户审批权限处理。若用户使用 #字段，本轮字段引用映射是最高优先级字段来源；SQL 必须使用映射中的实际字段名并用 SQLite 双引号引用，不得把 # 前缀写入 SQL。",
+        description: "请求执行受控只读 SQL 查询。必须提供单条只读 SQL，系统会安全校验并按审批权限处理。#字段 代表已验证字段引用，SQL 必须使用映射中的真实字段名并用 SQLite 双引号引用。需要后续统计、占比、排序、绘图或报告时，SQL 应返回所需原始字段，避免用聚合压缩样本。",
         inputSchema: TOOL_SCHEMAS.sql_query,
         riskLevel: "high",
         handler: async (request, context) => {
@@ -6226,7 +7025,7 @@ export class AssistantRuntime {
       },
       {
         name: TOOL_NAMES.python_analysis,
-        description: "请求执行受控 Python 数据分析。优先使用会话最新 SQL/Workflow 数据集作为输入；如提供 script，系统会按用户审批权限处理。Python 脚本应读取 SQL/Workflow 结果中的真实列名，不要根据原始 #字段 文本重新猜测列名。",
+        description: "请求执行受控 Python 数据分析。输入必须来自已授权 SQL/Workflow 数据集或具备 SQL 血缘的 Artifact；脚本只能使用标准库和输入数据中的真实列名，不得直接连接业务数据库或使用模拟数据。",
         inputSchema: TOOL_SCHEMAS.python_analysis,
         riskLevel: "high",
         handler: async (request, context) => {
@@ -6236,7 +7035,12 @@ export class AssistantRuntime {
       },
       {
         name: TOOL_NAMES.chart_rendering,
-        description: "请求登记受控 VisualizationSpec 图表 Artifact。图表数据必须来自已授权结果或可信小型 inline rows。",
+        description: [
+          "请求登记受控 VisualizationSpec 图表 Artifact。",
+          "用户要求画图、绘图、图表、可视化、比率图、占比图、排名图、条形图、柱状图、横向条形图，或把已有表格/分析结果变成图表时，必须调用本工具。",
+          "图表输入必须来自已授权 SQL/Python/Workflow Artifact；可提供 visualizationSpec，或声明式 title、chartType、dimensionFields、measureFields、sortBy、sortDirection、colorBy。",
+          "不得传 ECharts option、JavaScript、HTML、SVG 或 renderer 配置；横向条形图使用 chartType=horizontal_bar。",
+        ].join(" "),
         inputSchema: TOOL_SCHEMAS.chart_rendering,
         riskLevel: "medium",
         handler: async (request, context) => {
@@ -6246,7 +7050,7 @@ export class AssistantRuntime {
       },
       {
         name: TOOL_NAMES.report_generation,
-        description: "请求登记 Markdown 报告 Artifact。报告必须基于会话工具结果、Artifact 摘要和本轮字段引用映射，不得伪造数据或自行扩展用户未要求的字段、章节和指标。",
+        description: "请求登记 Markdown 报告 Artifact。报告必须基于真实 SQL、Python 和图表 Artifact；用户同时要求图表和报告时，必须引用 visualizationArtifactIds 并在正文嵌入 visualization 节点。不得伪造数据或扩展用户未要求的字段、章节和指标。",
         inputSchema: TOOL_SCHEMAS.report_generation,
         riskLevel: "low",
         handler: async (request, context) => {
@@ -6329,13 +7133,11 @@ export class AssistantRuntime {
     const toolState = await this.toolResultRegistry.getConversationState(conversation.id);
     const repair = this.agentGuidance.validateToolRequest({ toolKind: "sql_query", request, toolState });
     if (!repair.valid) {
-      return this.pauseForToolParameterRepairGuidance({
-        conversationId: conversation.id,
-        userId: input.userId,
-        assistantMessage,
+      return buildModelToolParameterIssueFeedback({
         toolKind: "sql_query",
-        modelToolCallId,
+        toolCallId: modelToolCallId,
         invalidParameters: repair.invalidParameters,
+        latestToolState: toolState,
       });
     }
     const script = typeof request.sql === "string" ? request.sql : typeof request.script === "string" ? request.script : "";
@@ -6344,6 +7146,18 @@ export class AssistantRuntime {
         status: "waiting_input",
         toolCallId: modelToolCallId,
         message: "request_sql_query_execution 需要提供 sql 字段，且必须是单条只读 SQL。",
+      };
+    }
+    if (shouldRequireDetailSqlForCompositeAnalysis({ request, prompt: input.prompt, sql: script })) {
+      return {
+        status: "waiting_input",
+        toolCallId: modelToolCallId,
+        reason: "sql_must_return_detail_rows_for_analysis",
+        message: [
+          "request_sql_query_execution 收到的是聚合 SQL，但当前用户需求是先查询真实样本，再由 Python 完成占比、拆分、排序和图表数据计算。",
+          "请重新调用 request_sql_query_execution，SQL 只做明细行提取：保留筛选条件，选择后续分析所需的原始字段，不要使用 GROUP BY、COUNT、SUM、AVG、DISTINCT 等聚合。",
+          "SQL 完成后再调用 request_python_analysis_execution 计算汇总指标，最后调用 request_chart_rendering 绘制图表。",
+        ].join(" "),
       };
     }
     const currentMessage = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(assistantMessage.id));
@@ -6389,13 +7203,11 @@ export class AssistantRuntime {
         : []),
     ];
     if (invalidParameters.length > 0) {
-      return this.pauseForToolParameterRepairGuidance({
-        conversationId: conversation.id,
-        userId: input.userId,
-        assistantMessage,
+      return buildModelToolParameterIssueFeedback({
         toolKind: "python_analysis",
-        modelToolCallId,
+        toolCallId: modelToolCallId,
         invalidParameters,
+        latestToolState: toolState,
       });
     }
     const script = typeof request.script === "string" ? request.script : "";
@@ -6436,16 +7248,31 @@ export class AssistantRuntime {
     const toolState = await this.toolResultRegistry.getConversationState(assistantMessage.conversationId);
     const repair = this.agentGuidance.validateToolRequest({ toolKind: "chart_rendering", request, toolState });
     if (!repair.valid) {
-      return this.pauseForToolParameterRepairGuidance({
-        conversationId: assistantMessage.conversationId,
-        userId: input.userId,
-        assistantMessage,
+      if (shouldDeferChartUntilUpstreamTools({ request, prompt: input.prompt, invalidParameters: repair.invalidParameters, toolState })) {
+        return {
+          status: "waiting_input",
+          toolCallId: modelToolCallId,
+          message: [
+            "request_chart_rendering 已识别图表需求，但当前会话还没有可引用的 SQL/Python 分析 Artifact。",
+            "这是查询、分析、绘图的复合任务，请先调用 request_sql_query_execution 获取真实数据；如需占比、拆分、排序或比率计算，再调用 request_python_analysis_execution；完成后再次调用 request_chart_rendering，并把 Python 分析 artifactIds 填入 inputArtifactIds。",
+          ].join(" "),
+          requiredToolSequence: [
+            TOOL_NAMES.sql_query,
+            TOOL_NAMES.python_analysis,
+            TOOL_NAMES.chart_rendering,
+          ],
+          reason: "chart_requires_upstream_query_and_analysis",
+        };
+      }
+      return buildModelToolParameterIssueFeedback({
         toolKind: "chart_rendering",
-        modelToolCallId,
+        toolCallId: modelToolCallId,
         invalidParameters: repair.invalidParameters,
+        latestToolState: toolState,
       });
     }
-    const parsed = parseVisualizationSpecJson(JSON.stringify(request.visualizationSpec ?? {}), {
+    const visualizationSpec = normalizeChartVisualizationSpec(request, toolState, modelToolCallId);
+    const parsed = parseVisualizationSpecJson(JSON.stringify(visualizationSpec), {
       allowInlineData: true,
       inlineDataMaxRows: 200,
       inlineDataMaxBytes: 64 * 1024,
@@ -6494,8 +7321,28 @@ export class AssistantRuntime {
     modelToolCallId: string,
   ) {
     const toolState = await this.toolResultRegistry.getConversationState(assistantMessage.conversationId);
+    if (shouldDeferReportUntilChartTool({ request, prompt: input.prompt, toolState })) {
+      const hasPythonInput = Boolean(toolState.latestSuccessfulPythonToolCallId && toolState.latestSuccessfulPythonArtifactIds?.length);
+      const hasSqlInput = Boolean(toolState.latestSuccessfulSqlToolCallId && toolState.latestSuccessfulSqlArtifactIds?.length);
+      return {
+        status: "waiting_input",
+        toolCallId: modelToolCallId,
+        reason: "report_requires_chart_first",
+        latestSqlToolCallId: toolState.latestSuccessfulSqlToolCallId,
+        latestPythonToolCallId: toolState.latestSuccessfulPythonToolCallId,
+        message: [
+          "用户本轮明确要求绘制图表，request_markdown_report_generation 不能替代图表工具。",
+          hasPythonInput || hasSqlInput
+            ? "请先调用 request_chart_rendering，并优先把最近一次 Python 分析 Artifact 填入 inputArtifactIds；图表完成后再生成报告。"
+            : "当前还没有可引用的 SQL/Python 结果，请先调用 request_sql_query_execution 查询明细数据，再调用 request_python_analysis_execution 完成分析，随后调用 request_chart_rendering。",
+        ].join(" "),
+        requiredToolSequence: hasPythonInput || hasSqlInput
+          ? [TOOL_NAMES.chart_rendering, TOOL_NAMES.report_generation]
+          : [TOOL_NAMES.sql_query, TOOL_NAMES.python_analysis, TOOL_NAMES.chart_rendering, TOOL_NAMES.report_generation],
+      };
+    }
     const repair = this.agentGuidance.validateToolRequest({ toolKind: "report_generation", request, toolState });
-    const markdown = typeof request.markdown === "string" ? request.markdown.trim() : "";
+    let markdown = typeof request.markdown === "string" ? request.markdown.trim() : "";
     const invalidParameters = [
       ...repair.invalidParameters,
       ...(!markdown && !repair.invalidParameters.some((item) => item.parameterName === "markdown")
@@ -6508,13 +7355,11 @@ export class AssistantRuntime {
         : []),
     ];
     if (invalidParameters.length > 0) {
-      return this.pauseForToolParameterRepairGuidance({
-        conversationId: assistantMessage.conversationId,
-        userId: input.userId,
-        assistantMessage,
+      return buildModelToolParameterIssueFeedback({
         toolKind: "report_generation",
-        modelToolCallId,
+        toolCallId: modelToolCallId,
         invalidParameters,
+        latestToolState: toolState,
       });
     }
     if (!markdown) {
@@ -6527,6 +7372,11 @@ export class AssistantRuntime {
         message: "request_markdown_report_generation 需要提供 markdown 字段，或先完成报告内容生成。",
       };
     }
+    markdown = appendVisualizationReferencesToReport(markdown, {
+      userRequest: toolRequestText(request, input.prompt),
+      chartToolCallId: toolState.latestSuccessfulChartToolCallId,
+      chartArtifactIds: toolState.latestSuccessfulChartArtifactIds ?? [],
+    });
     const title = typeof request.title === "string" && request.title.trim() ? request.title.trim().slice(0, 120) : inferReportTitle(markdown) ?? "分析报告";
     const currentMessage = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(assistantMessage.id));
     const reportToolCallId = generatedReportToolCallId(currentMessage.id);
@@ -6581,8 +7431,10 @@ export class AssistantRuntime {
     skill: AssistantSkill | null | undefined,
     approvalMode: AssistantApprovalMode,
     selectedFieldRefs?: ChatCsvSelectedFieldRef[],
+    localToolPlanContext?: string | null,
   ) {
     const recentToolContext = this.recentToolContext(userId, conversationId);
+    const recentToolArtifactContext = await this.recentToolArtifactContext(conversationId);
     const workflowContext = await this.workflowContextBuilder.buildMarkdown(conversationId);
     const schemaContextHasSelectedFields = Boolean(schemaContextMarkdown?.includes("Schema Context Mode：selected_fields"));
     const fieldReferenceContext = schemaContextHasSelectedFields ? null : selectedFieldReferencesMarkdown(selectedFieldRefs);
@@ -6607,25 +7459,33 @@ export class AssistantRuntime {
           "所有模型回复必须流式输出。默认普通问答、说明和简短结论使用流式 text；只有报告、方案、结构化分析、代码块、SQL 候选语句、工具调用执行结果和需要长期查看的产物使用流式 markdown。",
           "不要编造数据库结果；需要查询数据源时，应优先使用 request_sql_query_execution 语义生成候选只读 SQL、查询目的和结果用途，SQL 必须先经过安全校验、权限校验、风险评估和用户审批。",
           "当用户要求统计、筛选或读取数据源内容时，必须输出单个 ```sql 代码块承载候选只读 SQL；客户端会自动捕获该 SQL 并进入安全校验、审批和工具执行流程。",
+          "当用户本轮同时要求查询数据并进行分析、占比、比率、排序、绘图或生成报告时，SQL 阶段必须返回明细行和后续分析所需原始字段；不得用 GROUP BY、COUNT、SUM、AVG、DISTINCT 等聚合 SQL 直接生成统计结果，避免样本数量被压缩。聚合、占比、排序和图表数据计算交给 Python 分析工具。",
           "字段引用规则：用户文本中的 #字段名称 表示客户端已验证的结构化字段引用。生成 SQL 时把“#字段 为/是/等于 ‘值’”转换为 where 条件，字段名必须使用“本轮已选字段/字段引用映射”中的实际字段名并用 SQLite 双引号引用；不得保留 # 前缀到 SQL、Python 或报告指标字段中。",
           "字段解析优先级：本轮已选字段/字段引用映射 > Workflow/工具结果字段 > 全表字段清单。若 Schema Context Mode 为 selected_fields，不要扫描全表字段清单或重新比较字段别名；只有用户明确要求未选字段、字段探索或字段映射缺失时，才使用全表字段清单做补充匹配。",
           "工具调用字段约束：SQL 查询阶段按字段映射生成候选 SQL；Python 分析阶段优先读取 SQL 工具返回字段或工作流数据集字段，不得根据原始 #字段 文本重新猜列名；报告生成阶段只使用已完成工具结果、Artifact 和明确字段映射，不自行扩展字段。",
+          "当工具结果返回 status=parameter_issue 时，表示本地参数校验发现异常但对话未中断；请把 invalidParameters 当作补充上下文重新判断用户意图、修正工具参数或调整工具顺序。只有确认无法自动修复且确实缺少用户输入时，才用普通自然语言向用户说明需要补充的信息；不要生成参数异常卡片或固定模板。",
           "如果用户表达过短、只有代词或无法识别明确查询/分析/绘图/报告目标，不要输出预制模板、等待补充、Resume Token 或操作按钮文案；应结合当前数据源、已选字段和历史工具结果，用普通 text 简短说明可继续怎么提问。",
           "当缺少数据源时，直接说明可通过“文件”手动上传 CSV、在数据管理中导入 CSV，或连接数据库后选择数据源；当需要查询数据时，引导用户用 # 选择真实表字段并写清筛选值、分组维度或统计指标。",
           "当 Workflow Context 中存在 activeDataset 且用户提到上一轮、当前结果、这批数据或刚才的数据时，候选 SQL 必须优先查询 activeDataset 的 sqliteTableName；不要重新访问原始业务表，除非用户明确要求重新查询原始数据源。",
-          "如果用户明确要求“根据 SQL 查询结果/上一轮查询结果/工具调用结果”继续统计、对比或生成报告，必须复用最近工具结果，不得重新生成 SQL；需要计算时输出单个 ```python 代码块，报告正文必须为 Markdown。",
+          "如果用户明确要求“根据 SQL 查询结果/上一轮查询结果/工具调用结果”，或使用“这张表/该表/当前表/这份表”等指代继续统计、拆分、对比、分析、绘图或生成报告，必须复用最近工具结果，不得重新生成 SQL；需要计算时输出单个 ```python 代码块，图表需求应调用 request_chart_rendering，报告正文必须为 Markdown。",
+          "当历史结果请求同时包含绘制、图表、可视化、条形图、柱状图、折线图、饼图等图表意图时，必须先通过模型工具意图识别选择 request_chart_rendering；若图表数据还需要二次计算，再先调用 request_python_analysis_execution，随后调用 request_chart_rendering。",
           "Python 工具运行在受限本地沙箱中，只能使用 Python 标准库；不得 import pandas、numpy、openpyxl、matplotlib 或任何第三方库。需要读取工作流数据集时使用 sqlite3 连接 Workflow Context 中的 sqliteDatabasePath，并读取 activeDataset.sqliteTableName。",
-          "当用户需要图表或可视化时，只能生成受控 VisualizationSpec；不得生成完整 ECharts option、vis-network 配置、vis-timeline 配置、JavaScript、React、HTML、SVG 或 formatter 函数。",
-          "VisualizationSpec 只描述业务语义、图表类型、字段映射、指标格式、交互需求和数据来源。图表数据必须优先引用 SQL/Python/Workflow Artifact；只有系统已给出小型聚合结果且可信时，才允许 inline rows。",
-          "当前客户端把受控 VisualizationSpec 作为内部 visualization 节点处理。确需输出图表时，请使用单个 ```visualization JSON 代码块承载 VisualizationSpec；客户端会将其转换为内部图表节点，不会把协议作为普通 Markdown 展示。",
+          "当用户需要图表或可视化时，必须优先调用 request_chart_rendering；可提供完整 visualizationSpec，也可提供 chartType、title、dimensionFields、measureFields、sortBy、sortDirection、colorBy 等声明式参数。不要只用自然语言说明，也不要用报告工具替代图表工具。",
+          "用户明确要求绘图时，在 chart_rendering 完成前不得调用 request_markdown_report_generation 作为最终替代；如同时需要报告，必须先完成图表 Artifact，再生成报告。",
+          "图表意图包括：画图、绘图、图表、可视化、比率图、占比图、排名图、柱状图、条形图、横向条形图，以及“把这张表/分析结果变成图表”“图表改为某种类型”等表达。",
+          "VisualizationSpec 只描述业务语义、图表类型、字段映射、指标格式、交互需求和数据来源。图表数据必须优先引用 SQL/Python/Workflow Artifact；优先使用最近 Python 分析结果，没有 Python 结果时使用最近 SQL 查询结果；只有系统已给出小型聚合结果且可信时，才允许 inline rows。",
+          "图表入参规则：横向条形图使用 type=horizontal_bar；比率、占比、百分率等指标使用 percentage measure；排序、颜色分级、分组拆分等用户要求写入 dimensions、measures、encoding 或 metadata。",
+          "当前客户端把受控 VisualizationSpec 作为内部 visualization 节点处理。仅当当前通道无法发起工具调用时，才使用单个 ```visualization JSON 代码块承载 VisualizationSpec；客户端会将其转换为内部图表节点，不会把协议作为普通 Markdown 展示。",
           "VisualizationSpec 中不要指定 rendererId、rendererClass、dynamicImport、importPath、任意颜色、原始 HTML、本地文件路径或可执行代码。系统会根据业务语义和图表类型自动路由 renderer。",
           "当前会话可能包含用户临时上传的 CSV 数据源。临时 CSV 数据源的 SQLite 表字段可以是中文、英文或中英文混合。生成 SQLite SQL 时必须使用 Schema Context 中给出的真实表名和字段名，并对表名、字段名使用 SQLite 双引号转义。不要假设临时 CSV 字段具备 businessFieldId。需要精确查询、统计、排序、聚合或筛选时，必须调用 SQL 查询工具。",
           TOOL_ORCHESTRATION_SYSTEM_PROMPT,
+          localToolPlanContext ? `\n${localToolPlanContext}` : undefined,
           "仅在本地脚本调试场景才输出 /sql 或 /python 代码块，客户端会按审批权限处理。",
           !skill ? "当前未选择 Skill。必须严格按用户自然语言请求生成内容；只能使用用户显式点名的字段、筛选条件、统计指标和分析维度。不得自行添加用户未要求的报告章节、模板栏目、字段概览、交叉分布、数值字段汇总、核心风险指标、数据质量说明或口径说明。若用户只要求查询或分析，只输出与该请求直接相关的结果和必要解释。" : undefined,
           selectedSkillSystemPrompt(skill),
           schemaContextMarkdown ? `\n以下是已授权数据源 Schema Context。请遵守其中 Usage Policy、安全约束和工具调用要求，不要基于样例行推断全量结论。若本轮字段引用映射已经覆盖用户点名字段，不要在全表字段清单中重复搜索这些字段；全表字段清单仅用于补充未选择字段或生成 select * / 明细查询。\n${schemaContextMarkdown}` : undefined,
           workflowContext ? `\n${workflowContext}` : undefined,
+          recentToolArtifactContext ? `\n${recentToolArtifactContext}` : undefined,
           recentToolContext ? `\n${recentToolContext}` : undefined,
         ].filter(Boolean).join("\n"),
       },

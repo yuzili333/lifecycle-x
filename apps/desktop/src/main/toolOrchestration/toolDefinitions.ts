@@ -27,15 +27,21 @@ export function createOrchestrationToolDefinitions(input: {
 
 function toolDescription(toolKind: ToolKind) {
   if (toolKind === "sql_query") {
-    return "request_sql_query_execution 是受控只读 SQL 查询执行请求工具。SQL 必须经过安全校验、权限校验和用户审批，不得直接伪造查询结果。用户使用 #字段 时，必须优先使用本轮字段引用映射中的实际字段名，并用 SQLite 双引号引用。";
+    return "用途：从已授权数据源执行只读查询、筛选、字段选择、分组、聚合和排序。输出 SQL 结果 Artifact、行列统计和数据集 Schema。规则：只读、需要审批、不使用模拟数据、不把完整结果直接注入模型；无筛选条件的兜底查询表示查询活动表完整数据范围，大结果通过 Artifact 物化。";
   }
   if (toolKind === "python_analysis") {
-    return "request_python_analysis_execution 是受控 Python 数据分析工具。默认使用会话最新成功 SQL 结果作为输入，必须经过审批和沙箱执行。Python 分析应读取工具结果中的真实列名，不得根据原始 #字段 文本重新猜测字段。";
+    return "用途：对已有 SQL 查询结果执行统计、分布、趋势、相关性、异常检测或其他分析。必要输入是 SQL 数据集 Artifact 或具有 SQL 数据血缘的分析数据集。规则：不直接连接业务数据库，不使用模拟数据，字段必须来自输入数据集，输出分析 Artifact 供图表和报告使用。";
   }
   if (toolKind === "chart_rendering") {
-    return "request_chart_rendering 是受控数据可视化工具。图表数据必须来自已授权 Artifact，只能描述 VisualizationSpec，不得输出任意 JavaScript 或渲染器配置。";
+    return [
+      "用途：将 SQL 查询结果或 Python 分析结果转换为可交互数据可视化。",
+      "触发规则：用户明确要求绘图、画图、图表、可视化、分布图、趋势图、比率图、占比图、排名图或具体图表类型时，必须调用本工具。",
+      "输入：SQL 或 Python Artifact、图表目标、维度、指标和可选图表类型；横向条形图使用 horizontal_bar。",
+      "输出：受控 VisualizationSpec、图表 Artifact、标题和摘要。",
+      "规则：不输出完整 ECharts option，不用 Markdown 表格代替图表，图表 Artifact 可以被报告工具引用。",
+    ].join(" ");
   }
-  return "request_markdown_report_generation 是受控 Markdown 报告生成工具。报告必须引用 Artifact、工具结果摘要和字段引用映射，不得编造数据或自行扩展用户未要求字段，每次修改生成新版本。";
+  return "用途：基于真实 SQL、Python 和图表 Artifact 生成 Markdown 报告。输入包括 SQL Artifact、可选 Python Artifact、可选图表 Artifact、报告目标和结构要求。规则：不编造数据；用户同时要求图表和报告时，必须把 visualizationArtifactIds 嵌入报告正文；不重新计算上游指标，不重新生成已有图表，输出 Markdown Artifact 和报告卡片。";
 }
 
 function riskLevel(toolKind: ToolKind): ToolDefinition["riskLevel"] {

@@ -27,11 +27,13 @@ export function createToolOrchestrationModule(config: ToolOrchestrationModuleCon
   return {
     detectIntent: (input: { conversationId: string; userMessage: string }) => intentRouter.detect(input),
     buildPlan: async (input: BuildPlanInput) => {
+      const planningStartedAtMs = Date.now();
+      const toolState = await config.resultRegistry.getConversationState(input.conversationId);
       const intentResult = input.intentResult ?? await intentRouter.detect({
         conversationId: input.conversationId,
         userMessage: input.userMessage,
       });
-      return planBuilder.build({ ...input, intentResult });
+      return planBuilder.build({ ...input, intentResult, toolState, planningStartedAtMs });
     },
     validatePlan: (plan: ToolExecutionPlan) => planValidator.validate(plan),
     executePlan: (plan: ToolExecutionPlan) => executionEngine.executePlan(plan),
@@ -83,6 +85,8 @@ export function createToolOrchestrationModule(config: ToolOrchestrationModuleCon
       }
     },
     resolveToolInput: (input: { conversationId: string; toolKind: ToolKind; explicitInputRefs?: string[] }) => inputResolver.resolve(input),
+    resolveSqlResultInput: (input: { conversationId: string; userRequest: string; explicitInputRefs?: string[]; selectedDataSourceAvailable?: boolean; activeTableCount?: number }) =>
+      inputResolver.resolveSqlResult(input),
   };
 }
 

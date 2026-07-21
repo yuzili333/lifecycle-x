@@ -62,6 +62,7 @@ export class StreamingModelAdapter {
           traceId,
           messages: conversationMessages,
           allowTools,
+          roundIndex: toolRound + 1,
           parser,
           onContent: (delta) => {
             content += delta;
@@ -92,6 +93,7 @@ export class StreamingModelAdapter {
             traceId,
             messages: conversationMessages,
             allowTools: false,
+            roundIndex: toolRound + 1,
             parser,
             onContent: (delta) => {
               content += delta;
@@ -151,6 +153,7 @@ export class StreamingModelAdapter {
     traceId,
     messages,
     allowTools,
+    roundIndex,
     parser,
     onContent,
     versionState,
@@ -159,6 +162,7 @@ export class StreamingModelAdapter {
     traceId: string;
     messages: ConversationMessage[];
     allowTools: boolean;
+    roundIndex: number;
     parser: StreamingMarkdownParser;
     onContent: (delta: string) => void;
     versionState: { version: ContentVersion | null };
@@ -166,39 +170,79 @@ export class StreamingModelAdapter {
     const toolCalls = new Map<string, AggregatedToolCall>();
     const endedToolCalls = new Set<string>();
     const startedToolCalls = new Set<string>();
+    const tools = allowTools ? this.toolRegistry.getTools() : undefined;
+    const requestedAtMs = Date.now();
+    let firstModelEventMs: number | null = null;
+    let firstTokenMs: number | null = null;
+    let firstToolCallMs: number | null = null;
+    let contentDeltaChars = 0;
+    let finishReason: string | undefined;
 
-    for await (const providerEvent of this.provider.streamChat({
-      conversationId: input.conversationId,
-      messageId: input.messageId,
-      messages,
-      model: input.model,
-      tools: allowTools ? this.toolRegistry.getTools() : undefined,
-      signal: input.signal,
-      timeoutMs: input.timeoutMs,
-    })) {
-      if (providerEvent.type === "content-delta") {
-        onContent(providerEvent.delta);
-        yield this.event(input, input.contentType === "text" ? "text-delta" : "markdown-delta", { delta: providerEvent.delta }, traceId);
-        yield this.versionDeltaEvent(input, providerEvent.delta, traceId, versionState);
-        for (const parserEvent of parser.push(providerEvent.delta)) {
-          yield this.markdownParserEvent(input, parserEvent, traceId);
+    yield this.modelObservationEvent(input, traceId, "provider-round-start", "info", "模型请求开始。", {
+      roundIndex,
+      allowTools,
+      model: input.model ?? this.config.model,
+      timeoutMs: input.timeoutMs ?? this.config.timeoutMs,
+      ...summarizeModelRequest(messages, tools),
+    });
+
+    try {
+      for await (const providerEvent of this.provider.streamChat({
+        conversationId: input.conversationId,
+        messageId: input.messageId,
+        messages,
+        model: input.model,
+        tools,
+        signal: input.signal,
+        timeoutMs: input.timeoutMs,
+      })) {
+        firstModelEventMs ??= Date.now() - requestedAtMs;
+        if (providerEvent.type === "content-delta") {
+          firstTokenMs ??= Date.now() - requestedAtMs;
+          contentDeltaChars += providerEvent.delta.length;
+          onContent(providerEvent.delta);
+          yield this.event(input, input.contentType === "text" ? "text-delta" : "markdown-delta", { delta: providerEvent.delta }, traceId);
+          yield this.versionDeltaEvent(input, providerEvent.delta, traceId, versionState);
+          for (const parserEvent of parser.push(providerEvent.delta)) {
+            yield this.markdownParserEvent(input, parserEvent, traceId);
+          }
+        } else if (providerEvent.type === "tool-call-delta") {
+          firstToolCallMs ??= Date.now() - requestedAtMs;
+          const toolCall = aggregateToolCallDelta(toolCalls, providerEvent.delta);
+          const isFirstDelta = !startedToolCalls.has(toolCall.toolCallId);
+          startedToolCalls.add(toolCall.toolCallId);
+          yield this.toolCallEvent(input, providerEvent, toolCall, traceId, isFirstDelta);
+        } else if (providerEvent.type === "tool-call-end") {
+          endedToolCalls.add(providerEvent.toolCallId);
+          const toolCall = toolCalls.get(providerEvent.toolCallId);
+          yield this.event(
+            input,
+            "tool-call-end",
+            { index: providerEvent.index, toolName: toolCall?.name, argumentsText: toolCall?.argumentsText ?? "" },
+            traceId,
+            { toolCallId: providerEvent.toolCallId },
+          );
+        } else if (providerEvent.type === "end") {
+          finishReason = providerEvent.finishReason;
         }
-      } else if (providerEvent.type === "tool-call-delta") {
-        const toolCall = aggregateToolCallDelta(toolCalls, providerEvent.delta);
-        const isFirstDelta = !startedToolCalls.has(toolCall.toolCallId);
-        startedToolCalls.add(toolCall.toolCallId);
-        yield this.toolCallEvent(input, providerEvent, toolCall, traceId, isFirstDelta);
-      } else if (providerEvent.type === "tool-call-end") {
-        endedToolCalls.add(providerEvent.toolCallId);
-        const toolCall = toolCalls.get(providerEvent.toolCallId);
-        yield this.event(
-          input,
-          "tool-call-end",
-          { index: providerEvent.index, toolName: toolCall?.name, argumentsText: toolCall?.argumentsText ?? "" },
-          traceId,
-          { toolCallId: providerEvent.toolCallId },
-        );
       }
+    } catch (error) {
+      const adapterError = toModelAdapterError("UNKNOWN_ERROR", "模型流式调用失败。", error);
+      yield this.modelObservationEvent(input, traceId, "provider-round-error", "error", "模型请求异常。", {
+        roundIndex,
+        allowTools,
+        durationMs: Date.now() - requestedAtMs,
+        firstModelEventMs,
+        firstTokenMs,
+        firstToolCallMs,
+        returnedToolCalls: toolCalls.size > 0,
+        toolCallCount: toolCalls.size,
+        toolCallNames: Array.from(toolCalls.values()).map((toolCall) => toolCall.name).filter(Boolean),
+        contentDeltaChars,
+        finishReason,
+        error: adapterError.serialize(),
+      });
+      throw error;
     }
 
     for (const toolCall of toolCalls.values()) {
@@ -206,6 +250,20 @@ export class StreamingModelAdapter {
         yield this.event(input, "tool-call-end", { index: toolCall.index, toolName: toolCall.name, argumentsText: toolCall.argumentsText }, traceId, { toolCallId: toolCall.toolCallId });
       }
     }
+
+    yield this.modelObservationEvent(input, traceId, "provider-round-complete", "success", "模型请求完成。", {
+      roundIndex,
+      allowTools,
+      durationMs: Date.now() - requestedAtMs,
+      firstModelEventMs,
+      firstTokenMs,
+      firstToolCallMs,
+      returnedToolCalls: toolCalls.size > 0,
+      toolCallCount: toolCalls.size,
+      toolCallNames: Array.from(toolCalls.values()).map((toolCall) => toolCall.name).filter(Boolean),
+      contentDeltaChars,
+      finishReason: finishReason ?? "unknown",
+    });
 
     return Array.from(toolCalls.values()).filter((toolCall) => toolCall.name);
   }
@@ -334,6 +392,17 @@ export class StreamingModelAdapter {
       ...extra,
     };
   }
+
+  private modelObservationEvent(
+    input: StreamChatInput,
+    traceId: string,
+    phase: string,
+    status: "info" | "success" | "error",
+    message: string,
+    detail: Record<string, unknown>,
+  ) {
+    return this.event(input, "model-observation", { phase, status, message, detail }, traceId);
+  }
 }
 
 export function createStreamingModelAdapter(config: StreamingModelAdapterConfig) {
@@ -351,6 +420,35 @@ function buildMessages(input: StreamChatInput): ConversationMessage[] {
     });
   }
   return messages;
+}
+
+function summarizeModelRequest(messages: ConversationMessage[], tools: ToolDefinition[] | undefined) {
+  const messageRoleStats = messages.reduce<Record<string, { count: number; contentChars: number }>>((stats, message) => {
+    const existing = stats[message.role] ?? { count: 0, contentChars: 0 };
+    existing.count += 1;
+    existing.contentChars += message.content.length;
+    stats[message.role] = existing;
+    return stats;
+  }, {});
+  const messageContentChars = messages.reduce((sum, message) => sum + message.content.length, 0);
+  const maxMessageChars = messages.reduce((max, message) => Math.max(max, message.content.length), 0);
+  const toolDefinitionChars = tools?.reduce((sum, tool) => sum + tool.name.length + tool.description.length + JSON.stringify(tool.inputSchema).length, 0) ?? 0;
+  const totalContextChars = messageContentChars + toolDefinitionChars;
+  return {
+    messageCount: messages.length,
+    messageContentChars,
+    maxMessageChars,
+    messageRoleStats,
+    toolCount: tools?.length ?? 0,
+    toolNames: tools?.map((tool) => tool.name) ?? [],
+    toolDefinitionChars,
+    totalContextChars,
+    estimatedTokens: estimateTokens(totalContextChars),
+  };
+}
+
+function estimateTokens(chars: number) {
+  return Math.ceil(chars / 4);
 }
 
 function toolCallsAssistantMessage(input: StreamChatInput, toolCalls: AggregatedToolCall[]): ConversationMessage {

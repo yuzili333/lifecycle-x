@@ -244,6 +244,55 @@ describe("StreamingModelAdapter", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it("emits model request observations with request size, tool list and provider outcome", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(sseResponse([
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"searchCustomer","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}\n\n',
+        "data: [DONE]\n\n",
+      ]))
+      .mockResolvedValueOnce(sseResponse([
+        'data: {"choices":[{"delta":{"content":"完成。"},"finish_reason":"stop"}]}\n\n',
+        "data: [DONE]\n\n",
+      ]));
+    const adapter = createStreamingModelAdapter({
+      baseURL: "https://example.local/v1",
+      apiKey: "secret",
+      model: "test-model",
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+    adapter.registerTool({
+      name: "searchCustomer",
+      description: "查询客户",
+      inputSchema: { type: "object", properties: {} },
+      handler: async () => ({ ok: true }),
+    });
+
+    const events = await collect(adapter.streamChat(baseInput()));
+    const observations = events.filter((event) => event.type === "model-observation");
+    const firstStart = observations.find((event) => event.payload.phase === "provider-round-start");
+    const firstComplete = observations.find((event) => event.payload.phase === "provider-round-complete" && (event.payload.detail as { roundIndex?: number }).roundIndex === 1);
+    const secondComplete = observations.find((event) => event.payload.phase === "provider-round-complete" && (event.payload.detail as { roundIndex?: number }).roundIndex === 2);
+
+    expect(firstStart?.payload.detail).toMatchObject({
+      roundIndex: 1,
+      messageCount: 1,
+      toolCount: 1,
+      toolNames: ["searchCustomer"],
+    });
+    expect((firstStart?.payload.detail as { estimatedTokens?: number }).estimatedTokens).toBeGreaterThan(0);
+    expect(firstComplete?.payload.detail).toMatchObject({
+      returnedToolCalls: true,
+      toolCallCount: 1,
+      toolCallNames: ["searchCustomer"],
+      finishReason: "tool_calls",
+    });
+    expect(secondComplete?.payload.detail).toMatchObject({
+      returnedToolCalls: false,
+      finishReason: "stop",
+    });
+    expect((secondComplete?.payload.detail as { firstTokenMs?: number }).firstTokenMs).not.toBeNull();
+  });
+
   it("continues allowing dependent tool calls after a tool result is returned", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(sseResponse([

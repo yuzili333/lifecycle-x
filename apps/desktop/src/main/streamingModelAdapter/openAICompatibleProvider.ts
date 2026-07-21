@@ -94,8 +94,10 @@ export class OpenAICompatibleProvider {
           }
           const data = trimmed.slice("data:".length).trim();
           if (data === "[DONE]") {
-            streamDone = true;
-            yield { type: "end", finishReason: "stop" };
+            if (!streamDone) {
+              streamDone = true;
+              yield { type: "end", finishReason: "stop" };
+            }
             continue;
           }
           const parsed = parseProviderChunk(data);

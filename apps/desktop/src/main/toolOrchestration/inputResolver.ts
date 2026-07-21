@@ -1,8 +1,121 @@
-import type { ResolvedToolInput, ToolCallRecord, ToolKind, ToolResultRegistry } from "./types";
+import type { ResolvedToolInput, SqlInputResolution, ToolCallRecord, ToolKind, ToolResultRegistry } from "./types";
 import { selectedPointerKey } from "./utils";
 
-export class ToolInputResolver {
+type SqlResolutionInput = {
+  conversationId: string;
+  userRequest: string;
+  explicitInputRefs?: string[];
+  selectedDataSourceAvailable?: boolean;
+  activeTableCount?: number;
+};
+
+export class SqlResultInputResolver {
   constructor(private readonly registry: ToolResultRegistry) {}
+
+  async resolve(input: SqlResolutionInput): Promise<SqlInputResolution> {
+    if (input.explicitInputRefs?.length) {
+      const explicit = await this.resolveExplicitSql(input.conversationId, input.explicitInputRefs);
+      if (explicit) {
+        return explicit;
+      }
+    }
+    const latest = await this.registry.getLatestSuccessful(input.conversationId, "sql_query");
+    if (latest?.status === "completed") {
+      return {
+        status: "resolved",
+        source: "conversation_history",
+        sqlToolCallId: latest.toolCallId,
+        datasetArtifactId: artifactIdsForRecord(latest)[0],
+      };
+    }
+    const lineage = await this.resolveSqlLineage(input.conversationId, input.explicitInputRefs ?? []);
+    if (lineage) {
+      return lineage;
+    }
+    if (input.selectedDataSourceAvailable) {
+      if ((input.activeTableCount ?? 1) > 1) {
+        return {
+          status: "requires_user_input",
+          source: "none",
+          issue: {
+            code: "ACTIVE_TABLE_REQUIRED",
+            message: "当前数据源包含多个数据表，请选择需要分析的数据表。",
+            recoverable: true,
+            suggestedAction: "select_table",
+          },
+        };
+      }
+      return {
+        status: "requires_sql_step",
+        source: "selected_data_source_fallback",
+        fallbackQueryRequest: {
+          userRequest: input.userRequest,
+          fullDataRange: true,
+          reason: "当前没有可复用 SQL 结果，已选择单一可用数据源，需自动补充活动表完整数据范围查询。",
+        },
+      };
+    }
+    return {
+      status: "requires_user_input",
+      source: "none",
+      issue: {
+        code: "DATA_SOURCE_NOT_SELECTED",
+        message: "当前没有可用于后续工具的 SQL 查询结果，也没有已选择的数据源。请先选择已连接数据库、已导入 CSV，或上传本地 CSV 文件。",
+        recoverable: true,
+        suggestedAction: "select_data_source",
+      },
+    };
+  }
+
+  private async resolveExplicitSql(conversationId: string, refs: string[]): Promise<SqlInputResolution | null> {
+    const records = await this.registry.listByConversation(conversationId);
+    const matched = records.find((record) =>
+      record.status === "completed" &&
+      record.toolKind === "sql_query" &&
+      (refs.includes(record.toolCallId) || artifactIdsForRecord(record).some((artifactId) => refs.includes(artifactId))));
+    if (!matched) {
+      return null;
+    }
+    return {
+      status: "resolved",
+      source: "explicit_artifact",
+      sqlToolCallId: matched.toolCallId,
+      datasetArtifactId: artifactIdsForRecord(matched)[0],
+    };
+  }
+
+  private async resolveSqlLineage(conversationId: string, refs: string[]): Promise<SqlInputResolution | null> {
+    if (refs.length === 0) {
+      return null;
+    }
+    const records = await this.registry.listByConversation(conversationId);
+    const matchedDownstream = records.find((record) =>
+      record.status === "completed" &&
+      record.toolKind !== "sql_query" &&
+      (refs.includes(record.toolCallId) || artifactIdsForRecord(record).some((artifactId) => refs.includes(artifactId))));
+    if (!matchedDownstream) {
+      return null;
+    }
+    const sqlParentId = matchedDownstream.parentToolCallIds?.find((toolCallId) => records.some((record) => record.toolCallId === toolCallId && record.toolKind === "sql_query" && record.status === "completed"));
+    const sqlParent = sqlParentId ? records.find((record) => record.toolCallId === sqlParentId) : null;
+    if (!sqlParent) {
+      return null;
+    }
+    return {
+      status: "resolved",
+      source: "artifact_lineage",
+      sqlToolCallId: sqlParent.toolCallId,
+      datasetArtifactId: artifactIdsForRecord(sqlParent)[0],
+    };
+  }
+}
+
+export class ToolInputResolver {
+  private readonly sqlResolver: SqlResultInputResolver;
+
+  constructor(private readonly registry: ToolResultRegistry) {
+    this.sqlResolver = new SqlResultInputResolver(registry);
+  }
 
   async resolve(input: { conversationId: string; toolKind: ToolKind; explicitInputRefs?: string[] }): Promise<ResolvedToolInput> {
     if (input.explicitInputRefs?.length) {
@@ -51,8 +164,12 @@ export class ToolInputResolver {
     }
     return {
       mode: "no_input",
-      reason: "当前没有可用工具结果；仅允许生成无数据报告模板，不得编造结果。",
+      reason: "当前没有可用 SQL、Python 或图表工具结果；报告工具不能编造数据或生成带数值的报告。",
     };
+  }
+
+  resolveSqlResult(input: SqlResolutionInput) {
+    return this.sqlResolver.resolve(input);
   }
 
   private async resolveExplicit(conversationId: string, toolKind: ToolKind, refs: string[]) {

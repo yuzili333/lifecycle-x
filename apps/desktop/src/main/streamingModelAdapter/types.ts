@@ -17,6 +17,7 @@ export type ModelStreamEventType =
   | "tool-execution-start"
   | "tool-execution-result"
   | "tool-execution-error"
+  | "model-observation"
   | "version-created"
   | "version-updated"
   | "stream-end"

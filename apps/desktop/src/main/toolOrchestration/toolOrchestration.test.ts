@@ -59,6 +59,14 @@ describe("tool orchestration", () => {
       .resolves.toMatchObject({ intents: [{ toolKind: "report_generation" }] });
     await expect(tools.detectIntent({ conversationId: "c1", userMessage: "请根据数据分析结果绘制各分行的合同总数占比的饼图。" }))
       .resolves.toMatchObject({ intents: [{ toolKind: "chart_rendering" }] });
+    await expect(tools.detectIntent({
+      conversationId: "c1",
+      userMessage: "根据 #客户所属国标行业名称字段的前缀“F51/F52”查询和区分“批发/零售业”的数据，根据查询结果分析 #最新风险五级分类 为“不良”和“关注”的占比率，绘制“批发业/零售业”的条形图表。",
+    })).resolves.toMatchObject({
+      intents: expect.arrayContaining([
+        expect.objectContaining({ toolKind: "chart_rendering" }),
+      ]),
+    });
 
     const combined = await tools.detectIntent({
       conversationId: "c1",
@@ -124,6 +132,70 @@ describe("tool orchestration", () => {
     expect(() => tools.validatePlan(fullPlan)).not.toThrow();
     expect(fullPlan.steps.map((item) => item.toolKind)).toEqual(["sql_query", "python_analysis", "chart_rendering", "report_generation"]);
     expect(fullPlan.steps[1].dependencies).toEqual([fullPlan.steps[0].stepId]);
+  });
+
+  it("enforces explicit chart goals and auto-adds SQL only when no reusable SQL exists", async () => {
+    const { tools } = moduleWithBridges();
+    for (const userMessage of ["绘制图表", "画一个柱状图", "可视化展示", "生成分布图", "画出变化趋势", "用折线图展示"]) {
+      const intent = await tools.detectIntent({ conversationId: "c-chart-hit", userMessage });
+      expect(intent.agentIntent?.explicitGoals.chart).toBe(true);
+      expect(intent.intents.some((item) => item.toolKind === "chart_rendering")).toBe(true);
+    }
+
+    const chartPlan = await tools.buildPlan({
+      conversationId: "c-chart-auto-sql",
+      userId: "u",
+      userMessage: "绘制数据分布图。",
+      selectedDataSourceAvailable: true,
+      activeTableCount: 1,
+    });
+    expect(chartPlan.steps.map((step) => step.toolKind)).toEqual(["sql_query", "chart_rendering"]);
+    expect(chartPlan.steps[0].inputResolution).toBe("auto_sql_fallback");
+    expect(chartPlan.steps[1].dependencies).toEqual([chartPlan.steps[0].stepId]);
+    expect(chartPlan.metrics).toMatchObject({
+      explicitChartRequested: true,
+      chartToolIncluded: true,
+      sqlDependencyAutoAdded: true,
+    });
+
+    await tools.executeSingleTool({ conversationId: "c-chart-auto-sql", userId: "u", userMessage: "查询合同明细", toolKind: "sql_query" });
+    const reusedSqlPlan = await tools.buildPlan({
+      conversationId: "c-chart-auto-sql",
+      userId: "u",
+      userMessage: "把刚才的结果绘制成柱状图。",
+      selectedDataSourceAvailable: true,
+      activeTableCount: 1,
+    });
+    expect(reusedSqlPlan.steps.map((step) => step.toolKind)).toEqual(["chart_rendering"]);
+    expect(reusedSqlPlan.metrics).toMatchObject({
+      sqlDependencyAutoAdded: false,
+      reusedExistingSqlResult: true,
+    });
+  });
+
+  it("validates explicit report and chart coverage and report depends on chart", async () => {
+    const { tools } = moduleWithBridges();
+    const missingSqlPlan = await tools.buildPlan({
+      conversationId: "c-chart-without-input",
+      userId: "u",
+      userMessage: "绘制风险分布图。",
+    });
+    expect(() => tools.validatePlan(missingSqlPlan)).toThrow("缺少可追溯 SQL 输入");
+
+    const plan = await tools.buildPlan({
+      conversationId: "c-chart-report",
+      userId: "u",
+      userMessage: "绘制风险分布图并生成报告。",
+      selectedDataSourceAvailable: true,
+      activeTableCount: 1,
+    });
+    expect(plan.requestType).toBe("compound");
+    expect(plan.requestedOutputs).toEqual(["chart", "report"]);
+    expect(plan.steps.map((step) => step.toolKind)).toEqual(["sql_query", "chart_rendering", "report_generation"]);
+    const chartStep = plan.steps.find((step) => step.toolKind === "chart_rendering")!;
+    const reportStep = plan.steps.find((step) => step.toolKind === "report_generation")!;
+    expect(reportStep.dependencies).toContain(chartStep.stepId);
+    expect(() => tools.validatePlan(plan)).not.toThrow();
   });
 
   it("uses existing artifacts before planning upstream tools", async () => {
@@ -243,6 +315,55 @@ describe("tool orchestration", () => {
     const selectedReportInput = await tools.resolveToolInput({ conversationId: "c4", toolKind: "report_generation" });
     expect(selectedReportInput.mode).toBe("selected_result");
     expect(selectedReportInput.sourceArtifactIds).toEqual(["python-artifact-v1", "sql-artifact-v1"]);
+  });
+
+  it("resolves SQL input priority and structured fallback issues", async () => {
+    const { tools } = moduleWithBridges();
+    await expect(tools.resolveSqlResultInput({
+      conversationId: "c-sql-input",
+      userRequest: "绘制数据分布图",
+    })).resolves.toMatchObject({
+      status: "requires_user_input",
+      source: "none",
+      issue: {
+        code: "DATA_SOURCE_NOT_SELECTED",
+        suggestedAction: "select_data_source",
+      },
+    });
+    await expect(tools.resolveSqlResultInput({
+      conversationId: "c-sql-input",
+      userRequest: "绘制数据分布图",
+      selectedDataSourceAvailable: true,
+      activeTableCount: 2,
+    })).resolves.toMatchObject({
+      status: "requires_user_input",
+      issue: {
+        code: "ACTIVE_TABLE_REQUIRED",
+        suggestedAction: "select_table",
+      },
+    });
+    await expect(tools.resolveSqlResultInput({
+      conversationId: "c-sql-input",
+      userRequest: "绘制数据分布图",
+      selectedDataSourceAvailable: true,
+      activeTableCount: 1,
+    })).resolves.toMatchObject({
+      status: "requires_sql_step",
+      source: "selected_data_source_fallback",
+      fallbackQueryRequest: {
+        fullDataRange: true,
+      },
+    });
+
+    await tools.executeSingleTool({ conversationId: "c-sql-input", userId: "u", userMessage: "查询合同明细", toolKind: "sql_query" });
+    await expect(tools.resolveSqlResultInput({
+      conversationId: "c-sql-input",
+      userRequest: "绘制数据分布图",
+    })).resolves.toMatchObject({
+      status: "resolved",
+      source: "conversation_history",
+      datasetArtifactId: "sql-artifact-v1",
+    });
   });
 
   it("executes SQL to Python to chart to report and records report artifacts", async () => {
@@ -372,6 +493,12 @@ describe("tool orchestration", () => {
     ]);
     expect(definitions.find((tool) => tool.name === "request_sql_query_execution")?.riskLevel).toBe("high");
     expect(definitions.every((tool) => tool.inputSchema.type === "object")).toBe(true);
+    const chartDefinition = definitions.find((tool) => tool.name === "request_chart_rendering");
+    expect(chartDefinition?.description).toContain("横向条形图");
+    expect(chartDefinition?.inputSchema.required).toEqual(expect.arrayContaining(["userRequest", "purpose"]));
+    expect(chartDefinition?.inputSchema.required).not.toContain("visualizationSpec");
+    expect(chartDefinition?.inputSchema.properties?.chartType?.description).toContain("horizontal_bar");
+    expect(chartDefinition?.inputSchema.properties?.visualizationSpec?.description).toContain("type=horizontal_bar");
   });
 
   it("persists tool state and artifacts across SQLite registry instances", async () => {
