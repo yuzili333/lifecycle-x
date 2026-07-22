@@ -18,6 +18,8 @@ const ECHARTS_TYPES: VisualizationType[] = [
   "horizontal_bar",
   "stacked_bar",
   "bar_line_combo",
+  "pie",
+  "donut",
   "scatter",
   "bubble",
   "heatmap",

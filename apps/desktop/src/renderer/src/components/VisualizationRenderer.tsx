@@ -1,7 +1,6 @@
 import { useMemo, type CSSProperties } from "react";
-import { Button } from "@astryxdesign/core/Button";
-import { HStack } from "@astryxdesign/core/Layout";
 import { Text } from "@astryxdesign/core/Text";
+import { useTheme } from "@astryxdesign/core/theme";
 import {
   createDefaultVisualizationRendererRegistry,
   DefaultVisualizationThemeResolver,
@@ -28,8 +27,10 @@ type StreamingVisualizationNodeProps = {
 
 type VisualizationRendererProps = {
   spec?: VisualizationSpec;
+  data?: ResolvedVisualizationData;
   error?: VisualizationRenderError;
   isStreaming?: boolean;
+  embedded?: boolean;
 };
 
 export function StreamingVisualizationNode({ visualizationId, state }: StreamingVisualizationNodeProps) {
@@ -42,14 +43,23 @@ export function StreamingVisualizationNode({ visualizationId, state }: Streaming
   return <VisualizationRenderer spec={state.spec} />;
 }
 
-export function VisualizationRenderer({ spec, error, isStreaming }: VisualizationRendererProps) {
+export function VisualizationRenderer({ spec, data: providedData, error, isStreaming, embedded = false }: VisualizationRendererProps) {
+  const astryxTheme = useTheme();
   const validation = useMemo(() => (spec ? validateVisualizationSpec(spec, { allowInlineData: true }) : undefined), [spec]);
-  const data = useMemo(() => (validation?.success ? resolveDisplayData(validation.spec) : undefined), [validation]);
+  const data = useMemo(() => providedData ?? (validation?.success ? resolveDisplayData(validation.spec) : undefined), [providedData, validation]);
   const route = useMemo(
     () => (validation?.success && data ? router.route(validation.spec, { rowCount: data.rowCount, columnCount: data.columns.length }) : undefined),
     [data, validation],
   );
-  const theme = useMemo(() => (validation?.success ? themeResolver.resolve(validation.spec) : neutralDarkVisualizationTheme), [validation]);
+  const theme = useMemo(
+    () => validation?.success
+      ? themeResolver.resolve(validation.spec, {
+          appearance: astryxTheme.mode,
+          tokens: /neutral/i.test(astryxTheme.name) ? astryxTheme.tokens : undefined,
+        })
+      : neutralDarkVisualizationTheme,
+    [astryxTheme.mode, astryxTheme.tokens, validation],
+  );
 
   if (isStreaming || !spec) {
     return <VisualizationSkeleton visualizationId={spec?.visualizationId} />;
@@ -66,22 +76,20 @@ export function VisualizationRenderer({ spec, error, isStreaming }: Visualizatio
 
   const warnings = [...(validation.warnings ?? []), ...(data.warnings ?? []), ...(route?.warnings ?? [])];
   return (
-    <section className="assistant-visualization" aria-label={validation.spec.title}>
+    <section className={`assistant-visualization${embedded ? " embedded" : ""}`} aria-label={`${visualizationTypeLabel(validation.spec.type)}：${validation.spec.title}`}>
       <div className="assistant-visualization-header">
         <div>
           <Text type="label" color="primary">{validation.spec.title}</Text>
           {validation.spec.subtitle && <Text type="body" color="secondary">{validation.spec.subtitle}</Text>}
         </div>
-        <span className="assistant-visualization-engine">{route?.engine ?? "fallback"}</span>
       </div>
       {validation.spec.description && <p className="assistant-visualization-description">{validation.spec.description}</p>}
       <VisualizationBody spec={validation.spec} data={data} engine={route?.engine ?? "fallback"} theme={theme} />
-      <div className="assistant-visualization-footer">
-        <span>来源：{data.artifactId ? `Artifact ${data.artifactId}` : validation.spec.provenance.sourceType}</span>
+      {(validation.spec.provenance.truncated || data.truncated || validation.spec.provenance.masked || data.masked) && <div className="assistant-visualization-footer">
         {validation.spec.provenance.truncated || data.truncated ? <span>已截断</span> : null}
         {validation.spec.provenance.masked || data.masked ? <span>已脱敏</span> : null}
-      </div>
-      {warnings.length > 0 && (
+      </div>}
+      {!embedded && validation.spec.display?.showWarnings !== false && warnings.length > 0 && (
         <details className="assistant-visualization-warnings">
           <summary>查看警告</summary>
           <ul>
@@ -94,8 +102,8 @@ export function VisualizationRenderer({ spec, error, isStreaming }: Visualizatio
 }
 
 function VisualizationBody({ spec, data, engine, theme }: { spec: VisualizationSpec; data: ResolvedVisualizationData; engine: string; theme: ResolvedVisualizationTheme }) {
-  if (data.rows?.length === 0) {
-    return <div className="assistant-visualization-empty">{spec.display?.emptyText ?? "暂无可视化数据。"}</div>;
+  if (!data.rows?.length) {
+    return <div className="assistant-visualization-empty">{spec.display?.emptyText ?? "当前图表没有可展示的数据。"}</div>;
   }
   if (spec.type === "kpi") {
     return <KpiView spec={spec} data={data} />;
@@ -108,6 +116,12 @@ function VisualizationBody({ spec, data, engine, theme }: { spec: VisualizationS
   }
   if (spec.type === "timeline" || engine === "vis_timeline") {
     return <TimelineView spec={spec} data={data} />;
+  }
+  if (spec.type === "pie" || spec.type === "donut") {
+    return <CircularChartView spec={spec} data={data} theme={theme} />;
+  }
+  if (spec.type === "horizontal_bar") {
+    return <HorizontalBarChartView spec={spec} data={data} theme={theme} />;
   }
   return <SvgChartView spec={spec} data={data} theme={theme} />;
 }
@@ -188,11 +202,11 @@ function SvgChartView({ spec, data, theme }: { spec: VisualizationSpec; data: Re
   const seriesPoints = seriesValues.map((values) => values.map((value, index) => {
     const x = xAxis.position(rows[index] ?? {}, index);
     if (!Number.isFinite(value)) {
-      return "";
+      return null;
     }
     const y = scaleValue(value, yDomain.min, yDomain.max, margin.top, plotHeight);
-    return `${round(x)},${round(y)}`;
-  }).filter(Boolean));
+    return { point: `${round(x)},${round(y)}`, rowIndex: index, value };
+  }).filter((point): point is { point: string; rowIndex: number; value: number } => Boolean(point)));
   const chartStyle = createChartStyle(theme);
   const isPointChart = spec.type === "scatter" || spec.type === "bubble";
 
@@ -247,11 +261,15 @@ function SvgChartView({ spec, data, theme }: { spec: VisualizationSpec; data: Re
           <>
             {seriesPoints.map((points, seriesIndex) => (
               <g key={yFields[seriesIndex] ?? seriesIndex} style={seriesStyle(seriesIndex)}>
-                {spec.type === "area" && seriesIndex === 0 && points.length > 0 && <polygon points={`${margin.left},${round(zeroY)} ${points.join(" ")} ${width - margin.right},${round(zeroY)}`} className="area" />}
-                <polyline points={points.join(" ")} className="line" />
-                {points.map((point, index) => {
+                {spec.type === "area" && seriesIndex === 0 && points.length > 0 && <polygon points={`${margin.left},${round(zeroY)} ${points.map(({ point }) => point).join(" ")} ${width - margin.right},${round(zeroY)}`} className="area" />}
+                <polyline points={points.map(({ point }) => point).join(" ")} className="line" />
+                {points.map(({ point, rowIndex, value }) => {
                   const [x, y] = point.split(",");
-                  return <circle key={index} cx={x} cy={y} r="3" />;
+                  return (
+                    <circle key={rowIndex} cx={x} cy={y} r="3">
+                      <title>{`${formatCell(rows[rowIndex]?.[xField ?? ""])} ${labelForMeasure(spec, yFields[seriesIndex] ?? "数值")}: ${formatCell(value)}`}</title>
+                    </circle>
+                  );
                 })}
               </g>
             ))}
@@ -277,21 +295,177 @@ function SvgChartView({ spec, data, theme }: { spec: VisualizationSpec; data: Re
           }))
         )}
       </svg>
+      <ChartLegend spec={spec} fields={yFields} />
+      <VisualizationDataSummary spec={spec} data={data} />
     </div>
+  );
+}
+
+function HorizontalBarChartView({ spec, data, theme }: { spec: VisualizationSpec; data: ResolvedVisualizationData; theme: ResolvedVisualizationTheme }) {
+  const rows = (data.rows ?? []).slice(0, 30);
+  const categoryField = spec.encoding?.category ?? spec.encoding?.x ?? data.columns[0]?.name;
+  const categoryLabels = rows.map((row) => formatCell(row[categoryField ?? ""]));
+  const valueFields = resolveYFields(spec, data, categoryField);
+  const values = valueFields.flatMap((field) => rows.map((row) => normalizeNumber(row[field], Number.NaN)));
+  const ticks = buildNumericTicks(values, 5, { includeZero: true });
+  const domain = domainFromTicks(ticks);
+  const width = 720;
+  const labelWidth = Math.max(...categoryLabels.map(estimatedLabelWidth), 0);
+  const margin = { top: 18, right: 60, bottom: 48, left: clamp(labelWidth + 20, 150, 320) };
+  const rowHeight = Math.max(28, valueFields.length * 18 + 14);
+  const height = Math.max(220, margin.top + margin.bottom + rows.length * rowHeight);
+  const plotWidth = width - margin.left - margin.right;
+  const zeroX = scaleContinuous(clamp(0, domain.min, domain.max), domain.min, domain.max, margin.left, plotWidth);
+  const barHeight = Math.max(8, Math.min(18, (rowHeight - 8) / Math.max(1, valueFields.length)));
+
+  return (
+    <div className="assistant-visualization-svg-wrap horizontal" style={createChartStyle(theme)}>
+      <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={spec.title}>
+        {ticks.map((tick) => {
+          const x = scaleContinuous(tick, domain.min, domain.max, margin.left, plotWidth);
+          return (
+            <g key={tick}>
+              <line x1={x} y1={margin.top} x2={x} y2={height - margin.bottom} className="grid-line" />
+              <text x={x} y={height - 20} textAnchor="middle" className="axis-tick-label">{formatAxisTick(tick)}</text>
+            </g>
+          );
+        })}
+        <line x1={zeroX} y1={margin.top} x2={zeroX} y2={height - margin.bottom} className="axis-line zero-line" />
+        {rows.flatMap((row, rowIndex) => {
+          const groupTop = margin.top + rowIndex * rowHeight;
+          const category = categoryLabels[rowIndex] ?? "--";
+          return [
+            <text key={`label-${rowIndex}`} x={margin.left - 12} y={groupTop + rowHeight / 2} textAnchor="end" dominantBaseline="middle" className="axis-tick-label full-label">
+              {category}
+            </text>,
+            ...valueFields.map((field, seriesIndex) => {
+              const value = normalizeNumber(row[field], Number.NaN);
+              if (!Number.isFinite(value)) {
+                return null;
+              }
+              const valueX = scaleContinuous(value, domain.min, domain.max, margin.left, plotWidth);
+              const x = Math.min(zeroX, valueX);
+              const y = groupTop + 5 + seriesIndex * (barHeight + 3);
+              return (
+                <g key={`${rowIndex}-${field}`} style={seriesStyle(seriesIndex)}>
+                  <rect x={x} y={y} width={Math.max(2, Math.abs(valueX - zeroX))} height={barHeight} rx="3" />
+                  <title>{`${category} ${labelForMeasure(spec, field)}: ${formatCell(value)}`}</title>
+                </g>
+              );
+            }),
+          ];
+        })}
+      </svg>
+      <ChartLegend spec={spec} fields={valueFields} />
+      <VisualizationDataSummary spec={spec} data={data} />
+    </div>
+  );
+}
+
+function CircularChartView({ spec, data, theme }: { spec: VisualizationSpec; data: ResolvedVisualizationData; theme: ResolvedVisualizationTheme }) {
+  const rows = data.rows ?? [];
+  const categoryField = spec.encoding?.category ?? spec.encoding?.x ?? data.columns[0]?.name;
+  const valueField = resolveYFields(spec, data, categoryField)[0];
+  const slices = rows
+    .map((row) => ({ label: formatCell(row[categoryField ?? ""]), value: Math.max(0, normalizeNumber(row[valueField ?? ""], 0)) }))
+    .filter((slice) => slice.value > 0);
+  const total = slices.reduce((sum, slice) => sum + slice.value, 0);
+  if (total <= 0) {
+    return <div className="assistant-visualization-empty">当前图表没有可展示的数据。</div>;
+  }
+  let angle = -90;
+  const width = 680;
+  const height = Math.max(260, spec.display?.height ?? 300);
+  const centerX = 250;
+  const centerY = height / 2;
+  const radius = Math.min(108, height / 2 - 28);
+  const innerRadius = spec.type === "donut" ? radius * 0.56 : 0;
+
+  return (
+    <div className="assistant-visualization-circular" style={createChartStyle(theme)}>
+      <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={spec.title}>
+        {slices.map((slice, index) => {
+          const sweep = (slice.value / total) * 360;
+          const end = angle + Math.min(sweep, 359.999);
+          const path = describeArc(centerX, centerY, radius, innerRadius, angle, end);
+          angle += sweep;
+          return (
+            <path key={`${slice.label}-${index}`} d={path} className="pie-slice" style={seriesStyle(index)}>
+              <title>{`${slice.label}: ${formatCell(slice.value)}（${formatPercentage(slice.value / total)}）`}</title>
+            </path>
+          );
+        })}
+        {spec.type === "donut" ? (
+          <g className="donut-center">
+            <text x={centerX} y={centerY - 5} textAnchor="middle" className="donut-value">{formatCompactNumber(total)}</text>
+            <text x={centerX} y={centerY + 18} textAnchor="middle" className="axis-tick-label">合计</text>
+          </g>
+        ) : null}
+      </svg>
+      <ul className="assistant-visualization-circular-legend" aria-label="图例">
+        {slices.map((slice, index) => (
+          <li key={`${slice.label}-${index}`} style={seriesStyle(index)}>
+            <span className="assistant-visualization-legend-swatch" />
+            <span>{slice.label}</span>
+            <strong>{formatPercentage(slice.value / total)}</strong>
+          </li>
+        ))}
+      </ul>
+      <VisualizationDataSummary spec={spec} data={data} />
+    </div>
+  );
+}
+
+function ChartLegend({ spec, fields }: { spec: VisualizationSpec; fields: string[] }) {
+  if (spec.interaction?.legend === false || fields.length <= 1) {
+    return null;
+  }
+  return (
+    <ul className="assistant-visualization-legend" aria-label="图例">
+      {fields.map((field, index) => (
+        <li key={field} style={seriesStyle(index)}>
+          <span className="assistant-visualization-legend-swatch" />
+          <span>{labelForMeasure(spec, field)}</span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function VisualizationDataSummary({ spec, data }: { spec: VisualizationSpec; data: ResolvedVisualizationData }) {
+  const rows = (data.rows ?? []).slice(0, 30);
+  const fields = uniqueStrings([
+    spec.encoding?.category ?? "",
+    spec.encoding?.x ?? "",
+    ...(spec.encoding?.y ?? []),
+    spec.encoding?.value ?? "",
+  ]).filter((field) => data.columns.some((column) => column.name === field));
+  if (rows.length === 0 || fields.length === 0) {
+    return null;
+  }
+  return (
+    <table className="assistant-visualization-a11y-table">
+      <caption>{spec.title}数据摘要</caption>
+      <thead><tr>{fields.map((field) => <th key={field}>{labelForField(spec, field)}</th>)}</tr></thead>
+      <tbody>
+        {rows.map((row, index) => <tr key={index}>{fields.map((field) => <td key={field}>{formatCell(row[field])}</td>)}</tr>)}
+      </tbody>
+    </table>
   );
 }
 
 function createChartStyle(theme: ResolvedVisualizationTheme) {
   return {
-    "--viz-series-0": `var(--color-accent-primary, var(--color-icon-blue, ${theme.colors.primary[0]}))`,
-    "--viz-series-1": `var(--color-accent-success, var(--color-icon-teal, ${theme.colors.primary[1]}))`,
-    "--viz-series-2": `var(--color-accent-info, var(--color-icon-purple, ${theme.colors.primary[2]}))`,
-    "--viz-series-3": `var(--color-accent-warning, var(--color-icon-orange, ${theme.colors.primary[3]}))`,
-    "--viz-series-4": `var(--color-accent-danger, var(--color-icon-green, ${theme.colors.primary[4]}))`,
-    "--viz-axis": `var(--color-text-secondary, ${theme.colors.textSecondary})`,
-    "--viz-grid": `var(--color-border, ${theme.colors.border})`,
-    "--viz-text": `var(--color-text-primary, ${theme.colors.textPrimary})`,
-    "--viz-surface": `var(--color-background-surface, ${theme.colors.neutral[1]})`,
+    "--viz-series-0": theme.colors.primary[0],
+    "--viz-series-1": theme.colors.primary[1],
+    "--viz-series-2": theme.colors.primary[2],
+    "--viz-series-3": theme.colors.primary[3],
+    "--viz-series-4": theme.colors.primary[4],
+    "--viz-axis": theme.colors.textSecondary,
+    "--viz-grid": theme.colors.border,
+    "--viz-text": theme.colors.textPrimary,
+    "--viz-surface": theme.colors.neutral[1],
+    "--viz-font": theme.typography.fontFamily,
   } as CSSProperties;
 }
 
@@ -488,6 +662,10 @@ function normalizeNumber(value: unknown, fallback = 0) {
   return fallback;
 }
 
+function estimatedLabelWidth(value: string) {
+  return Array.from(value).reduce((width, character) => width + (/[^\u0000-\u00ff]/.test(character) ? 12 : 7), 0);
+}
+
 function normalizeTime(value: unknown, fallback = 0) {
   if (value instanceof Date) {
     return value.getTime();
@@ -517,6 +695,12 @@ function formatTimeTick(value: number, span: number) {
 
 function labelForMeasure(spec: VisualizationSpec, field: string) {
   return spec.measures?.find((measure: VisualizationMeasure) => measure.field === field)?.label ?? field;
+}
+
+function labelForField(spec: VisualizationSpec, field: string) {
+  return spec.measures?.find((measure) => measure.field === field)?.label
+    ?? spec.dimensions?.find((dimension) => dimension.field === field)?.label
+    ?? field;
 }
 
 function seriesStyle(index: number) {
@@ -555,7 +739,7 @@ function TimelineView({ spec, data }: { spec: VisualizationSpec; data: ResolvedV
   );
 }
 
-function VisualizationSkeleton({ visualizationId }: { visualizationId?: string }) {
+function VisualizationSkeleton(_props: { visualizationId?: string }) {
   return (
     <section className="assistant-visualization skeleton" aria-label="图表加载中">
       <div className="assistant-visualization-header">
@@ -563,21 +747,15 @@ function VisualizationSkeleton({ visualizationId }: { visualizationId?: string }
         <div className="assistant-skeleton-line chip" />
       </div>
       <div className="assistant-skeleton-chart" />
-      {visualizationId && <span className="assistant-visualization-id">{visualizationId}</span>}
     </section>
   );
 }
 
-function VisualizationErrorView({ error, visualizationId }: { error?: VisualizationRenderError; visualizationId?: string }) {
+function VisualizationErrorView({ error }: { error?: VisualizationRenderError; visualizationId?: string }) {
   return (
     <section className="assistant-visualization error" aria-label="图表错误">
-      <Text type="label" color="primary">可视化配置无法解析</Text>
-      <p>{error?.message ?? "图表渲染失败，已降级显示。"}</p>
-      <HStack gap={2} wrap="wrap">
-        {visualizationId && <span className="assistant-visualization-id">{visualizationId}</span>}
-        {error?.traceId && <span className="assistant-visualization-id">Trace: {error.traceId}</span>}
-        <Button label="保留消息继续阅读" variant="secondary" size="sm" isDisabled />
-      </HStack>
+      <Text type="label" color="primary">图表暂时无法显示</Text>
+      <p>{error ? "图表配置或数据无法解析，其他内容仍可正常查看。" : "图表渲染失败，其他内容仍可正常查看。"}</p>
     </section>
   );
 }
@@ -635,6 +813,54 @@ function formatAxisNumber(value: number) {
     maximumFractionDigits: 2,
     useGrouping: Math.abs(value) >= 10_000,
   }).format(value);
+}
+
+function formatPercentage(value: number) {
+  return new Intl.NumberFormat("zh-CN", { style: "percent", maximumFractionDigits: 2 }).format(value);
+}
+
+function describeArc(cx: number, cy: number, outerRadius: number, innerRadius: number, startAngle: number, endAngle: number) {
+  const outerStart = polarPoint(cx, cy, outerRadius, startAngle);
+  const outerEnd = polarPoint(cx, cy, outerRadius, endAngle);
+  const largeArc = endAngle - startAngle > 180 ? 1 : 0;
+  if (innerRadius <= 0) {
+    return [
+      `M ${cx} ${cy}`,
+      `L ${outerStart.x} ${outerStart.y}`,
+      `A ${outerRadius} ${outerRadius} 0 ${largeArc} 1 ${outerEnd.x} ${outerEnd.y}`,
+      "Z",
+    ].join(" ");
+  }
+  const innerEnd = polarPoint(cx, cy, innerRadius, endAngle);
+  const innerStart = polarPoint(cx, cy, innerRadius, startAngle);
+  return [
+    `M ${outerStart.x} ${outerStart.y}`,
+    `A ${outerRadius} ${outerRadius} 0 ${largeArc} 1 ${outerEnd.x} ${outerEnd.y}`,
+    `L ${innerEnd.x} ${innerEnd.y}`,
+    `A ${innerRadius} ${innerRadius} 0 ${largeArc} 0 ${innerStart.x} ${innerStart.y}`,
+    "Z",
+  ].join(" ");
+}
+
+function polarPoint(cx: number, cy: number, radius: number, angle: number) {
+  const radians = (angle * Math.PI) / 180;
+  return {
+    x: round(cx + Math.cos(radians) * radius),
+    y: round(cy + Math.sin(radians) * radius),
+  };
+}
+
+function visualizationTypeLabel(type: VisualizationSpec["type"]) {
+  if (type === "horizontal_bar") return "横向柱状图";
+  if (type === "bar" || type === "stacked_bar") return "柱状图";
+  if (type === "line") return "折线图";
+  if (type === "area") return "面积图";
+  if (type === "pie") return "饼图";
+  if (type === "donut") return "环形图";
+  if (type === "scatter" || type === "bubble") return "散点图";
+  if (type === "table") return "数据表";
+  if (type === "kpi") return "指标";
+  return "图表";
 }
 
 function bubbleRadius(value: number, values: number[]) {

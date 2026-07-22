@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   DefaultVisualizationRendererRegistry,
+  DefaultVisualizationThemeResolver,
   StreamVisualizationAssembler,
   VisualizationRouter,
   createDefaultVisualizationRendererRegistry,
@@ -11,6 +12,7 @@ import {
   createTableRendererAdapter,
   createTimelineRendererAdapter,
   neutralDarkVisualizationTheme,
+  neutralLightVisualizationTheme,
   transformToControlledEChartsOption,
   transformToNetworkPayload,
   transformToTimelinePayload,
@@ -65,16 +67,18 @@ const resolvedData: ResolvedVisualizationData = {
 };
 
 describe("Visualization validator", () => {
-  it("accepts legal line, KPI, network and timeline specs", () => {
+  it("accepts legal line, KPI, circular, network and timeline specs", () => {
     expect(validateVisualizationSpec(baseSpec()).success).toBe(true);
     expect(validateVisualizationSpec(baseSpec({ type: "kpi", measures: [{ field: "balance", dataType: "currency", role: "value" }], encoding: { value: "balance" } })).success).toBe(true);
+    expect(validateVisualizationSpec(baseSpec({ type: "pie" })).success).toBe(true);
+    expect(validateVisualizationSpec(baseSpec({ type: "donut" })).success).toBe(true);
     expect(validateVisualizationSpec(baseSpec({ type: "network", businessSemantic: "guarantee_relationship", encoding: { source: "source", target: "target" }, dimensions: [{ field: "source", dataType: "identifier" }, { field: "target", dataType: "identifier" }] })).success).toBe(true);
     expect(validateVisualizationSpec(baseSpec({ type: "timeline", businessSemantic: "lifecycle_event_chain", encoding: { startTime: "startTime", category: "title" }, dimensions: [{ field: "startTime", dataType: "time" }, { field: "title", dataType: "category" }] })).success).toBe(true);
   });
 
   it("rejects missing artifact id, bad type, missing fields and unsafe values", () => {
     expect(validateVisualizationSpec(baseSpec({ data: { mode: "artifact", artifactId: "" } as VisualizationSpec["data"] })).success).toBe(false);
-    expect(validateVisualizationSpec({ ...baseSpec(), type: "pie" }).success).toBe(false);
+    expect(validateVisualizationSpec({ ...baseSpec(), type: "radar" }).success).toBe(false);
     expect(validateVisualizationSpec(baseSpec({ encoding: { x: "missing", y: ["balance"] } })).success).toBe(false);
     expect(validateVisualizationSpec(baseSpec({ type: "network", encoding: { source: "source" } })).success).toBe(false);
     expect(validateVisualizationSpec(baseSpec({ type: "timeline", encoding: { category: "title" } })).success).toBe(false);
@@ -144,6 +148,36 @@ describe("Visualization renderer adapters", () => {
     expect(createKpiRendererAdapter().canRender({ spec: baseSpec({ type: "kpi" }) })).toBe(true);
     expect(createNetworkRendererAdapter().canRender({ spec: baseSpec({ type: "network", businessSemantic: "related_enterprise_risk" }) })).toBe(true);
     expect(createTimelineRendererAdapter().canRender({ spec: baseSpec({ type: "timeline", businessSemantic: "lifecycle_event_chain" }) })).toBe(true);
+  });
+
+  it("maps Astryx neutral tokens to light and dark chart options", () => {
+    const light = transformToControlledEChartsOption(baseSpec({ type: "bar" }), resolvedData, neutralLightVisualizationTheme);
+    const dark = transformToControlledEChartsOption(baseSpec({ type: "donut" }), resolvedData, neutralDarkVisualizationTheme);
+
+    expect(neutralLightVisualizationTheme.name).toBe("astryx-neutral");
+    expect(neutralDarkVisualizationTheme.name).toBe("astryx-neutral");
+    expect(neutralLightVisualizationTheme.mode).toBe("light");
+    expect(neutralDarkVisualizationTheme.mode).toBe("dark");
+    expect(neutralLightVisualizationTheme.colors.background).not.toBe(neutralDarkVisualizationTheme.colors.background);
+    expect(light.tooltip).toMatchObject({
+      backgroundColor: neutralLightVisualizationTheme.colors.background,
+      borderColor: neutralLightVisualizationTheme.colors.border,
+    });
+    expect(dark.legend).toMatchObject({ textStyle: { color: neutralDarkVisualizationTheme.colors.textSecondary } });
+    expect(JSON.stringify(dark)).not.toContain("gradient");
+  });
+
+  it("resolves system appearance without changing the visualization artifact", () => {
+    const resolver = new DefaultVisualizationThemeResolver();
+    const spec = baseSpec({ theme: { palette: "neutral", mode: "system" } });
+    const originalSpec = JSON.stringify(spec);
+    const light = resolver.resolve(spec, { appearance: "light" });
+    const dark = resolver.resolve(spec, { appearance: "dark" });
+
+    expect(light.mode).toBe("light");
+    expect(dark.mode).toBe("dark");
+    expect(light.colors.background).not.toBe(dark.colors.background);
+    expect(JSON.stringify(spec)).toBe(originalSpec);
   });
 });
 

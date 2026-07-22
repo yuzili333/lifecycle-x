@@ -279,18 +279,32 @@ describe("StreamingModelAdapter", () => {
       toolCount: 1,
       toolNames: ["searchCustomer"],
     });
-    expect((firstStart?.payload.detail as { estimatedTokens?: number }).estimatedTokens).toBeGreaterThan(0);
+    const firstStartDetail = firstStart?.payload.detail as {
+      estimatedTokens?: number;
+      messageContentChars?: number;
+      messageContextChars?: number;
+      totalContextChars?: number;
+    };
+    expect(firstStartDetail.estimatedTokens).toBeGreaterThan(0);
+    expect(firstStartDetail.messageContextChars).toBeGreaterThan(firstStartDetail.messageContentChars ?? 0);
+    expect(firstStartDetail.totalContextChars).toBeGreaterThan(firstStartDetail.messageContextChars ?? 0);
+    expect(JSON.stringify(firstStartDetail)).not.toContain("分析客户 A");
     expect(firstComplete?.payload.detail).toMatchObject({
+      messageCount: 1,
+      toolNames: ["searchCustomer"],
       returnedToolCalls: true,
       toolCallCount: 1,
       toolCallNames: ["searchCustomer"],
       finishReason: "tool_calls",
     });
+    expect((firstComplete?.payload.detail as { firstTokenMs?: number | null }).firstTokenMs).not.toBeNull();
     expect(secondComplete?.payload.detail).toMatchObject({
+      messageCount: 3,
+      toolNames: ["searchCustomer"],
       returnedToolCalls: false,
       finishReason: "stop",
     });
-    expect((secondComplete?.payload.detail as { firstTokenMs?: number }).firstTokenMs).not.toBeNull();
+    expect((secondComplete?.payload.detail as { firstContentTokenMs?: number | null }).firstContentTokenMs).not.toBeNull();
   });
 
   it("continues allowing dependent tool calls after a tool result is returned", async () => {
@@ -351,6 +365,13 @@ describe("StreamingModelAdapter", () => {
 
     const events = await collect(adapter.streamChat(baseInput()));
 
+    const observation = events.find((event) => event.type === "model-observation" && event.payload.phase === "provider-round-error");
+    expect(observation?.payload.detail).toMatchObject({
+      messageCount: 1,
+      toolCount: 0,
+      returnedToolCalls: false,
+      finishReason: "error",
+    });
     expect(events.some((event) => event.type === "stream-error" && (event.payload.error as { code: string }).code === "PROVIDER_STREAM_PARSE_FAILED")).toBe(true);
   });
 

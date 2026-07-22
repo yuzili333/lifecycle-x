@@ -55,7 +55,7 @@ describe("VisualizationRenderer", () => {
     expect(html).not.toContain("specVersion");
   });
 
-  it("renders artifact references as controlled source state", () => {
+  it("does not expose artifact identifiers while data resolution is pending", () => {
     const html = renderToString(
       <VisualizationRenderer
         spec={kpiSpec({
@@ -65,15 +65,16 @@ describe("VisualizationRenderer", () => {
       />,
     );
 
-    expect(html).toContain("Artifact workflow-dataset:dataset-1");
+    expect(html).toContain("当前图表没有可展示的数据");
     expect(html).toContain("已截断");
+    expect(html).not.toContain("workflow-dataset:dataset-1");
     expect(html).not.toContain("/Users/");
   });
 
   it("renders validation errors as fallback UI", () => {
     const html = renderToString(<VisualizationRenderer spec={{ ...kpiSpec(), type: "network", encoding: { source: "from" } } as VisualizationSpec} />);
 
-    expect(html).toContain("可视化配置无法解析");
+    expect(html).toContain("图表暂时无法显示");
     expect(html).not.toContain("from");
   });
 
@@ -85,9 +86,9 @@ describe("VisualizationRenderer", () => {
     expect(html).toContain("杭州分行");
     expect(html).toContain("风险数量");
     expect(html).toContain("--viz-series-0");
-    expect(html).toContain("--color-accent-primary");
-    expect(html).toContain("--color-icon-blue");
-    expect(html).toContain("--color-icon-teal");
+    expect(html).not.toContain("--color-icon-blue");
+    expect(html).not.toContain("--color-icon-teal");
+    expect(html).toContain("数据摘要");
   });
 
   it("derives continuous axis ranges from rendered data", () => {
@@ -149,7 +150,17 @@ describe("VisualizationRenderer", () => {
     expect(html).toContain("01/03");
     expect(html).toContain("101");
     expect(html).toContain("112");
+    expect(html).toContain("2026-01-01 指标值: 101");
     expect(html).not.toContain(">0</text>");
+  });
+
+  it("renders area charts with the shared neutral series style", () => {
+    const html = renderToString(<VisualizationRenderer spec={barSpec({ type: "area" })} />);
+
+    expect(html).toContain("面积图：分行风险数量");
+    expect(html).toContain('class="area"');
+    expect(html).toContain("--viz-series-0");
+    expect(html).not.toContain("gradient");
   });
 
   it("renders two-dimensional point charts with data-derived x and y ticks", () => {
@@ -183,5 +194,33 @@ describe("VisualizationRenderer", () => {
     expect(html).toContain(">0.41</text>");
     expect(html).toContain("class=\"point\"");
     expect(html).not.toContain(">0</text>");
+  });
+
+  it("renders horizontal bars with complete category labels", () => {
+    const longLabel = "华东地区制造业及批发零售业务综合管理分行";
+    const html = renderToString(<VisualizationRenderer spec={barSpec({
+      type: "horizontal_bar",
+      data: {
+        mode: "inline",
+        trusted: true,
+        rowCount: 2,
+        rows: [{ branch: longLabel, count: 120 }, { branch: "宁波分行", count: 80 }],
+      },
+    })} />);
+
+    expect(html).toContain("横向柱状图：分行风险数量");
+    expect(html).toContain("full-label");
+    expect(html).toContain(longLabel);
+    expect(html).toContain("宁波分行");
+  });
+
+  it.each(["pie", "donut"] as const)("renders %s charts with neutral controlled series and textual legend", (type) => {
+    const html = renderToString(<VisualizationRenderer spec={barSpec({ type })} />);
+
+    expect(html).toContain(type === "pie" ? "饼图：分行风险数量" : "环形图：分行风险数量");
+    expect(html).toContain("pie-slice");
+    expect(html).toContain("assistant-visualization-circular-legend");
+    expect(html).toContain("杭州分行");
+    expect(html).not.toContain("Artifact");
   });
 });

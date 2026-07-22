@@ -4065,6 +4065,10 @@ export function DataAssistantWorkspace({
                         markdown={activeArtifactContent.markdown}
                         components={markdownComponents}
                         className="assistant-artifact-markdown"
+                        userId={user?.id}
+                        conversationId={activeArtifactMessage.conversationId}
+                        reportArtifactId={activeArtifactId}
+                        reportVersion={activeArtifactReportRecord?.version}
                       />
                     )}
                   </VStack>
@@ -4073,6 +4077,10 @@ export function DataAssistantWorkspace({
                     markdown={activeArtifactContent?.markdown ?? activeArtifactMessage.content}
                     components={markdownComponents}
                     className="assistant-artifact-markdown"
+                    userId={user?.id}
+                    conversationId={activeArtifactMessage.conversationId}
+                    reportArtifactId={activeArtifactId}
+                    reportVersion={activeArtifactReportRecord?.version}
                   />
                 )}
               </Section>

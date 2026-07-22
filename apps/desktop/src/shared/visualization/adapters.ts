@@ -15,6 +15,8 @@ const ECHARTS_TYPES: VisualizationType[] = [
   "horizontal_bar",
   "stacked_bar",
   "bar_line_combo",
+  "pie",
+  "donut",
   "scatter",
   "bubble",
   "heatmap",
@@ -66,6 +68,8 @@ export function createFallbackRendererAdapter(): VisualizationRendererAdapter {
       "horizontal_bar",
       "stacked_bar",
       "bar_line_combo",
+      "pie",
+      "donut",
       "scatter",
       "bubble",
       "heatmap",
@@ -133,19 +137,52 @@ function basePayload(
 export function transformToControlledEChartsOption(spec: VisualizationSpec, data: ResolvedVisualizationData, theme: ResolvedVisualizationTheme) {
   const xField = spec.encoding?.x ?? spec.encoding?.category ?? data.columns[0]?.name;
   const yFields = spec.encoding?.y?.length ? spec.encoding.y : spec.measures?.map((measure) => measure.field) ?? [spec.encoding?.value].filter(Boolean) as string[];
+  const isCircular = spec.type === "pie" || spec.type === "donut";
   return {
+    backgroundColor: "transparent",
     color: theme.colors.primary,
-    tooltip: { show: spec.interaction?.tooltip ?? true },
-    legend: { show: spec.interaction?.legend ?? yFields.length > 1 },
+    textStyle: { color: theme.colors.textPrimary, fontFamily: theme.typography.fontFamily },
+    tooltip: {
+      show: spec.interaction?.tooltip ?? true,
+      backgroundColor: theme.colors.background,
+      borderColor: theme.colors.border,
+      textStyle: { color: theme.colors.textPrimary },
+    },
+    legend: {
+      show: spec.interaction?.legend ?? (yFields.length > 1 || isCircular),
+      textStyle: { color: theme.colors.textSecondary },
+    },
     dataset: { source: data.rows ?? [] },
-    xAxis: { type: "category", field: xField },
-    yAxis: spec.type === "bar_line_combo" ? [{ type: "value" }, { type: "value" }] : { type: "value" },
-    series: yFields.map((field, index) => ({
+    xAxis: isCircular ? undefined : {
+      type: spec.type === "horizontal_bar" ? "value" : "category",
+      field: spec.type === "horizontal_bar" ? undefined : xField,
+      axisLine: { lineStyle: { color: theme.colors.border } },
+      axisLabel: { color: theme.colors.textSecondary },
+      splitLine: { lineStyle: { color: theme.colors.border } },
+    },
+    yAxis: isCircular ? undefined : spec.type === "bar_line_combo"
+      ? [{ type: "value" }, { type: "value" }]
+      : {
+          type: spec.type === "horizontal_bar" ? "category" : "value",
+          field: spec.type === "horizontal_bar" ? xField : undefined,
+          axisLine: { lineStyle: { color: theme.colors.border } },
+          axisLabel: { color: theme.colors.textSecondary },
+          splitLine: { lineStyle: { color: theme.colors.border } },
+        },
+    series: isCircular ? [{
+      name: labelForField(spec, yFields[0] ?? "value"),
+      type: "pie",
+      radius: spec.type === "donut" ? ["48%", "72%"] : "72%",
+      encode: { itemName: xField, value: yFields[0] },
+      itemStyle: { borderColor: theme.colors.background, borderWidth: 1 },
+      label: { color: theme.colors.textSecondary },
+    }] : yFields.map((field, index) => ({
       name: labelForField(spec, field),
       type: seriesTypeFor(spec.type, index),
-      encode: { x: xField, y: field },
+      encode: spec.type === "horizontal_bar" ? { x: field, y: xField } : { x: xField, y: field },
       stack: spec.type === "stacked_bar" ? "total" : undefined,
       yAxisIndex: spec.type === "bar_line_combo" && index > 0 ? 1 : 0,
+      itemStyle: { borderRadius: 3 },
     })),
   };
 }

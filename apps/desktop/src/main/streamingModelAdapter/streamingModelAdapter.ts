@@ -171,9 +171,11 @@ export class StreamingModelAdapter {
     const endedToolCalls = new Set<string>();
     const startedToolCalls = new Set<string>();
     const tools = allowTools ? this.toolRegistry.getTools() : undefined;
+    const requestSummary = summarizeModelRequest(messages, tools);
     const requestedAtMs = Date.now();
     let firstModelEventMs: number | null = null;
     let firstTokenMs: number | null = null;
+    let firstContentTokenMs: number | null = null;
     let firstToolCallMs: number | null = null;
     let contentDeltaChars = 0;
     let finishReason: string | undefined;
@@ -183,7 +185,7 @@ export class StreamingModelAdapter {
       allowTools,
       model: input.model ?? this.config.model,
       timeoutMs: input.timeoutMs ?? this.config.timeoutMs,
-      ...summarizeModelRequest(messages, tools),
+      ...requestSummary,
     });
 
     try {
@@ -199,6 +201,7 @@ export class StreamingModelAdapter {
         firstModelEventMs ??= Date.now() - requestedAtMs;
         if (providerEvent.type === "content-delta") {
           firstTokenMs ??= Date.now() - requestedAtMs;
+          firstContentTokenMs ??= Date.now() - requestedAtMs;
           contentDeltaChars += providerEvent.delta.length;
           onContent(providerEvent.delta);
           yield this.event(input, input.contentType === "text" ? "text-delta" : "markdown-delta", { delta: providerEvent.delta }, traceId);
@@ -207,6 +210,7 @@ export class StreamingModelAdapter {
             yield this.markdownParserEvent(input, parserEvent, traceId);
           }
         } else if (providerEvent.type === "tool-call-delta") {
+          firstTokenMs ??= Date.now() - requestedAtMs;
           firstToolCallMs ??= Date.now() - requestedAtMs;
           const toolCall = aggregateToolCallDelta(toolCalls, providerEvent.delta);
           const isFirstDelta = !startedToolCalls.has(toolCall.toolCallId);
@@ -231,15 +235,17 @@ export class StreamingModelAdapter {
       yield this.modelObservationEvent(input, traceId, "provider-round-error", "error", "模型请求异常。", {
         roundIndex,
         allowTools,
+        ...requestSummary,
         durationMs: Date.now() - requestedAtMs,
         firstModelEventMs,
         firstTokenMs,
+        firstContentTokenMs,
         firstToolCallMs,
         returnedToolCalls: toolCalls.size > 0,
         toolCallCount: toolCalls.size,
         toolCallNames: Array.from(toolCalls.values()).map((toolCall) => toolCall.name).filter(Boolean),
         contentDeltaChars,
-        finishReason,
+        finishReason: finishReason ?? "error",
         error: adapterError.serialize(),
       });
       throw error;
@@ -254,9 +260,11 @@ export class StreamingModelAdapter {
     yield this.modelObservationEvent(input, traceId, "provider-round-complete", "success", "模型请求完成。", {
       roundIndex,
       allowTools,
+      ...requestSummary,
       durationMs: Date.now() - requestedAtMs,
       firstModelEventMs,
       firstTokenMs,
+      firstContentTokenMs,
       firstToolCallMs,
       returnedToolCalls: toolCalls.size > 0,
       toolCallCount: toolCalls.size,
@@ -432,23 +440,41 @@ function summarizeModelRequest(messages: ConversationMessage[], tools: ToolDefin
   }, {});
   const messageContentChars = messages.reduce((sum, message) => sum + message.content.length, 0);
   const maxMessageChars = messages.reduce((max, message) => Math.max(max, message.content.length), 0);
-  const toolDefinitionChars = tools?.reduce((sum, tool) => sum + tool.name.length + tool.description.length + JSON.stringify(tool.inputSchema).length, 0) ?? 0;
-  const totalContextChars = messageContentChars + toolDefinitionChars;
+  const serializedMessages = JSON.stringify(messages.map((message) => ({
+    role: message.role,
+    content: message.content,
+    ...(message.toolCallId ? { toolCallId: message.toolCallId } : {}),
+    ...(message.toolName ? { toolName: message.toolName } : {}),
+    ...(message.toolCalls?.length ? { toolCalls: message.toolCalls } : {}),
+  })));
+  const serializedTools = JSON.stringify((tools ?? []).map((tool) => ({
+    name: tool.name,
+    description: tool.description,
+    inputSchema: tool.inputSchema,
+  })));
+  const messageContextChars = serializedMessages.length;
+  const toolDefinitionChars = serializedTools.length;
+  const totalContextChars = messageContextChars + toolDefinitionChars;
   return {
     messageCount: messages.length,
     messageContentChars,
+    messageContextChars,
     maxMessageChars,
     messageRoleStats,
     toolCount: tools?.length ?? 0,
     toolNames: tools?.map((tool) => tool.name) ?? [],
     toolDefinitionChars,
     totalContextChars,
-    estimatedTokens: estimateTokens(totalContextChars),
+    estimatedTokens: estimateTokens(`${serializedMessages}${serializedTools}`),
   };
 }
 
-function estimateTokens(chars: number) {
-  return Math.ceil(chars / 4);
+function estimateTokens(value: string) {
+  if (!value) {
+    return 0;
+  }
+  const cjkChars = value.match(/[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]/g)?.length ?? 0;
+  return Math.ceil(cjkChars + (value.length - cjkChars) / 4);
 }
 
 function toolCallsAssistantMessage(input: StreamChatInput, toolCalls: AggregatedToolCall[]): ConversationMessage {

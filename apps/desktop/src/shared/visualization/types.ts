@@ -6,6 +6,8 @@ export const visualizationTypes = [
   "horizontal_bar",
   "stacked_bar",
   "bar_line_combo",
+  "pie",
+  "donut",
   "scatter",
   "bubble",
   "heatmap",
@@ -352,7 +354,58 @@ export type ResolvedVisualizationTheme = {
 };
 
 export type VisualizationThemeResolver = {
-  resolve(spec: VisualizationSpec): ResolvedVisualizationTheme;
+  resolve(
+    spec: VisualizationSpec,
+    context?: {
+      appearance?: "light" | "dark";
+      tokens?: Record<string, string>;
+    },
+  ): ResolvedVisualizationTheme;
+};
+
+export type ReportVisualizationErrorCode =
+  | "VISUALIZATION_NODE_INVALID"
+  | "VISUALIZATION_ARTIFACT_NOT_FOUND"
+  | "VISUALIZATION_ARTIFACT_EXPIRED"
+  | "VISUALIZATION_ARTIFACT_PERMISSION_DENIED"
+  | "VISUALIZATION_SPEC_INVALID"
+  | "VISUALIZATION_DATA_EMPTY"
+  | "VISUALIZATION_RENDER_FAILED"
+  | "CHART_THEME_RESOLVE_FAILED"
+  | "UNKNOWN_ERROR";
+
+export type ParsedReportVisualizationNode = {
+  type: "visualization";
+  nodeId: string;
+  key: string;
+  artifactId?: string;
+  title?: string;
+  description?: string;
+  errorCode?: "VISUALIZATION_NODE_INVALID";
+  position: {
+    startLine: number;
+    endLine: number;
+  };
+};
+
+export type ReportMarkdownSegment =
+  | {
+      type: "markdown";
+      key: string;
+      markdown: string;
+    }
+  | ParsedReportVisualizationNode;
+
+export type ResolvedReportVisualizationArtifact = {
+  artifactId: string;
+  version: number;
+  status: "ready";
+  visualizationSpec: VisualizationSpec;
+  data: ResolvedVisualizationData;
+  title?: string;
+  description?: string;
+  sourceArtifactIds: string[];
+  createdAt: string;
 };
 
 export type VisualizationRendererValidationResult = {

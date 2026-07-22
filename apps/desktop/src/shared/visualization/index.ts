@@ -3,6 +3,7 @@ export * from "./assembler";
 export * from "./businessChartRules";
 export * from "./module";
 export * from "./router";
+export * from "./reportMarkdown";
 export * from "./schema";
 export * from "./theme";
 export * from "./types";

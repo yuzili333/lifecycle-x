@@ -19,7 +19,8 @@ import {
   type WorkflowStateStore,
 } from "./workflowRuntime";
 import { rewriteCompoundOrderByForSqlite } from "./sqliteSqlRewrite";
-import { parseVisualizationSpecJson, visualizationTypes, type VisualizationRenderError, type VisualizationSpec } from "../shared/visualization";
+import { parseVisualizationSpecJson, reportVisualizationArtifactIds, visualizationTypes, type VisualizationRenderError, type VisualizationSpec } from "../shared/visualization";
+import { ReportVisualizationArtifactResolver } from "./reportVisualizationArtifactResolver";
 import {
   SQLiteArtifactManager,
   SQLiteToolResultRegistry,
@@ -382,6 +383,12 @@ function normalizeChartType(request: Record<string, unknown>, spec: Record<strin
   if (/折线|趋势|line/i.test(text)) {
     return "line";
   }
+  if (/环形|甜甜圈|donut/i.test(text)) {
+    return "donut";
+  }
+  if (/饼图|pie/i.test(text)) {
+    return "pie";
+  }
   if (/热力|heatmap/i.test(text)) {
     return "heatmap";
   }
@@ -520,8 +527,11 @@ function inferChartTypeFromText(text: string): VisualizationSpec["type"] {
   if (/折线|趋势|line/i.test(text)) {
     return "line";
   }
+  if (/环形|甜甜圈|donut/i.test(text)) {
+    return "donut";
+  }
   if (/饼图|pie/i.test(text)) {
-    return "bar";
+    return "pie";
   }
   if (/热力|heatmap/i.test(text)) {
     return "heatmap";
@@ -1964,6 +1974,7 @@ export class AssistantRuntime {
   private readonly toolArtifactManager: ArtifactManager;
   private readonly tempSourceManager: ConversationTempSourceManager;
   private readonly agentGuidance: ReturnType<typeof createAgentGuidanceModule>;
+  private readonly reportVisualizationArtifactResolver: ReportVisualizationArtifactResolver;
 
   constructor(options: AssistantRuntimeOptions) {
     this.options = options;
@@ -1984,6 +1995,11 @@ export class AssistantRuntime {
     });
     this.workflowStore = new AuditedWorkflowStateStore(new SQLiteWorkflowStateStore(this.db), new SQLiteWorkflowAuditLogger(this.db));
     this.datasetStateManager = new SQLiteDatasetStateManager(this.db, this.workflowStore);
+    this.reportVisualizationArtifactResolver = new ReportVisualizationArtifactResolver(
+      this.toolArtifactManager,
+      this.toolResultRegistry,
+      this.datasetStateManager,
+    );
     this.sqliteMaterializer = new SQLiteMaterializer(this.db, {
       sqliteDatabasePath: options.dbPath,
       batchSize: 500,
@@ -2892,6 +2908,25 @@ export class AssistantRuntime {
       return null;
     }
     return this.toolArtifactManager.getArtifact(normalizedArtifactId);
+  }
+
+  async resolveConversationReportVisualization(
+    userId: string,
+    conversationId: string,
+    reportArtifactId: string,
+    reportVersion: number,
+    visualizationArtifactId: string,
+  ) {
+    const conversation = this.findConversation(userId, conversationId);
+    if (!conversation) {
+      throw new Error("对话不存在或已失效。");
+    }
+    return this.reportVisualizationArtifactResolver.resolve({
+      conversationId: conversation.id,
+      reportArtifactId: reportArtifactId.trim(),
+      reportVersion,
+      visualizationArtifactId: visualizationArtifactId.trim(),
+    });
   }
 
   async confirmWorkflowDataset(userId: string, conversationId: string, datasetId?: string) {
@@ -5881,6 +5916,10 @@ export class AssistantRuntime {
       sourceName: reportContext.sourceName,
       selectedFieldNames: reportContext.selectedFieldNames,
     });
+    const declaredChartArtifactIds = reportVisualizationArtifactIds(normalizedMarkdown);
+    const declaredChartToolCallId = declaredChartArtifactIds.some((artifactId) => chartArtifactIds.includes(artifactId))
+      ? chartToolCallId
+      : undefined;
     const artifact = await this.toolArtifactManager.createArtifact({
       artifactId: `assistant-report-markdown:${toolCall.id}`,
       artifactType: "report_markdown",
@@ -5890,6 +5929,7 @@ export class AssistantRuntime {
       metadata: {
         messageId: message.id,
         sourcePythonToolCallId: toolCall.id,
+        visualizationArtifactIds: declaredChartArtifactIds,
         dataSourceLabels: reportContext.sourceName ? [reportContext.sourceName] : [],
         selectedFieldNames: reportContext.selectedFieldNames,
       },
@@ -5929,12 +5969,16 @@ export class AssistantRuntime {
         metadata: {
           messageId: message.id,
           sourcePythonToolCallId: toolCall.id,
+          visualizationArtifactIds: declaredChartArtifactIds,
           dataSourceLabels: reportContext.sourceName ? [reportContext.sourceName] : [],
           selectedFieldNames: reportContext.selectedFieldNames,
         },
       },
-      parentToolCallIds: [pythonRecord.toolCallId],
-      sourceArtifactIds: pythonRecord.outputArtifactIds ?? pythonRecord.result?.artifactIds ?? [],
+      parentToolCallIds: uniqueValues([pythonRecord.toolCallId, declaredChartToolCallId].filter((item): item is string => Boolean(item))),
+      sourceArtifactIds: uniqueValues([
+        ...(pythonRecord.outputArtifactIds ?? pythonRecord.result?.artifactIds ?? []),
+        ...declaredChartArtifactIds,
+      ]),
       outputArtifactIds: [artifact.artifactId],
       version,
       isLatestSuccessful: false,
@@ -6107,7 +6151,15 @@ export class AssistantRuntime {
   }) {
     const parents = (await Promise.all(input.parentKinds.map((toolKind) => this.toolResultRegistry.getLatestSuccessful(input.message.conversationId, toolKind))))
       .filter((record): record is ToolCallRecord => Boolean(record));
-    const sourceArtifactIds = uniqueValues(parents.flatMap((record) => record.outputArtifactIds ?? record.result?.artifactIds ?? []));
+    const declaredVisualizationArtifactIds = input.toolKind === "report_generation"
+      && input.artifact.contentType === "markdown"
+      && typeof input.artifact.content === "string"
+      ? reportVisualizationArtifactIds(input.artifact.content)
+      : [];
+    const sourceArtifactIds = uniqueValues([
+      ...parents.flatMap((record) => record.outputArtifactIds ?? record.result?.artifactIds ?? []),
+      ...declaredVisualizationArtifactIds,
+    ]);
     const parentToolCallIds = uniqueValues(parents.map((record) => record.toolCallId));
     const primaryParent = parents[0];
     const reportContext = input.toolKind === "report_generation" ? this.analysisReportContextFromRecords(parents) : { sourceName: null, selectedFieldNames: [] };
@@ -6130,6 +6182,7 @@ export class AssistantRuntime {
         }),
         metadata: {
           ...(input.artifact.metadata ?? {}),
+          visualizationArtifactIds: declaredVisualizationArtifactIds,
           dataSourceLabels: reportContext.sourceName ? [reportContext.sourceName] : [],
           selectedFieldNames: reportContext.selectedFieldNames,
         },
@@ -6161,6 +6214,7 @@ export class AssistantRuntime {
             ...(existing.result?.metadata ?? {}),
             messageId: input.message.id,
             artifactType: artifact.artifactType,
+            visualizationArtifactIds: declaredVisualizationArtifactIds,
             dataSourceLabels: reportContext.sourceName ? [reportContext.sourceName] : [],
             selectedFieldNames: reportContext.selectedFieldNames,
           },
@@ -6214,6 +6268,7 @@ export class AssistantRuntime {
         metadata: {
           messageId: input.message.id,
           artifactType: artifact.artifactType,
+          visualizationArtifactIds: declaredVisualizationArtifactIds,
           dataSourceLabels: reportContext.sourceName ? [reportContext.sourceName] : [],
           selectedFieldNames: reportContext.selectedFieldNames,
         },
@@ -7377,6 +7432,7 @@ export class AssistantRuntime {
       chartToolCallId: toolState.latestSuccessfulChartToolCallId,
       chartArtifactIds: toolState.latestSuccessfulChartArtifactIds ?? [],
     });
+    const visualizationArtifactIds = reportVisualizationArtifactIds(markdown);
     const title = typeof request.title === "string" && request.title.trim() ? request.title.trim().slice(0, 120) : inferReportTitle(markdown) ?? "分析报告";
     const currentMessage = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(assistantMessage.id));
     const reportToolCallId = generatedReportToolCallId(currentMessage.id);
@@ -7395,6 +7451,7 @@ export class AssistantRuntime {
         content: markdown,
         metadata: {
           modelToolCallId,
+          visualizationArtifactIds,
         },
       },
       parentKinds: ["chart_rendering", "python_analysis", "sql_query"],
