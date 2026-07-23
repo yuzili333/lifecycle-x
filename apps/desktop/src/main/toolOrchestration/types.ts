@@ -520,14 +520,14 @@ export const TOOL_NAMES: Record<ToolKind, string> = {
 export const TOOL_SCHEMAS: Record<ToolKind, JsonSchema> = {
   sql_query: {
     type: "object",
-    required: ["userRequest", "purpose"],
+    required: ["userRequest", "purpose", "sql"],
     description: "从已授权数据源执行受控只读查询、筛选、字段选择、分组、聚合和排序。无筛选条件的兜底查询表示查询活动表完整数据范围，并通过 Artifact 物化结果；不得使用模拟数据。",
     properties: {
-      userRequest: { type: "string", description: "用户原始查询需求；保留筛选条件、字段和后续分析/绘图/报告目标。" },
+      userRequest: { type: "string", minLength: 1, description: "用户原始查询需求；保留筛选条件、字段和后续分析/绘图/报告目标。" },
       dataSourceId: { type: "string" },
-      sql: { type: "string", description: "单条只读 SQL。需要后续统计、占比、排序、绘图或报告时，应返回后续所需的真实原始字段，避免用聚合压缩样本。" },
+      sql: { type: "string", minLength: 1, description: "必填。单条只读 SQL。需要后续统计、占比、排序、绘图或报告时，应返回后续所需的真实原始字段，避免用聚合压缩样本。" },
       script: { type: "string" },
-      purpose: { type: "string", description: "说明 SQL 的查询目标、字段范围和结果用途。" },
+      purpose: { type: "string", minLength: 1, description: "说明 SQL 的查询目标、字段范围和结果用途。" },
       baseToolCallId: { type: "string" },
       baseArtifactId: { type: "string" },
       requireApproval: { type: "boolean" },
@@ -535,12 +535,12 @@ export const TOOL_SCHEMAS: Record<ToolKind, JsonSchema> = {
   },
   python_analysis: {
     type: "object",
-    required: ["userRequest", "purpose"],
+    required: ["userRequest", "purpose", "script"],
     description: "对已有 SQL 查询结果或具备 SQL 血缘的数据集执行统计、分布、趋势、异常或其他数据分析。不得直接连接业务数据库，不得使用模拟数据。",
     properties: {
-      userRequest: { type: "string" },
-      purpose: { type: "string" },
-      script: { type: "string" },
+      userRequest: { type: "string", minLength: 1 },
+      purpose: { type: "string", minLength: 1 },
+      script: { type: "string", minLength: 1, description: "必填。只使用标准库和输入数据真实字段的受控 Python 分析脚本。" },
       inputArtifactIds: { type: "array", items: { type: "string" } },
       sourceSqlToolCallId: { type: "string" },
       basePythonToolCallId: { type: "string" },
@@ -550,18 +550,51 @@ export const TOOL_SCHEMAS: Record<ToolKind, JsonSchema> = {
   chart_rendering: {
     type: "object",
     required: ["userRequest", "purpose"],
+    anyOf: [
+      {
+        type: "object",
+        required: ["title", "chartType"],
+        anyOf: [
+          {
+            type: "object",
+            required: ["dimensionFields"],
+            properties: {
+              dimensionFields: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
+            },
+          },
+          {
+            type: "object",
+            required: ["measureFields"],
+            properties: {
+              measureFields: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
+            },
+          },
+        ],
+        properties: {
+          title: { type: "string", minLength: 1 },
+          chartType: { type: "string" },
+        },
+      },
+      {
+        type: "object",
+        required: ["visualizationSpec"],
+        properties: {
+          visualizationSpec: { type: "object" },
+        },
+      },
+    ],
     description: "受控图表生成请求。凡用户要求画图、绘图、图表、可视化、比率图、占比图、横向/纵向条形图、排名图，或要求把已有表格/分析结果变成图表时，应调用 request_chart_rendering。若当前没有可引用 SQL/Python Artifact，且用户同时要求查询/筛选/拆分/区分数据和分析/占比/比率计算，应先调用 SQL 查询和 Python 分析，最后再调用本工具。可提供完整 visualizationSpec，也可提供声明式 chartType、title、dimensionFields、measureFields 等字段，由客户端补全受控 VisualizationSpec。",
     properties: {
-      userRequest: { type: "string", description: "用户原始绘图/可视化需求，保留图表类型、排序、拆分、颜色分级等要求。" },
-      purpose: { type: "string", description: "说明本次图表要表达的分析目的，例如按某个维度展示指标排名、趋势或结构。" },
-      title: { type: "string", description: "图表标题。缺省时可根据用户请求和目的生成。" },
+      userRequest: { type: "string", minLength: 1, description: "用户原始绘图/可视化需求，保留图表类型、排序、拆分、颜色分级等要求。" },
+      purpose: { type: "string", minLength: 1, description: "说明本次图表要表达的分析目的，例如按某个维度展示指标排名、趋势或结构。" },
+      title: { type: "string", minLength: 1, description: "必填。图表标题。" },
       chartType: {
         type: "string",
         enum: ["kpi", "line", "area", "bar", "horizontal_bar", "stacked_bar", "bar_line_combo", "scatter", "bubble", "heatmap", "histogram", "pareto", "funnel", "waterfall", "table"],
         description: "图表类型。横向条形图使用 horizontal_bar；普通条形图/柱状图使用 bar；趋势使用 line 或 area。",
       },
-      dimensionFields: { type: "array", items: { type: "string" }, description: "图表维度字段或分析结果中的类别列，例如分组、分类、行业、分行等。" },
-      measureFields: { type: "array", items: { type: "string" }, description: "图表指标字段或分析结果中的数值列，例如数量、金额、占比、比率、百分率等。" },
+      dimensionFields: { type: "array", items: { type: "string", minLength: 1 }, description: "图表维度字段或分析结果中的类别列，例如分组、分类、行业、分行等。" },
+      measureFields: { type: "array", items: { type: "string", minLength: 1 }, description: "图表指标字段或分析结果中的数值列，例如数量、金额、占比、比率、百分率等。" },
       sortBy: { type: "string", description: "排序字段，通常为主要指标字段。" },
       sortDirection: { type: "string", enum: ["asc", "desc"], description: "排序方向。降序使用 desc，升序使用 asc。" },
       colorBy: { type: "string", description: "颜色编码字段，可使用维度字段或指标字段。" },
@@ -581,11 +614,11 @@ export const TOOL_SCHEMAS: Record<ToolKind, JsonSchema> = {
   },
   report_generation: {
     type: "object",
-    required: ["userRequest", "purpose"],
+    required: ["userRequest", "purpose", "markdown"],
     description: "基于真实 SQL、Python 和图表 Artifact 生成 Markdown 报告。用户同时要求图表和报告时，必须引用 visualizationArtifactIds 并在正文嵌入 visualization 节点。",
     properties: {
-      userRequest: { type: "string" },
-      purpose: { type: "string" },
+      userRequest: { type: "string", minLength: 1 },
+      purpose: { type: "string", minLength: 1 },
       title: { type: "string" },
       inputArtifactIds: { type: "array", items: { type: "string" } },
       visualizationArtifactIds: { type: "array", items: { type: "string" }, description: "报告正文需要引用的图表 Artifact IDs。" },
@@ -595,7 +628,7 @@ export const TOOL_SCHEMAS: Record<ToolKind, JsonSchema> = {
       sourceChartToolCallIds: { type: "array", items: { type: "string" } },
       baseReportToolCallId: { type: "string" },
       baseReportArtifactId: { type: "string" },
-      markdown: { type: "string" },
+      markdown: { type: "string", minLength: 1, description: "必填。仅依据已授权 Artifact 结果生成的完整 Markdown 报告正文。" },
     },
   },
 };

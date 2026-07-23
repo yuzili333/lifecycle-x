@@ -84,6 +84,10 @@ export class StreamingModelAdapter {
           yield this.toolResultEvent(input, toolResult, traceId);
         }
 
+        if (input.stopAfterToolExecution) {
+          break;
+        }
+
         conversationMessages.push(toolCallsAssistantMessage(input, toolCalls));
         conversationMessages.push(...toolResults.map(toolResultMessage));
 
@@ -409,7 +413,7 @@ export class StreamingModelAdapter {
     message: string,
     detail: Record<string, unknown>,
   ) {
-    return this.event(input, "model-observation", { phase, status, message, detail }, traceId);
+    return this.event(input, "model-observation", { phase, status, message, detail: { ...detail, ...(input.metadata ?? {}) } }, traceId);
   }
 }
 

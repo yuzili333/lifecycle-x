@@ -28,6 +28,8 @@ export type WorkbenchSettings = {
   configuration: {
     modelProvider: string;
     modelName: string;
+    executionModelName?: string;
+    dualModelOrchestrationEnabled?: boolean;
     apiKeyStatus: "not_configured" | "configured";
     skillEnabled: boolean;
     mcpEnabled: boolean;

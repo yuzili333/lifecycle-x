@@ -85,6 +85,8 @@ const defaultSettings: WorkbenchSettings = {
   configuration: {
     modelProvider: "Siliconflow",
     modelName: "",
+    executionModelName: "",
+    dualModelOrchestrationEnabled: true,
     apiKeyStatus: "not_configured",
     skillEnabled: false,
     mcpEnabled: false,
@@ -732,6 +734,8 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
             <DataAssistantWorkspace
               user={auth.user}
               modelName={settings.configuration.modelName}
+              executionModelName={settings.configuration.executionModelName?.trim() || settings.configuration.modelName}
+              dualModelOrchestrationEnabled={settings.configuration.dualModelOrchestrationEnabled !== false}
               isModelConfigured={isModelConfigurationReady(settings)}
               canReadDataSources={auth.permissions.includes("datasource:read")}
               requestWithRefresh={requestWithRefresh}
@@ -983,7 +987,7 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
                       }
                     />
                     <TextInput
-                      label="模型名称"
+                      label="推理模型名称"
                       value={settings.configuration.modelName}
                       placeholder="例如 gpt-4.1、qwen-max、deepseek-chat"
                       width="100%"
@@ -991,6 +995,28 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
                         setSettings((current) => ({
                           ...current,
                           configuration: { ...current.configuration, modelName },
+                        }))
+                      }
+                    />
+                    <TextInput
+                      label="执行模型名称"
+                      value={settings.configuration.executionModelName ?? ""}
+                      placeholder="留空时使用推理模型"
+                      width="100%"
+                      onChange={(executionModelName) =>
+                        setSettings((current) => ({
+                          ...current,
+                          configuration: { ...current.configuration, executionModelName },
+                        }))
+                      }
+                    />
+                    <Switch
+                      label="启用双模型编排"
+                      value={settings.configuration.dualModelOrchestrationEnabled !== false}
+                      onChange={(dualModelOrchestrationEnabled) =>
+                        setSettings((current) => ({
+                          ...current,
+                          configuration: { ...current.configuration, dualModelOrchestrationEnabled },
                         }))
                       }
                     />

@@ -30,7 +30,7 @@ import { Text } from "@astryxdesign/core/Text";
 import { Token } from "@astryxdesign/core/Token";
 import { Toolbar } from "@astryxdesign/core/Toolbar";
 import { Tooltip } from "@astryxdesign/core/Tooltip";
-import { CircleAlert, Clock, Copy, FileSpreadsheet, FileText, LoaderCircle, Maximize2, Minimize2, Pencil, Plus, RotateCcw, Sparkles, Trash2, X, type LucideIcon } from "lucide-react";
+import { BrainCircuit, CheckCircle2, ChevronDown, ChevronRight, CircleAlert, Clock, Copy, FileSpreadsheet, FileText, LoaderCircle, Maximize2, Minimize2, Pencil, Plus, RotateCcw, Sparkles, Trash2, X, type LucideIcon } from "lucide-react";
 import type { AuthFailure, AuthUser } from "./auth";
 import { useAppToast } from "./useAppToast";
 import { workbenchApi, type ApiResult, type DataSourceSummary } from "./workbenchApi";
@@ -93,6 +93,7 @@ import type { ChatCsvAttachment, ChatCsvSelectedFieldRef } from "../../main/chat
 import type { AgentGuidance, AgentGuidanceAction } from "../../main/agentGuidance";
 import type { ArtifactRecord, ConversationToolState, ToolCallRecord } from "../../main/toolOrchestration";
 import type { WorkflowContextSummary } from "../../main/workflowRuntime";
+import type { AgentProgressEvent, AgentRunRecord } from "../../main/agentOrchestration";
 
 type RequestWithRefresh = <T extends { success: true }>(
   call: (accessToken: string) => Promise<ApiResult<T>>,
@@ -101,6 +102,8 @@ type RequestWithRefresh = <T extends { success: true }>(
 type DataAssistantWorkspaceProps = {
   user: AuthUser | null;
   modelName: string;
+  executionModelName: string;
+  dualModelOrchestrationEnabled: boolean;
   isModelConfigured: boolean;
   canReadDataSources: boolean;
   requestWithRefresh: RequestWithRefresh;
@@ -632,6 +635,84 @@ function formatMessageDuration(message: AssistantMessage, nowMs: number) {
     return `${Math.floor(totalSeconds / 60)}m ${totalSeconds % 60}s`;
   }
   return `${totalSeconds}s`;
+}
+
+export function isActiveAgentRun(run: AgentRunRecord) {
+  return run.status === "planning" || run.status === "responding" || run.status === "executing" || run.status === "waiting_approval";
+}
+
+export function shouldShowMessageMetadataStatus(showStatus: boolean, run?: AgentRunRecord) {
+  return showStatus && !(run && isActiveAgentRun(run));
+}
+
+export function formatDurationMs(durationMs: number) {
+  const totalSeconds = Math.max(0, Math.round(durationMs / 1000));
+  return totalSeconds >= 60 ? `${Math.floor(totalSeconds / 60)}m ${totalSeconds % 60}s` : `${totalSeconds}s`;
+}
+
+function agentRunActiveDuration(run: AgentRunRecord, nowMs: number) {
+  const activeSegment = run.activeStartedAt ? Math.max(0, nowMs - Date.parse(run.activeStartedAt)) : 0;
+  return run.activeDurationMs + activeSegment;
+}
+
+function compactAgentProgressEvents(events: AgentProgressEvent[]) {
+  const order: string[] = [];
+  const latest = new Map<string, AgentProgressEvent>();
+  for (const event of events) {
+    const key = progressEventDisplayKey(event);
+    if (!latest.has(key)) order.push(key);
+    latest.set(key, event);
+  }
+  return order.map((key) => latest.get(key)!).filter(Boolean);
+}
+
+function progressEventDisplayKey(event: AgentProgressEvent) {
+  if (event.phase === "accepted" || event.phase === "planning" || event.phase === "plan_ready") {
+    return "planning";
+  }
+  if (
+    event.phase === "preparing_step" ||
+    event.phase === "validating_parameters" ||
+    event.phase === "waiting_approval" ||
+    event.phase === "tool_executing" ||
+    event.phase === "step_completed" ||
+    event.phase === "step_failed"
+  ) {
+    return `step:${event.stepId ?? event.toolCallId ?? "current"}`;
+  }
+  if (event.phase === "responding" || event.phase === "clarifying" || event.phase === "completed" || event.phase === "failed" || event.phase === "cancelled") {
+    return "run-result";
+  }
+  return `${event.phase}:${event.stepId ?? "run"}`;
+}
+
+export function AgentProgressPanel({ run }: { run: AgentRunRecord }) {
+  const active = isActiveAgentRun(run);
+  const events = compactAgentProgressEvents(run.events).filter((event) => active || (event.status !== "running" && event.status !== "waiting"));
+  return (
+    <div className="assistant-agent-progress" data-agent-run-status={run.status}>
+      <div className="assistant-agent-progress-heading">
+        <Icon icon={BrainCircuit} size="sm" color="inherit" />
+        <span>{active ? "Assistant 工作进度" : "Assistant 工作记录"}</span>
+      </div>
+      <div className="assistant-agent-progress-events">
+        {events.map((event) => (
+          <div key={event.eventId} className={`assistant-agent-progress-event is-${event.status}`}>
+            <span className="assistant-agent-progress-event-icon" aria-hidden="true">
+              {event.status === "success" ? (
+                <Icon icon={CheckCircle2} size="xsm" color="inherit" />
+              ) : event.status === "error" || event.status === "cancelled" ? (
+                <Icon icon={CircleAlert} size="xsm" color="inherit" />
+              ) : (
+                <Icon icon={LoaderCircle} size="xsm" color="inherit" className={event.status === "running" ? "assistant-message-status-spinner" : undefined} />
+              )}
+            </span>
+            <span>{event.summary}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 function AssistantActionIcon({ src }: { src: string }) {
@@ -1216,6 +1297,8 @@ function shouldHideInlineToolResult(block: AssistantBlock) {
 export function DataAssistantWorkspace({
   user,
   modelName,
+  executionModelName,
+  dualModelOrchestrationEnabled,
   isModelConfigured,
   canReadDataSources,
   requestWithRefresh,
@@ -1226,6 +1309,8 @@ export function DataAssistantWorkspace({
   const [messagesByConversation, setMessagesByConversation] = useState<Record<string, AssistantMessage[]>>({});
   const [workflowContextByConversation, setWorkflowContextByConversation] = useState<Record<string, WorkflowContextSummary | null>>({});
   const [toolStateByConversation, setToolStateByConversation] = useState<Record<string, ConversationToolState | null>>({});
+  const [agentRunsByMessage, setAgentRunsByMessage] = useState<Record<string, AgentRunRecord>>({});
+  const [expandedAgentRunMessageIds, setExpandedAgentRunMessageIds] = useState<Set<string>>(() => new Set());
   const [chatCsvAttachmentsByConversation, setChatCsvAttachmentsByConversation] = useState<Record<string, ChatCsvAttachment[]>>({});
   const [activeConversationId, setActiveConversationId] = useState("");
   const [composerValue, setComposerValue] = useState("");
@@ -1492,6 +1577,10 @@ export function DataAssistantWorkspace({
   const activeStreamingMessages = useMemo(() => activeMessages.filter(isRunningAssistantMessage), [activeMessages]);
   const activeStreamingMessageIds = useMemo(() => activeStreamingMessages.map((message) => message.id), [activeStreamingMessages]);
   const isStreaming = activeStreamingMessages.length > 0;
+  const hasActivelyTimedAgentRun = useMemo(
+    () => Object.values(agentRunsByMessage).some((run) => run.conversationId === activeConversation?.id && Boolean(run.activeStartedAt)),
+    [activeConversation?.id, agentRunsByMessage],
+  );
   const activeChatCsvAttachments = activeConversation ? chatCsvAttachmentsByConversation[activeConversation.id] ?? [] : [];
   const readyChatCsvAttachments = activeChatCsvAttachments.filter((attachment) => attachment.status === "ready" && attachment.tempDataSourceId);
   const activeTempDataSourceIds = readyChatCsvAttachments.map((attachment) => attachment.tempDataSourceId as string);
@@ -1619,12 +1708,19 @@ export function DataAssistantWorkspace({
       if (!user?.id || !window.lifecycleX?.assistant) {
         return;
       }
-      const messages = await window.lifecycleX.assistant.listMessages(user.id, conversationId);
+      const [messages, context, toolState, agentRuns] = await Promise.all([
+        window.lifecycleX.assistant.listMessages(user.id, conversationId),
+        window.lifecycleX.assistant.getWorkflowContext(user.id, conversationId),
+        window.lifecycleX.assistant.getToolState(user.id, conversationId),
+        window.lifecycleX.assistant.listAgentRuns(user.id, conversationId),
+      ]);
       setMessagesByConversation((current) => ({ ...current, [conversationId]: messages }));
-      const context = await window.lifecycleX.assistant.getWorkflowContext(user.id, conversationId);
       setWorkflowContextByConversation((current) => ({ ...current, [conversationId]: context }));
-      const toolState = await window.lifecycleX.assistant.getToolState(user.id, conversationId);
       setToolStateByConversation((current) => ({ ...current, [conversationId]: toolState }));
+      setAgentRunsByMessage((current) => ({
+        ...current,
+        ...Object.fromEntries(agentRuns.map((run) => [run.messageId, run])),
+      }));
     },
     [user?.id],
   );
@@ -1688,6 +1784,18 @@ export function DataAssistantWorkspace({
       }
       if (event.type === "message-delta") {
         queueMessageDelta(event);
+        return;
+      }
+      if (event.type === "agent-progress") {
+        setAgentRunsByMessage((current) => ({ ...current, [event.messageId]: event.run }));
+        if (!isActiveAgentRun(event.run)) {
+          setExpandedAgentRunMessageIds((current) => {
+            if (!current.has(event.messageId)) return current;
+            const next = new Set(current);
+            next.delete(event.messageId);
+            return next;
+          });
+        }
         return;
       }
       if (event.type === "stream-content") {
@@ -1897,12 +2005,12 @@ export function DataAssistantWorkspace({
   }, [activeMessages, activeToolState, reportCardTransitions, reportTransitionController, streamContentRevision]);
 
   useEffect(() => {
-    if (!isStreaming) {
+    if (!isStreaming && !hasActivelyTimedAgentRun) {
       return undefined;
     }
     const timer = window.setInterval(() => setMetadataNow(Date.now()), 1000);
     return () => window.clearInterval(timer);
-  }, [isStreaming]);
+  }, [hasActivelyTimedAgentRun, isStreaming]);
 
   useEffect(() => {
     const mention = findChatToolMention(composerValue, composerSelectionStart);
@@ -2870,6 +2978,8 @@ export function DataAssistantWorkspace({
           messageId: message.id,
           clientRequestId: createClientRequestId(),
           modelName,
+          executionModelName,
+          dualModelOrchestrationEnabled,
           dataSourceLabel: selectedDataSource ? dataSourceLabel(selectedDataSource) : null,
           selectedTempDataSourceIds: messageTempDataSourceIds,
           selectedFieldRefs: message.context?.selectedFieldRefs,
@@ -2898,7 +3008,7 @@ export function DataAssistantWorkspace({
         });
       }
     },
-    [approvalMode, loadSchemaContextMarkdown, messageTempDataSourceIds, modelName, patchMessage, selectedDataSource, selectedSkill, toast, upsertMessage, user?.id],
+    [approvalMode, dualModelOrchestrationEnabled, executionModelName, loadSchemaContextMarkdown, messageTempDataSourceIds, modelName, patchMessage, selectedDataSource, selectedSkill, toast, upsertMessage, user?.id],
   );
 
   const renderMessageMetadata = useCallback(
@@ -2915,20 +3025,37 @@ export function DataAssistantWorkspace({
       const showStatus = isThinking || showFailed || message.status === "sending" || showWaiting || message.status === "stopped";
       const showCopy = !(message.role === "assistant" && isThinking);
       const duration = formatMessageDuration(message, metadataNow);
+      const agentRun = agentRunsByMessage[message.id];
+      const agentDuration = agentRun ? formatDurationMs(agentRunActiveDuration(agentRun, metadataNow)) : null;
+      const isAgentProgressExpanded = Boolean(agentRun && (isActiveAgentRun(agentRun) || expandedAgentRunMessageIds.has(message.id)));
 
       return (
         <ChatMessageMetadata
           timestamp={formatChatTime(message.createdAt)}
           footer={
             <div className="assistant-message-metadata-footer">
-              {showStatus && (
+              {shouldShowMessageMetadataStatus(showStatus, agentRun) && (
                 <MetadataStatusIcon status={message.status} isThinking={isThinking} />
               )}
-              {duration && (
-                <span className="assistant-message-duration" title="大模型推理耗时">
-                  {duration}
-                </span>
-              )}
+              {agentRun && agentDuration ? (
+                <button
+                  type="button"
+                  className="assistant-message-duration assistant-message-duration-button"
+                  title="Assistant 主动处理耗时；审批等待时间不计入"
+                  aria-expanded={isAgentProgressExpanded}
+                  onClick={() => setExpandedAgentRunMessageIds((current) => {
+                    const next = new Set(current);
+                    if (next.has(message.id)) next.delete(message.id);
+                    else next.add(message.id);
+                    return next;
+                  })}
+                >
+                  <Icon icon={isAgentProgressExpanded ? ChevronDown : ChevronRight} size="xsm" color="inherit" />
+                  已处理 {agentDuration}
+                </button>
+              ) : duration ? (
+                <span className="assistant-message-duration" title="大模型推理耗时">{duration}</span>
+              ) : null}
               <div className="assistant-message-actions">
                 {showCopy && (
                   <MetadataIconButton label="复制" icon={Copy} onClick={() => void copyMessage(message)} />
@@ -2945,7 +3072,7 @@ export function DataAssistantWorkspace({
         />
       );
     },
-    [copyMessage, editUserMessage, metadataNow, retryAssistantMessage],
+    [agentRunsByMessage, copyMessage, editUserMessage, expandedAgentRunMessageIds, metadataNow, retryAssistantMessage],
   );
 
   const approveTool = useCallback(
@@ -3167,6 +3294,8 @@ export function DataAssistantWorkspace({
           assistantMessageId: optimisticAssistantMessage.id,
           prompt,
           modelName,
+          executionModelName,
+          dualModelOrchestrationEnabled,
           dataSourceId: submitDataSource?.id ?? null,
           dataSourceLabel: submitDataSource ? dataSourceLabel(submitDataSource) : null,
           selectedTempDataSourceIds: submitTempDataSourceIds,
@@ -3225,6 +3354,8 @@ export function DataAssistantWorkspace({
       messageTempDataSourceIds,
       messageTempDataSourceLabels,
       modelName,
+      executionModelName,
+      dualModelOrchestrationEnabled,
       onRequireModelConfig,
       readyChatCsvAttachments,
       resolveDataSourceSchemaColumnLimit,
@@ -3915,6 +4046,8 @@ export function DataAssistantWorkspace({
                       ? workflowToolCalls
                       : toolCallsFromMessage(message)
                     : [];
+                  const agentRun = sender === "assistant" ? agentRunsByMessage[message.id] : undefined;
+                  const showAgentProgress = Boolean(agentRun && (isActiveAgentRun(agentRun) || expandedAgentRunMessageIds.has(message.id)));
                   return (
                     <ChatMessage
                       key={message.id}
@@ -3928,6 +4061,7 @@ export function DataAssistantWorkspace({
                       }
                     >
                       {sender === "user" && renderUserContextTokens(message)}
+                      {showAgentProgress && agentRun ? <AgentProgressPanel run={agentRun} /> : null}
                       <ChatMessageBubble
                         variant={sender === "assistant" ? "ghost" : "filled"}
                         metadata={renderMessageMetadata(message)}

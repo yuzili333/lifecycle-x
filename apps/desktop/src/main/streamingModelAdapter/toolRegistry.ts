@@ -135,6 +135,19 @@ function validateToolName(name: string) {
 }
 
 function validateInputSchema(schema: JsonSchema, value: unknown, toolName: string, path = "input") {
+  if (schema.anyOf?.length) {
+    const matched = schema.anyOf.some((candidate) => {
+      try {
+        validateInputSchema(candidate, value, toolName, path);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    if (!matched) {
+      throw new ModelAdapterError("TOOL_INPUT_INVALID", `${toolName} 参数 ${path} 未满足任一允许的参数组合`);
+    }
+  }
   if (!schema.type) {
     return;
   }
@@ -159,6 +172,9 @@ function validateInputSchema(schema: JsonSchema, value: unknown, toolName: strin
     if (!Array.isArray(value)) {
       throw new ModelAdapterError("TOOL_INPUT_INVALID", `${toolName} 参数 ${path} 必须是数组`);
     }
+    if (typeof schema.minItems === "number" && value.length < schema.minItems) {
+      throw new ModelAdapterError("TOOL_INPUT_INVALID", `${toolName} 参数 ${path} 至少需要 ${schema.minItems} 项`);
+    }
     if (schema.items) {
       value.forEach((item, index) => validateInputSchema(schema.items as JsonSchema, item, toolName, `${path}[${index}]`));
     }
@@ -169,6 +185,9 @@ function validateInputSchema(schema: JsonSchema, value: unknown, toolName: strin
   }
   if (schema.enum && !schema.enum.includes(value)) {
     throw new ModelAdapterError("TOOL_INPUT_INVALID", `${toolName} 参数 ${path} 不在允许值范围内`);
+  }
+  if (schema.type === "string" && typeof schema.minLength === "number" && (value as string).length < schema.minLength) {
+    throw new ModelAdapterError("TOOL_INPUT_INVALID", `${toolName} 参数 ${path} 长度不能小于 ${schema.minLength}`);
   }
 }
 

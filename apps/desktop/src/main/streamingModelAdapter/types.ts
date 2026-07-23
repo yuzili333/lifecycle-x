@@ -90,6 +90,9 @@ export type JsonSchema = {
   required?: string[];
   enum?: unknown[];
   items?: JsonSchema;
+  anyOf?: JsonSchema[];
+  minLength?: number;
+  minItems?: number;
   additionalProperties?: boolean | JsonSchema;
   description?: string;
 };
@@ -178,6 +181,7 @@ export type StreamChatInput = {
   contentType?: "text" | "markdown";
   toolExecutionMode?: ToolExecutionMode;
   maxToolRounds?: number;
+  stopAfterToolExecution?: boolean;
   signal?: AbortSignal;
   timeoutMs?: number;
   metadata?: Record<string, unknown>;

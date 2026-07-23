@@ -1,10 +1,31 @@
 import { describe, expect, it } from "vitest";
-import { appendVisualizationReferencesToReport, buildFallbackTempCsvSqlForAnalysisRequest, buildGenericSqlResultAnalysisPythonScript, buildModelToolParameterIssueFeedback, buildOverallRiskDistributionMarkdown, detectToolFromAssistantOutput, formatStoppedGenerationMessage, generalStreamSegmentId, generalTextStreamSegmentId, generatedReportArtifactId, generatedReportToolCallId, inferReportTitle, isPreToolTextGuidanceRequiredInputs, isPythonReportCardContent, isReportGenerationContent, normalizeAnalysisReportMarkdown, normalizeAnalysisReportTitle, providerToolFallbackText, renderLocalToolPlanContext, reportStreamSegmentId, selectedFieldReferencesMarkdown, shouldAnalyzePriorSqlResult, shouldAutoStartPythonReport, shouldDeferChartUntilUpstreamTools, shouldDeferReportUntilChartTool, shouldEagerStartToolFromAssistantStream, shouldForceGenericSqlResultAnalysisScript, shouldGenerateReportFromAnalysisResult, shouldKeepProviderToolActivityMessage, shouldRegisterAssistantGeneratedArtifacts, shouldRequireDetailSqlForCompositeAnalysis, shouldRouteDeterministicTempCsvToolPlan, shouldRouteSkillThroughModel, shouldStartOverallRiskWorkflowAfterModelText, shouldUseModelForPriorResultVisualization, shouldUseModelForUnclearTaskGoal } from "./assistantRuntime";
+import { appendVisualizationReferencesToReport, buildFallbackTempCsvSqlForAnalysisRequest, buildGenericSqlResultAnalysisPythonScript, buildModelToolParameterIssueFeedback, buildOverallRiskDistributionMarkdown, detectToolFromAssistantOutput, formatStoppedGenerationMessage, generalStreamSegmentId, generalTextStreamSegmentId, generatedReportArtifactId, generatedReportToolCallId, inferReportTitle, isPreToolTextGuidanceRequiredInputs, isPythonReportCardContent, isReportGenerationContent, normalizeAnalysisReportMarkdown, normalizeAnalysisReportTitle, normalizeChartVisualizationSpec, providerToolFallbackText, renderLocalToolPlanContext, reportStreamSegmentId, selectedFieldReferencesMarkdown, shouldAnalyzePriorSqlResult, shouldAutoStartPythonReport, shouldDeferChartUntilUpstreamTools, shouldDeferReportUntilChartTool, shouldEagerStartToolFromAssistantStream, shouldForceGenericSqlResultAnalysisScript, shouldGenerateReportFromAnalysisResult, shouldKeepProviderToolActivityMessage, shouldRegisterAssistantGeneratedArtifacts, shouldRequireDetailSqlForCompositeAnalysis, shouldRouteDeterministicTempCsvToolPlan, shouldRouteSkillThroughModel, shouldStartOverallRiskWorkflowAfterModelText, shouldUseModelForPriorResultVisualization, shouldUseModelForUnclearTaskGoal } from "./assistantRuntime";
 import { TOOL_NAMES, type ToolExecutionPlan } from "./toolOrchestration";
 import { MissingInputDetector } from "./agentGuidance";
 import type { ChatCsvSelectedFieldRef, ConversationTempCsvTable } from "./chatCsvTempSource";
+import { validateVisualizationSpec } from "../shared/visualization";
 
 describe("AssistantRuntime workflow intent", () => {
+  it("normalizes partial chart parameters locally without another model request", () => {
+    const spec = normalizeChartVisualizationSpec({
+      userRequest: "绘制行业占比横向条形图",
+      purpose: "展示行业占比排名",
+      chartType: "horizontal_bar",
+      dimensionFields: ["行业"],
+      measureFields: ["占比"],
+      visualizationSpec: { encoding: { y: 1 } },
+    }, {
+      conversationId: "conversation-1",
+      latestSuccessfulPythonToolCallId: "python-1",
+      latestSuccessfulPythonArtifactIds: ["analysis-1"],
+      toolCalls: [],
+      updatedAt: "2026-07-23T00:00:00.000Z",
+    }, "chart-call-1");
+
+    expect(validateVisualizationSpec(spec).success).toBe(true);
+    expect(spec).toMatchObject({ type: "horizontal_bar", data: { mode: "artifact", artifactId: "analysis-1" } });
+  });
+
   it("starts Python report flow for one-shot SQL, chart, and report requests", () => {
     expect(
       shouldAutoStartPythonReport(

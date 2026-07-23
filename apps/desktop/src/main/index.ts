@@ -260,6 +260,12 @@ ipcMain.handle("assistant:conversation:delete", (_event, userId: string, convers
 ipcMain.handle("assistant:messages:list", (_event, userId: string, conversationId: string) =>
   getAssistantRuntime().getConversationMessages(userId, conversationId),
 );
+ipcMain.handle("assistant:agent-run:get", (_event, userId: string, messageId: string) =>
+  getAssistantRuntime().getAgentRun(userId, messageId),
+);
+ipcMain.handle("assistant:agent-runs:list", (_event, userId: string, conversationId: string) =>
+  getAssistantRuntime().listConversationAgentRuns(userId, conversationId),
+);
 ipcMain.handle("assistant:message:send", (_event, input) => getAssistantRuntime().sendMessage(input));
 ipcMain.handle("assistant:message:retry", (_event, input) => getAssistantRuntime().retryAssistantMessage(input));
 ipcMain.handle("assistant:message:cancel", (_event, messageId: string) => {

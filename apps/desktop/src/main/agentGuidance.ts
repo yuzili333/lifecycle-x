@@ -803,7 +803,7 @@ export class ParameterRepairEngine {
           reason: "missing",
           message: "图表生成需要提供完整 visualizationSpec，或提供 chartType/title/dimensionFields/measureFields 等声明式图表参数。",
         });
-      } else if (hasSpec) {
+      } else if (hasSpec && !hasDeclarativeInput) {
         const visualizationSpec = input.request.visualizationSpec as Record<string, unknown>;
         if (!nonEmptyString(visualizationSpec.title)) {
           invalidParameters.push({

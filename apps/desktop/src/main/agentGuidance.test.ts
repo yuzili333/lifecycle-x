@@ -430,12 +430,24 @@ describe("agent guidance", () => {
         updatedAt: "2026-07-17T00:00:00.000Z",
       },
     });
+    const partialSpecWithDeclarativeFields = engine.validateToolRequest({
+      toolKind: "chart_rendering",
+      request: {
+        userRequest: "绘制行业占比横向条形图",
+        purpose: "展示行业占比",
+        chartType: "horizontal_bar",
+        dimensionFields: ["行业"],
+        measureFields: ["占比"],
+        visualizationSpec: { encoding: { y: 1 } },
+      },
+    });
 
     expect(missingSpec.valid).toBe(false);
     expect(missingSpec.invalidParameters.map((item) => item.parameterName)).toEqual(expect.arrayContaining(["visualizationSpec.title", "visualizationSpec.encoding"]));
     expect(missingSpec.invalidParameters.map((item) => item.parameterName)).not.toContain("inputArtifactIds");
     expect(trustedInline.valid).toBe(true);
     expect(declarativeChart.valid).toBe(true);
+    expect(partialSpecWithDeclarativeFields.valid).toBe(true);
   });
 
   it("validates report parameters without enforcing upstream tool order", () => {

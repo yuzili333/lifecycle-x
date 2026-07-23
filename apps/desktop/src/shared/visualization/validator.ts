@@ -123,6 +123,11 @@ function validateEncodingFields(encoding: VisualizationEncoding | undefined, kno
   if (!encoding || knownFields.size === 0) {
     return errors;
   }
+  const yFields = Array.isArray(encoding.y)
+    ? encoding.y
+    : typeof encoding.y === "string"
+      ? [encoding.y]
+      : [];
   const fields = [
     encoding.x,
     encoding.category,
@@ -134,7 +139,7 @@ function validateEncodingFields(encoding: VisualizationEncoding | undefined, kno
     encoding.startTime,
     encoding.endTime,
     encoding.value,
-    ...(encoding.y ?? []),
+    ...yFields,
   ].filter(Boolean) as string[];
   for (const field of fields) {
     if (!knownFields.has(field)) {

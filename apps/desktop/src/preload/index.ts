@@ -12,6 +12,7 @@ import type { ChatCsvAttachment, ImportConversationCsvInput } from "../main/chat
 import type { ArtifactRecord, ConversationToolState, ToolCallRecord, ToolKind } from "../main/toolOrchestration";
 import type { WorkflowContextSummary, WorkflowDatasetRef } from "../main/workflowRuntime";
 import type { ResolvedReportVisualizationArtifact } from "../shared/visualization";
+import type { AgentRunRecord } from "../main/agentOrchestration";
 
 export type DataSourceMenuAction = "open-database" | "open-csv" | "create-connection" | "import-csv";
 
@@ -38,6 +39,10 @@ const lifecycleXApi = {
       ipcRenderer.invoke("assistant:conversation:delete", userId, conversationId) as Promise<{ success: true; conversationId: string }>,
     listMessages: (userId: string, conversationId: string) =>
       ipcRenderer.invoke("assistant:messages:list", userId, conversationId) as Promise<AssistantMessage[]>,
+    getAgentRun: (userId: string, messageId: string) =>
+      ipcRenderer.invoke("assistant:agent-run:get", userId, messageId) as Promise<AgentRunRecord | null>,
+    listAgentRuns: (userId: string, conversationId: string) =>
+      ipcRenderer.invoke("assistant:agent-runs:list", userId, conversationId) as Promise<AgentRunRecord[]>,
     sendMessage: (input: AssistantSendInput) =>
       ipcRenderer.invoke("assistant:message:send", input) as Promise<AssistantSendResult>,
     retryMessage: (input: AssistantRetryInput) =>

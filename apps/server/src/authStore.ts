@@ -75,6 +75,8 @@ export type WorkbenchSettings = {
   configuration: {
     modelProvider: string;
     modelName: string;
+    executionModelName?: string;
+    dualModelOrchestrationEnabled?: boolean;
     apiKeyStatus: "not_configured" | "configured";
     skillEnabled: boolean;
     mcpEnabled: boolean;
@@ -469,6 +471,8 @@ export class AuthStore {
         configuration: {
           modelProvider: "Siliconflow",
           modelName: "",
+          executionModelName: "",
+          dualModelOrchestrationEnabled: true,
           apiKeyStatus: "not_configured",
           skillEnabled: false,
           mcpEnabled: false,

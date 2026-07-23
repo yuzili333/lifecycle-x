@@ -91,6 +91,10 @@ describe("Visualization validator", () => {
     const rows = Array.from({ length: 3 }, (_, index) => ({ month: `2026-0${index}`, balance: index }));
     expect(validateVisualizationSpec(baseSpec({ data: { mode: "inline", trusted: true, rowCount: 3, rows } }), { inlineDataMaxRows: 2 }).success).toBe(false);
   });
+
+  it("treats a non-array encoding.y as invalid input without throwing", () => {
+    expect(() => validateVisualizationSpec(baseSpec({ encoding: { x: "month", y: 1 } as never }))).not.toThrow();
+  });
 });
 
 describe("Visualization router", () => {

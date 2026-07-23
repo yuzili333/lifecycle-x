@@ -104,6 +104,42 @@ describe("ToolRegistry", () => {
     expect(result.error?.code).toBe("TOOL_INPUT_INVALID");
   });
 
+  it("validates non-empty strings, arrays, and alternative parameter combinations locally", async () => {
+    const registry = new ToolRegistry();
+    registry.registerTool({
+      name: "renderChart",
+      description: "生成图表",
+      inputSchema: {
+        type: "object",
+        required: ["title"],
+        properties: {
+          title: { type: "string", minLength: 1 },
+          dimensions: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
+          measures: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
+        },
+        anyOf: [
+          { type: "object", required: ["dimensions"], properties: { dimensions: { type: "array", minItems: 1 } } },
+          { type: "object", required: ["measures"], properties: { measures: { type: "array", minItems: 1 } } },
+        ],
+      },
+      handler: async () => ({ ok: true }),
+    });
+
+    const results = await registry.executeToolCalls(
+      [
+        { toolCallId: "valid", index: 0, name: "renderChart", argumentsText: '{"title":"行业分布","dimensions":["行业"]}' },
+        { toolCallId: "empty-title", index: 1, name: "renderChart", argumentsText: '{"title":"","dimensions":["行业"]}' },
+        { toolCallId: "empty-fields", index: 2, name: "renderChart", argumentsText: '{"title":"行业分布","dimensions":[]}' },
+      ],
+      "serial",
+      { conversationId: "conv", messageId: "msg", traceId: "trace" },
+    );
+
+    expect(results[0].success).toBe(true);
+    expect(results[1].error?.code).toBe("TOOL_INPUT_INVALID");
+    expect(results[2].error?.code).toBe("TOOL_INPUT_INVALID");
+  });
+
   it("returns not found and timeout errors as structured tool results", async () => {
     const registry = new ToolRegistry();
     registry.registerTool({
@@ -165,6 +201,44 @@ describe("InMemoryVersionManager", () => {
 });
 
 describe("StreamingModelAdapter", () => {
+  it("executes the sole allowed tool when the provider omits the streamed function name", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(sseResponse([
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_unnamed","function":{"arguments":"{\\"customerId\\":\\"A\\"}"}}]},"finish_reason":"tool_calls"}]}\n\n',
+      "data: [DONE]\n\n",
+    ]));
+    const adapter = createStreamingModelAdapter({
+      baseURL: "https://example.local/v1",
+      apiKey: "secret",
+      model: "test-model",
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+    const inputs: unknown[] = [];
+    adapter.registerTool({
+      name: "searchCustomer",
+      description: "查询客户",
+      inputSchema: {
+        type: "object",
+        required: ["customerId"],
+        properties: { customerId: { type: "string" } },
+      },
+      handler: async (input) => {
+        inputs.push(input);
+        return { status: "completed" };
+      },
+    });
+
+    const events = await collect(adapter.streamChat({
+      ...baseInput(),
+      maxToolRounds: 1,
+      stopAfterToolExecution: true,
+    }));
+
+    expect(inputs).toEqual([{ customerId: "A" }]);
+    expect(events.some((event) => event.type === "tool-execution-result" && event.toolCallId === "call_unnamed")).toBe(true);
+    expect(events.find((event) => event.type === "model-observation" && event.payload.phase === "provider-round-complete")?.payload.detail)
+      .toMatchObject({ toolCallNames: ["searchCustomer"] });
+  });
+
   it("streams markdown events, executes tool calls, continues generation and creates a version", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(sseResponse([

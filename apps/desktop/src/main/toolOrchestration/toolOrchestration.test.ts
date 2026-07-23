@@ -493,9 +493,13 @@ describe("tool orchestration", () => {
     ]);
     expect(definitions.find((tool) => tool.name === "request_sql_query_execution")?.riskLevel).toBe("high");
     expect(definitions.every((tool) => tool.inputSchema.type === "object")).toBe(true);
+    expect(definitions.find((tool) => tool.name === "request_sql_query_execution")?.inputSchema.required).toContain("sql");
+    expect(definitions.find((tool) => tool.name === "request_python_analysis_execution")?.inputSchema.required).toContain("script");
+    expect(definitions.find((tool) => tool.name === "request_markdown_report_generation")?.inputSchema.required).toContain("markdown");
     const chartDefinition = definitions.find((tool) => tool.name === "request_chart_rendering");
     expect(chartDefinition?.description).toContain("横向条形图");
     expect(chartDefinition?.inputSchema.required).toEqual(expect.arrayContaining(["userRequest", "purpose"]));
+    expect(chartDefinition?.inputSchema.anyOf).toHaveLength(2);
     expect(chartDefinition?.inputSchema.required).not.toContain("visualizationSpec");
     expect(chartDefinition?.inputSchema.properties?.chartType?.description).toContain("horizontal_bar");
     expect(chartDefinition?.inputSchema.properties?.visualizationSpec?.description).toContain("type=horizontal_bar");

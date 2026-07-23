@@ -110,12 +110,13 @@ export class OpenAICompatibleProvider {
             const index = toolCall.index ?? 0;
             const toolCallId = toolCall.id ?? toolIdsByIndex.get(index) ?? createId("tool");
             toolIdsByIndex.set(index, toolCallId);
+            const soleAllowedToolName = input.tools?.length === 1 ? input.tools[0]?.name : undefined;
             yield {
               type: "tool-call-delta",
               delta: {
                 toolCallId,
                 index,
-                name: toolCall.function?.name,
+                name: toolCall.function?.name || soleAllowedToolName,
                 argumentsDelta: toolCall.function?.arguments,
               },
             };

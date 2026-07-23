@@ -19,7 +19,7 @@ import {
   type WorkflowStateStore,
 } from "./workflowRuntime";
 import { rewriteCompoundOrderByForSqlite } from "./sqliteSqlRewrite";
-import { parseVisualizationSpecJson, reportVisualizationArtifactIds, visualizationTypes, type VisualizationRenderError, type VisualizationSpec } from "../shared/visualization";
+import { businessVisualizationSemantics, parseVisualizationSpecJson, reportVisualizationArtifactIds, visualizationTypes, type VisualizationRenderError, type VisualizationSpec } from "../shared/visualization";
 import { ReportVisualizationArtifactResolver } from "./reportVisualizationArtifactResolver";
 import {
   SQLiteArtifactManager,
@@ -42,6 +42,21 @@ import {
   type ToolResultRegistry,
 } from "./toolOrchestration";
 import { createStreamingModelAdapter, type ConversationMessage, type ModelStreamEvent, type ToolDefinition } from "./streamingModelAdapter";
+import {
+  AgentTurnOrchestrator,
+  ExecutionParameterAdapter,
+  ReasoningPlannerAdapter,
+  SQLiteAgentProgressStore,
+  agentRunError,
+  executionMessages,
+  orderPlannerSteps,
+  plannerMessages,
+  validatePlannerDecision,
+  type AgentProgressEvent,
+  type AgentRunRecord,
+  type PlannerDecision,
+  type PlannerStep,
+} from "./agentOrchestration";
 import {
   chatCsvError,
   ConversationTempSourceManager,
@@ -147,6 +162,9 @@ export type AssistantToolCallMetadata = {
   temporaryDataSourceLabels?: string[];
   selectedTempDataSourceIds?: string[];
   selectedFieldRefs?: ChatCsvSelectedFieldRef[];
+  agentRunId?: string;
+  agentStepId?: string;
+  orchestrationMode?: "dual_model";
 };
 
 export type AssistantToolCall = {
@@ -172,6 +190,8 @@ export type AssistantSendInput = {
   assistantMessageId?: string;
   prompt: string;
   modelName: string;
+  executionModelName?: string;
+  dualModelOrchestrationEnabled?: boolean;
   dataSourceId?: string | null;
   dataSourceLabel?: string | null;
   selectedTempDataSourceIds?: string[];
@@ -180,6 +200,8 @@ export type AssistantSendInput = {
   schemaContextMarkdown?: string | null;
   skill?: AssistantSkill | null;
   approvalMode: AssistantApprovalMode;
+  agentRunId?: string;
+  agentStepId?: string;
 };
 
 export type AssistantRetryInput = {
@@ -187,6 +209,8 @@ export type AssistantRetryInput = {
   messageId: string;
   clientRequestId: string;
   modelName: string;
+  executionModelName?: string;
+  dualModelOrchestrationEnabled?: boolean;
   dataSourceLabel?: string | null;
   selectedTempDataSourceIds?: string[];
   selectedFieldRefs?: ChatCsvSelectedFieldRef[];
@@ -244,6 +268,7 @@ export type AssistantStreamEvent =
   | { type: "tool"; conversationId: string; toolCall: AssistantToolCall; message: AssistantMessage }
   | { type: "tool-state"; conversationId: string; state: ConversationToolState }
   | { type: "workflow"; conversationId: string; context: WorkflowContextSummary }
+  | { type: "agent-progress"; conversationId: string; messageId: string; event: AgentProgressEvent; run: AgentRunRecord }
   | { type: "error"; conversationId: string; messageId?: string; message: string; traceId: string };
 
 export type AssistantSendResult = {
@@ -298,8 +323,10 @@ const SILICONFLOW_CHAT_COMPLETIONS_URL = "https://api.siliconflow.cn/v1/chat/com
 const MAX_STORED_MESSAGES_FOR_CONTEXT = 12;
 const MAX_STREAM_CHARS = 120_000;
 const MODEL_STREAM_TIMEOUT_MS = 180_000;
+const PLANNER_TOTAL_TIMEOUT_MS = 90_000;
 const PYTHON_TIMEOUT_MS = 5_000;
 const MAX_TOOL_CONTEXT_CHARS = 30_000;
+const MAX_EXECUTION_RESULT_CONTEXT_CHARS = 4_000;
 const WORKFLOW_DATASET_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 function selectedSkillSystemPrompt(skill: AssistantSkill | null | undefined) {
@@ -367,6 +394,33 @@ function stringArrayValue(value: unknown) {
   return value.map((item) => stringValue(item)).filter(Boolean);
 }
 
+function resultPreviewFieldNames(preview: string) {
+  const fields: string[] = [];
+  try {
+    const parsed = JSON.parse(preview) as unknown;
+    if (isPlainRecordValue(parsed)) {
+      const columns = Array.isArray(parsed.columns) ? parsed.columns : [];
+      fields.push(...columns.flatMap((column) => {
+        if (typeof column === "string") return [column];
+        return isPlainRecordValue(column) ? [stringValue(column.name || column.field || column.label)].filter(Boolean) : [];
+      }));
+      const rows = [parsed.previewRows, parsed.rows, parsed.data].find(Array.isArray);
+      if (Array.isArray(rows) && isPlainRecordValue(rows[0])) {
+        fields.push(...Object.keys(rows[0]));
+      }
+    }
+  } catch {
+    const lines = preview.split(/\r?\n/);
+    for (let index = 0; index < lines.length - 1; index += 1) {
+      const line = lines[index].trim();
+      const separator = lines[index + 1].trim();
+      if (!line.startsWith("|") || !/^\|?[\s:|-]+\|?$/.test(separator)) continue;
+      fields.push(...line.split("|").map((value) => value.trim()).filter(Boolean));
+    }
+  }
+  return uniqueValues(fields.map((field) => field.trim()).filter(Boolean));
+}
+
 function isVisualizationTypeValue(value: string): value is VisualizationSpec["type"] {
   return (visualizationTypes as readonly string[]).includes(value);
 }
@@ -427,44 +481,81 @@ function firstArtifactInput(request: Record<string, unknown>, toolState: Convers
   return null;
 }
 
-function normalizeChartVisualizationSpec(
+function normalizeChartDimensions(specValue: unknown, declarativeFields: string[]) {
+  const source = Array.isArray(specValue) && specValue.length > 0 ? specValue : declarativeFields;
+  return source.flatMap((item) => {
+    const record = isPlainRecordValue(item) ? item : {};
+    const field = typeof item === "string" ? item.trim() : stringValue(record.field);
+    if (!field) return [];
+    const dataType = ["category", "time", "number", "boolean", "identifier"].includes(stringValue(record.dataType))
+      ? stringValue(record.dataType)
+      : "category";
+    return [{ ...record, field, label: stringValue(record.label) || field, dataType, role: stringValue(record.role) || "category" }];
+  });
+}
+
+function normalizeChartMeasures(specValue: unknown, declarativeFields: string[], semanticText: string) {
+  const source = Array.isArray(specValue) && specValue.length > 0 ? specValue : declarativeFields;
+  return source.flatMap((item) => {
+    const record = isPlainRecordValue(item) ? item : {};
+    const field = typeof item === "string" ? item.trim() : stringValue(record.field);
+    if (!field) return [];
+    const isRate = /率|占比|百分|rate|ratio|percent/i.test(`${field} ${semanticText}`);
+    const dataType = ["number", "percentage", "currency", "count"].includes(stringValue(record.dataType))
+      ? stringValue(record.dataType)
+      : isRate ? "percentage" : "number";
+    return [{
+      ...record,
+      field,
+      label: stringValue(record.label) || field,
+      dataType,
+      role: stringValue(record.role) || (isRate ? "rate" : "value"),
+      aggregation: stringValue(record.aggregation) || "none",
+      format: isPlainRecordValue(record.format)
+        ? record.format
+        : { type: isRate ? "percentage" : "number", decimals: 2 },
+    }];
+  });
+}
+
+function chartEncodingField(value: unknown, knownFields: Set<string>) {
+  const field = stringValue(value);
+  return field && knownFields.has(field) ? field : undefined;
+}
+
+export function normalizeChartVisualizationSpec(
   request: Record<string, unknown>,
   toolState: ConversationToolState,
   modelToolCallId: string,
 ): Record<string, unknown> {
   const spec = isPlainRecordValue(request.visualizationSpec) ? request.visualizationSpec : {};
-  const dimensions = Array.isArray(spec.dimensions) ? spec.dimensions : stringArrayValue(request.dimensionFields).map((field) => ({
-    field,
-    label: field,
-    dataType: "category",
-    role: "category",
-  }));
-  const measures = Array.isArray(spec.measures) ? spec.measures : stringArrayValue(request.measureFields).map((field) => {
-    const text = `${field} ${stringValue(request.userRequest)} ${stringValue(request.purpose)}`;
-    const isRate = /率|占比|百分|rate|ratio|percent/i.test(text);
-    return {
-      field,
-      label: field,
-      dataType: isRate ? "percentage" : "number",
-      role: isRate ? "rate" : "value",
-      aggregation: "none",
-      format: isRate ? { type: "percentage", decimals: 2 } : { type: "number", decimals: 2 },
-    };
-  });
-  const firstDimension = isPlainRecordValue(dimensions[0]) ? stringValue(dimensions[0].field) : stringArrayValue(request.dimensionFields)[0];
-  const firstMeasure = isPlainRecordValue(measures[0]) ? stringValue(measures[0].field) : stringArrayValue(request.measureFields)[0];
-  const encoding = isPlainRecordValue(spec.encoding)
-    ? spec.encoding
-    : {
-        x: firstDimension || undefined,
-        y: firstMeasure ? [firstMeasure] : undefined,
-        category: firstDimension || undefined,
-        value: firstMeasure || undefined,
-        colorBy: stringValue(request.colorBy) || undefined,
-      };
+  const semanticText = `${stringValue(request.userRequest)} ${stringValue(request.purpose)}`;
+  const dimensions = normalizeChartDimensions(spec.dimensions, stringArrayValue(request.dimensionFields));
+  const measures = normalizeChartMeasures(spec.measures, stringArrayValue(request.measureFields), semanticText);
+  const firstDimension = stringValue(dimensions[0]?.field);
+  const firstMeasure = stringValue(measures[0]?.field);
+  const knownFields = new Set([...dimensions, ...measures].map((item) => stringValue(item.field)).filter(Boolean));
+  const requestedEncoding = isPlainRecordValue(spec.encoding) ? spec.encoding : {};
+  const requestedY = Array.isArray(requestedEncoding.y)
+    ? requestedEncoding.y
+    : typeof requestedEncoding.y === "string"
+      ? [requestedEncoding.y]
+      : [];
+  const encoding = {
+    ...requestedEncoding,
+    x: chartEncodingField(requestedEncoding.x, knownFields) || firstDimension || undefined,
+    y: requestedY.map((field) => chartEncodingField(field, knownFields)).filter(Boolean).length > 0
+      ? requestedY.map((field) => chartEncodingField(field, knownFields)).filter(Boolean)
+      : firstMeasure ? [firstMeasure] : undefined,
+    category: chartEncodingField(requestedEncoding.category, knownFields) || firstDimension || undefined,
+    value: chartEncodingField(requestedEncoding.value, knownFields) || firstMeasure || undefined,
+    colorBy: chartEncodingField(request.colorBy, knownFields) || chartEncodingField(requestedEncoding.colorBy, knownFields),
+  };
   const artifactInput = firstArtifactInput(request, toolState);
-  const data = isPlainRecordValue(spec.data)
-    ? spec.data
+  const declaredData = isPlainRecordValue(spec.data) ? spec.data : null;
+  const declaredDataValid = declaredData?.mode === "inline" || (declaredData?.mode === "artifact" && stringValue(declaredData.artifactId));
+  const data = declaredDataValid
+    ? declaredData
     : artifactInput
       ? {
           mode: "artifact",
@@ -483,7 +574,9 @@ function normalizeChartVisualizationSpec(
     visualizationId: stringValue(spec.visualizationId) || `viz_${modelToolCallId.replace(/[^a-zA-Z0-9_-]/g, "_")}`,
     type: normalizeChartType(request, spec),
     title: stringValue(spec.title) || stringValue(request.title) || stringValue(request.purpose) || "数据可视化图表",
-    businessSemantic: stringValue(spec.businessSemantic) || "generic_analysis",
+    businessSemantic: businessVisualizationSemantics.includes(stringValue(spec.businessSemantic) as (typeof businessVisualizationSemantics)[number])
+      ? stringValue(spec.businessSemantic)
+      : "generic_analysis",
     data,
     dimensions: dimensions.length > 0 ? dimensions : spec.dimensions,
     measures: measures.length > 0 ? measures : spec.measures,
@@ -491,7 +584,13 @@ function normalizeChartVisualizationSpec(
     interaction: isPlainRecordValue(spec.interaction) ? spec.interaction : { tooltip: true, legend: true, exportable: true },
     display: isPlainRecordValue(spec.display) ? spec.display : { responsive: true, showDataSource: true, showWarnings: true },
     provenance: isPlainRecordValue(spec.provenance)
-      ? spec.provenance
+      ? {
+          ...spec.provenance,
+          sourceType: ["sql", "python", "workflow_dataset", "approved_inline"].includes(stringValue(spec.provenance.sourceType))
+            ? stringValue(spec.provenance.sourceType)
+            : artifactInput?.sourceType ?? "workflow_dataset",
+          generatedAt: stringValue(spec.provenance.generatedAt) || nowIso(),
+        }
       : {
           sourceType: artifactInput?.sourceType ?? "workflow_dataset",
           sourceRequestId: artifactInput?.sourceRequestId,
@@ -1975,6 +2074,8 @@ export class AssistantRuntime {
   private readonly tempSourceManager: ConversationTempSourceManager;
   private readonly agentGuidance: ReturnType<typeof createAgentGuidanceModule>;
   private readonly reportVisualizationArtifactResolver: ReportVisualizationArtifactResolver;
+  private readonly agentProgressStore: SQLiteAgentProgressStore;
+  private readonly agentTurnOrchestrator: AgentTurnOrchestrator;
 
   constructor(options: AssistantRuntimeOptions) {
     this.options = options;
@@ -1983,6 +2084,12 @@ export class AssistantRuntime {
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
     this.migrate();
+    this.agentProgressStore = new SQLiteAgentProgressStore(this.db);
+    this.agentProgressStore.migrate();
+    this.agentProgressStore.stopOrphanedRuns();
+    this.agentTurnOrchestrator = new AgentTurnOrchestrator(this.agentProgressStore, (event, run) => {
+      this.options.emit({ type: "agent-progress", conversationId: run.conversationId, messageId: run.messageId, event, run });
+    });
     this.tempSourceManager = new ConversationTempSourceManager(this.db);
     this.tempSourceManager.migrate();
     this.tempSourceManager.cleanupExpired();
@@ -2035,6 +2142,16 @@ export class AssistantRuntime {
       .map((row: Record<string, unknown>) => this.messageFromRow(row))
       .map((message: AssistantMessage) => this.verifyMessageIntegrity(message))
       .map((message: AssistantMessage) => this.normalizePreToolGuidanceMessageForDisplay(message));
+  }
+
+  getAgentRun(userId: string, messageId: string) {
+    const message = this.db.prepare("select id from messages where id = ? and user_id = ?").get(messageId, userId);
+    return message ? this.agentProgressStore.latestForMessage(messageId) : null;
+  }
+
+  listConversationAgentRuns(userId: string, conversationId: string) {
+    const conversation = this.findConversation(userId, conversationId);
+    return conversation ? this.agentProgressStore.listByConversation(conversationId) : [];
   }
 
   createConversation(userId: string, title = "新对话"): AssistantConversation {
@@ -2754,7 +2871,11 @@ export class AssistantRuntime {
     effectiveInput = resume.input;
 
     const tool = detectTool(effectiveInput.prompt);
-    if (!resume.resumed && !tool && await this.pauseForMissingInputGuidance(effectiveInput, conversation, assistantMessage, tempSources)) {
+    if (effectiveInput.dualModelOrchestrationEnabled && !tool) {
+      this.runCancellableAssistantOperation(conversation.id, assistantMessage.id, (signal) =>
+        this.startDualModelRun(effectiveInput, conversation, assistantMessage, signal),
+      );
+    } else if (!resume.resumed && !tool && await this.pauseForMissingInputGuidance(effectiveInput, conversation, assistantMessage, tempSources)) {
       // Paused with actionable guidance; the user can supplement missing inputs in the next turn.
     } else if (!shouldRouteSkillThroughModel(effectiveInput.skill) && await this.routeOverallRiskSkillWorkflow(effectiveInput, conversation, assistantMessage)) {
       // Routed to the governed multi-step skill workflow.
@@ -2791,6 +2912,27 @@ export class AssistantRuntime {
 
     if (!approved) {
       const next = this.updateToolCall(toolCall.id, "declined", undefined, "用户已拒绝执行该工具调用。");
+      if (toolCall.metadata?.agentRunId && toolCall.metadata.agentStepId) {
+        const run = this.agentProgressStore.get(toolCall.metadata.agentRunId);
+        const step = run?.plan?.steps.find((item) => item.stepId === toolCall.metadata?.agentStepId);
+        if (run && step) {
+          this.agentTurnOrchestrator.stepFailed(run.runId, step, agentRunError({
+            code: "TOOL_APPROVAL_REJECTED",
+            phase: "step_failed",
+            stepId: step.stepId,
+            toolCallId: toolCall.id,
+            message: "用户已拒绝执行该工具调用。",
+          }));
+          const processing = this.updateMessage(toolCall.messageId, {
+            status: "processing",
+            content: "工具审批已拒绝，正在结束相关任务。",
+            blocks: [{ id: randomUUID(), type: "text", content: "工具审批已拒绝，正在结束相关任务。" }],
+          });
+          this.options.emit({ type: "tool", conversationId: toolCall.conversationId, toolCall: next, message: processing });
+          this.runCancellableAssistantOperation(toolCall.conversationId, toolCall.messageId, (signal) => this.continueDualModelRun(run.runId, signal));
+          return { success: true as const, toolCall: next, message: processing };
+        }
+      }
       const paused = await this.pauseForApprovalRejectedGuidance({
         conversationId: toolCall.conversationId,
         userId: toolCall.userId,
@@ -2807,7 +2949,30 @@ export class AssistantRuntime {
     const controller = this.registerAbortController(toolCall.messageId);
     const startedAtMs = Date.now();
     try {
+      const agentRun = toolCall.metadata?.agentRunId ? this.agentProgressStore.get(toolCall.metadata.agentRunId) : null;
+      const agentStep = agentRun?.plan?.steps.find((step) => step.stepId === toolCall.metadata?.agentStepId);
+      if (agentRun && agentStep) {
+        this.agentTurnOrchestrator.resumeAfterApproval(agentRun.runId, agentStep, toolCall.id);
+      }
       const result = await this.executeToolCall(toolCall, controller.signal);
+      if (agentRun && agentStep) {
+        if (result.toolCall.status === "completed") {
+          this.agentTurnOrchestrator.stepCompleted(agentRun.runId, agentStep, result.toolCall.id, this.agentToolCompletionSummary(agentStep, result.toolCall));
+        } else {
+          this.agentTurnOrchestrator.stepFailed(agentRun.runId, agentStep, agentRunError({
+            code: "TOOL_EXECUTION_FAILED",
+            phase: "step_failed",
+            stepId: agentStep.stepId,
+            toolCallId: result.toolCall.id,
+            message: result.toolCall.errorMessage || `${this.agentToolLabel(agentStep.toolKind)}未完成。`,
+            recoverable: true,
+          }));
+        }
+        await this.continueDualModelRun(agentRun.runId, controller.signal);
+        const latestMessage = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(toolCall.messageId));
+        const latestToolCall = this.toolCallFromRow(this.db.prepare("select * from tool_calls where id = ?").get(toolCall.id));
+        return { success: true as const, toolCall: latestToolCall, message: latestMessage };
+      }
       if (!controller.signal.aborted) {
         this.cancelledMessageIds.delete(toolCall.messageId);
       }
@@ -3044,6 +3209,10 @@ export class AssistantRuntime {
       return;
     }
     const message = this.messageFromRow(row);
+    const agentRun = this.agentProgressStore.latestForMessage(messageId);
+    if (agentRun) {
+      this.agentTurnOrchestrator.cancel(agentRun.runId);
+    }
     if (message.role !== "assistant" || (message.status !== "receiving" && message.status !== "processing")) {
       return;
     }
@@ -3221,6 +3390,8 @@ export class AssistantRuntime {
       clientRequestId: input.clientRequestId,
       prompt: sourceUserMessage.content,
       modelName,
+      executionModelName: input.executionModelName,
+      dualModelOrchestrationEnabled: input.dualModelOrchestrationEnabled,
       dataSourceLabel: input.dataSourceLabel,
       selectedTempDataSourceIds: tempSources.map((source) => source.tempDataSourceId),
       selectedFieldRefs: retrySelectedFieldRefs,
@@ -3232,6 +3403,10 @@ export class AssistantRuntime {
 
     if (!shouldRouteSkillThroughModel(retryInput.skill) && await this.routeOverallRiskSkillWorkflow(retryInput, nextConversation, assistantMessage)) {
       // Routed to the governed multi-step skill workflow.
+    } else if (retryInput.dualModelOrchestrationEnabled) {
+      this.runCancellableAssistantOperation(nextConversation.id, assistantMessage.id, (signal) =>
+        this.startDualModelRun(retryInput, nextConversation, assistantMessage, signal),
+      );
     } else if (await this.routeLatestAnalysisReport(retryInput, nextConversation, assistantMessage)) {
       // Routed to report generation from the latest Python analysis result.
     } else if (!(await this.routePriorSqlAnalysis(retryInput, nextConversation, assistantMessage))) {
@@ -3705,7 +3880,7 @@ export class AssistantRuntime {
     );
   }
 
-  private async recentToolArtifactContext(conversationId: string) {
+  private async recentToolArtifactContext(conversationId: string, includeParameterInjectionRules = true) {
     const state = await this.toolResultRegistry.getConversationState(conversationId);
     const lines = [
       state.latestSuccessfulSqlToolCallId
@@ -3725,10 +3900,60 @@ export class AssistantRuntime {
       return null;
     }
     return [
-      "最近成功工具结果指针（用于后续工具入参注入）：",
+      includeParameterInjectionRules
+        ? "最近成功工具结果指针（用于后续工具入参注入）："
+        : "最近成功工具结果指针（仅用于判断是否复用历史结果）：",
       ...lines,
-      "入参注入规则：生成图表时优先把 python_analysis artifactIds 填入 inputArtifactIds，并填 sourcePythonToolCallId；没有 Python 结果时使用 sql_query artifactIds 和 sourceSqlToolCallId。生成报告时优先引用 python_analysis，并引用最近 chart_rendering Artifact。",
-    ].join("\n");
+      includeParameterInjectionRules
+        ? "入参注入规则：生成图表时优先把 python_analysis artifactIds 填入 inputArtifactIds，并填 sourcePythonToolCallId；没有 Python 结果时使用 sql_query artifactIds 和 sourceSqlToolCallId。生成报告时优先引用 python_analysis，并引用最近 chart_rendering Artifact。"
+        : null,
+    ].filter((line): line is string => Boolean(line)).join("\n");
+  }
+
+  private async recentToolResultShapeContext(conversationId: string, toolKind: ToolKind) {
+    const upstreamKinds: Partial<Record<ToolKind, ToolKind[]>> = {
+      python_analysis: ["sql_query"],
+      chart_rendering: ["python_analysis", "sql_query"],
+      report_generation: ["python_analysis", "chart_rendering", "sql_query"],
+    };
+    const relevantKinds = upstreamKinds[toolKind] ?? [];
+    if (relevantKinds.length === 0) return null;
+
+    const records = (await this.toolResultRegistry.listByConversation(conversationId))
+      .filter((record) => record.status === "completed" && relevantKinds.includes(record.toolKind));
+    const latestRecords = relevantKinds.flatMap((kind) => {
+      const record = records.filter((candidate) => candidate.toolKind === kind).at(-1);
+      return record ? [record] : [];
+    });
+    if (latestRecords.length === 0) return null;
+
+    const sections = latestRecords.map((record) => {
+      const metadata = record.result?.metadata;
+      const preview = typeof metadata?.resultPreview === "string" ? metadata.resultPreview.trim() : "";
+      const fields = uniqueValues([
+        ...this.toolRecordSelectedFieldNames(record),
+        ...resultPreviewFieldNames(preview),
+      ]);
+      const rowCount = typeof metadata?.rowCount === "number"
+        ? metadata.rowCount
+        : typeof metadata?.sampleCount === "number"
+          ? metadata.sampleCount
+          : null;
+      const artifactIds = record.outputArtifactIds ?? record.result?.artifactIds ?? [];
+      const includePreview = toolKind === "report_generation" && record.toolKind === "python_analysis" && preview;
+      return [
+        `- ${record.toolKind}: toolCallId=${record.toolCallId}`,
+        `  artifactIds=${artifactIds.join(", ") || "--"}`,
+        `  rowCount=${rowCount ?? "--"}`,
+        `  resultFields=${fields.join(", ") || "--"}`,
+        record.result?.summary ? `  summary=${truncateText(record.result.summary, 500)}` : null,
+        includePreview ? `  analysisPreview:\n${truncateText(preview, 2_000)}` : null,
+      ].filter((line): line is string => Boolean(line)).join("\n");
+    });
+    return truncateText(
+      ["当前步骤可引用的真实上游结果摘要（只使用这些字段和 Artifact，不要复述或猜测上游脚本）：", ...sections].join("\n"),
+      MAX_EXECUTION_RESULT_CONTEXT_CHARS,
+    );
   }
 
   private async hasRecordedToolActivityForMessage(conversationId: string, messageId: string) {
@@ -4139,6 +4364,9 @@ export class AssistantRuntime {
       messageId,
       provider: event.provider,
       model: event.model,
+      modelRole: isPlainRecordValue(payload.detail) ? payload.detail.modelRole : undefined,
+      orchestrationPhase: isPlainRecordValue(payload.detail) ? payload.detail.orchestrationPhase : undefined,
+      stepId: isPlainRecordValue(payload.detail) ? payload.detail.stepId : undefined,
     };
     const log = {
       id: randomUUID(),
@@ -4355,6 +4583,9 @@ export class AssistantRuntime {
       temporaryDataSourceLabels: tempSources.map((source) => source.fileName),
       selectedTempDataSourceIds: input.selectedTempDataSourceIds ?? [],
       selectedFieldRefs: input.selectedFieldRefs ?? [],
+      agentRunId: input.agentRunId,
+      agentStepId: input.agentStepId,
+      orchestrationMode: input.agentRunId ? "dual_model" : undefined,
     };
   }
 
@@ -4602,7 +4833,8 @@ export class AssistantRuntime {
       });
       const currentBeforeComplete = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(toolCall.messageId));
       const sourcePrompt = this.sourcePromptForToolCall(completed);
-      const shouldRenderPythonReportCard = completed.kind === "python" && isPythonReportCardContent(sourcePrompt, result);
+      const isDualModelStep = completed.metadata?.orchestrationMode === "dual_model";
+      const shouldRenderPythonReportCard = !isDualModelStep && completed.kind === "python" && isPythonReportCardContent(sourcePrompt, result);
       const completedDisplay = shouldRenderPythonReportCard ? "Python 分析已完成，报告内容已生成，可点击报告卡片查看完整报告。" : result;
       const completedBlock = this.toolBlock(completed, completedDisplay);
       const completedBlocks = preserveContent ? replaceToolBlock(currentBeforeComplete.blocks, completedBlock) : [completedBlock];
@@ -4616,13 +4848,13 @@ export class AssistantRuntime {
         result,
         sqlDataset: sqlDataset ?? undefined,
       });
-      if (completed.kind === "python") {
+      if (!isDualModelStep && completed.kind === "python") {
         await this.maybeCreateAutoChartArtifact(completed, message, toolRecord);
       }
       if (shouldRenderPythonReportCard) {
         await this.registerPythonReportCard(completed, result, message, toolRecord);
       }
-      if (completed.kind === "sql") {
+      if (!isDualModelStep && completed.kind === "sql") {
         if (!shouldAutoStartPythonReport(sourcePrompt)) {
           await this.maybeCreateAutoChartArtifact(completed, message, toolRecord);
         }
@@ -6760,6 +6992,508 @@ export class AssistantRuntime {
     return planning?.context ?? null;
   }
 
+  private async startDualModelRun(
+    input: AssistantSendInput,
+    conversation: AssistantConversation,
+    assistantMessage: AssistantMessage,
+    signal: AbortSignal,
+  ) {
+    const runId = `agent_run_${randomUUID()}`;
+    const reasoningModelName = input.modelName.trim();
+    const executionModelName = input.executionModelName?.trim() || reasoningModelName;
+    const persistedInput = this.persistableAgentInput({
+      ...input,
+      conversationId: conversation.id,
+      executionModelName,
+      dualModelOrchestrationEnabled: true,
+    });
+    this.agentTurnOrchestrator.start({
+      runId,
+      conversationId: conversation.id,
+      messageId: assistantMessage.id,
+      userId: input.userId,
+      attempt: this.agentProgressStore.nextAttempt(assistantMessage.id),
+      reasoningModelName,
+      executionModelName,
+      input: persistedInput,
+    });
+
+    try {
+      throwIfAssistantOperationCancelled(signal);
+      const apiKey = await this.options.getModelApiKey(input.userId);
+      if (!apiKey) {
+        throw agentRunError({
+          code: "MODEL_API_KEY_MISSING",
+          phase: "planning",
+          message: "模型 API Key 未配置，请先在模型配置中保存密钥。",
+          recoverable: true,
+        });
+      }
+
+      const context = await this.buildDualModelContext(input, conversation, "reasoning");
+      const planner = new ReasoningPlannerAdapter({
+        providerName: "siliconflow",
+        baseURL: "https://api.siliconflow.cn/v1",
+        apiKey,
+        model: reasoningModelName,
+        timeoutMs: PLANNER_TOTAL_TIMEOUT_MS,
+      });
+      const planningDeadlineMs = Date.now() + PLANNER_TOTAL_TIMEOUT_MS;
+      const callPlanner = (repairErrors?: string[]) => planner.plan({
+        conversationId: conversation.id,
+        messageId: assistantMessage.id,
+        messages: plannerMessages(context, input.prompt),
+        signal,
+        timeoutMs: Math.max(250, planningDeadlineMs - Date.now()),
+        repairErrors,
+        onEvent: (event) => {
+          if (event.type === "model-observation") this.appendModelObservationLog(input, conversation.id, assistantMessage.id, event);
+        },
+      });
+
+      let plannerOutput = await this.withAgentHeartbeat(
+        runId,
+        "planning",
+        "思考中",
+        callPlanner(),
+      );
+      throwIfAssistantOperationCancelled(signal);
+      let modelResponseText = plannerOutput.content.trim();
+      let validation = plannerOutput.decision === undefined
+        ? null
+        : validatePlannerDecision(plannerOutput.decision);
+      if (validation && !validation.valid && planningDeadlineMs - Date.now() > 500) {
+        this.agentTurnOrchestrator.fallback(runId, "规划结果未通过校验，正在进行一次结构化修复。", { validationErrorCount: validation.errors.length });
+        plannerOutput = await this.withAgentHeartbeat(
+          runId,
+          "planning",
+          "思考中",
+          callPlanner(validation.errors),
+        );
+        modelResponseText = plannerOutput.content.trim() || modelResponseText;
+        validation = plannerOutput.decision === undefined ? null : validatePlannerDecision(plannerOutput.decision);
+      }
+
+      let decision: PlannerDecision | null = validation?.valid ? validation.decision : null;
+      if (!decision && modelResponseText) {
+        decision = {
+          outcome: "respond",
+          summary: "无需调用数据工具，直接回答用户问题。",
+          responseText: modelResponseText,
+          requestedOutputs: [],
+          steps: [],
+        };
+      }
+      if (!decision) {
+        const message = plannerOutput.error
+          ? `推理模型暂时无法完成任务规划：${plannerOutput.error}`
+          : "推理模型未返回可用的计划或文本响应，请重新描述任务目标后再试。";
+        await this.completeDualModelText(runId, conversation.id, assistantMessage.id, message, "clarify");
+        return;
+      }
+      if (decision.outcome !== "execute") {
+        await this.completeDualModelText(
+          runId,
+          conversation.id,
+          assistantMessage.id,
+          decision.responseText || decision.summary,
+          decision.outcome,
+        );
+        return;
+      }
+
+      this.agentTurnOrchestrator.planReady(runId, decision);
+      await this.continueDualModelRun(runId, signal);
+    } catch (error) {
+      if (signal.aborted || isAssistantOperationCancelled(error)) {
+        this.agentTurnOrchestrator.cancel(runId);
+        throw error;
+      }
+      const normalized = this.normalizeAgentRunError(error, "planning");
+      this.agentTurnOrchestrator.fail(runId, normalized);
+      throw new Error(normalized.message);
+    }
+  }
+
+  private async continueDualModelRun(runId: string, signal: AbortSignal) {
+    let run = this.agentProgressStore.get(runId);
+    if (!run?.plan || run.status === "cancelled" || run.status === "failed" || run.status === "completed" || run.status === "partial") {
+      return;
+    }
+    const input = run.input as AssistantSendInput | undefined;
+    if (!input) {
+      const error = agentRunError({ code: "AGENT_RUN_INPUT_MISSING", phase: "failed", message: "Agent Run 缺少恢复上下文。" });
+      this.agentTurnOrchestrator.fail(runId, error);
+      return;
+    }
+    const conversation = this.findConversation(run.userId, run.conversationId);
+    if (!conversation) {
+      this.agentTurnOrchestrator.fail(runId, agentRunError({ code: "CONVERSATION_NOT_FOUND", phase: "failed", message: "对话已失效，无法继续执行。" }));
+      return;
+    }
+    const apiKey = await this.options.getModelApiKey(run.userId);
+    if (!apiKey) {
+      this.agentTurnOrchestrator.fail(runId, agentRunError({ code: "MODEL_API_KEY_MISSING", phase: "failed", message: "模型 API Key 未配置。", recoverable: true }));
+      return;
+    }
+
+    for (const step of orderPlannerSteps(run.plan)) {
+      throwIfAssistantOperationCancelled(signal);
+      run = this.agentProgressStore.get(runId)!;
+      if (run.completedStepIds.includes(step.stepId) || run.failedStepIds.includes(step.stepId)) continue;
+      const failedDependency = step.dependencies.find((dependency) => run!.failedStepIds.includes(dependency));
+      if (failedDependency) {
+        this.agentTurnOrchestrator.stepFailed(runId, step, agentRunError({
+          code: "UPSTREAM_STEP_FAILED",
+          phase: "step_failed",
+          stepId: step.stepId,
+          message: `上游步骤 ${failedDependency} 失败，当前步骤已阻断。`,
+        }));
+        continue;
+      }
+      if (step.dependencies.some((dependency) => !run!.completedStepIds.includes(dependency))) continue;
+
+      const currentMessage = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(run.messageId));
+      const executionInput: AssistantSendInput = {
+        ...input,
+        userId: run.userId,
+        conversationId: run.conversationId,
+        modelName: run.reasoningModelName,
+        executionModelName: run.executionModelName,
+        dualModelOrchestrationEnabled: true,
+        agentRunId: runId,
+        agentStepId: step.stepId,
+      };
+      this.updateMessage(run.messageId, { status: "processing", errorMessage: undefined });
+      this.agentTurnOrchestrator.preparingStep(runId, step);
+      const tool = this.createAssistantRuntimeToolDefinitions(executionInput, conversation, currentMessage, () => undefined, signal)
+        .find((definition) => definition.name === TOOL_NAMES[step.toolKind]);
+      if (!tool) {
+        this.agentTurnOrchestrator.stepFailed(runId, step, agentRunError({
+          code: "TOOL_NOT_REGISTERED",
+          phase: "step_failed",
+          stepId: step.stepId,
+          message: `工具 ${TOOL_NAMES[step.toolKind]} 未注册。`,
+        }));
+        continue;
+      }
+
+      const context = await this.buildDualModelContext(executionInput, conversation, "execution", step);
+      const execution = await this.executeDualModelStep({
+        runId,
+        step,
+        input: executionInput,
+        tool,
+        context,
+        modelName: run.executionModelName,
+        apiKey,
+        signal,
+      });
+      const localToolCall = this.findAgentToolCall(run.messageId, runId, step.stepId);
+      const issues = this.executionParameterIssues(execution);
+
+      if (localToolCall?.status === "pending_approval") {
+        this.agentTurnOrchestrator.waitingApproval(runId, step, localToolCall.id);
+        return;
+      }
+      if (localToolCall?.status === "completed") {
+        this.agentTurnOrchestrator.stepCompleted(runId, step, localToolCall.id, this.agentToolCompletionSummary(step, localToolCall));
+        continue;
+      }
+      if (localToolCall && (localToolCall.status === "blocked" || localToolCall.status === "error" || localToolCall.status === "declined")) {
+        this.agentTurnOrchestrator.stepFailed(runId, step, agentRunError({
+          code: "TOOL_EXECUTION_FAILED",
+          phase: "step_failed",
+          stepId: step.stepId,
+          toolCallId: localToolCall.id,
+          message: localToolCall.errorMessage || `${this.agentToolLabel(step.toolKind)}未完成。`,
+          recoverable: localToolCall.status === "error",
+        }));
+        continue;
+      }
+      const output = isPlainRecordValue(execution.output) ? execution.output : {};
+      if (execution.invoked && output.status === "completed") {
+        this.agentTurnOrchestrator.stepCompleted(
+          runId,
+          step,
+          typeof output.toolCallId === "string" ? output.toolCallId : execution.toolCallId,
+          typeof output.summary === "string" ? output.summary : undefined,
+        );
+        continue;
+      }
+      this.agentTurnOrchestrator.stepFailed(runId, step, agentRunError({
+        code: "TOOL_PARAMETER_GENERATION_FAILED",
+        phase: "step_failed",
+        stepId: step.stepId,
+        toolCallId: execution.toolCallId,
+        message: issues[0] || execution.error || `${this.agentToolLabel(step.toolKind)}未返回可执行参数。`,
+        recoverable: true,
+        retryTrace: [],
+        fallbackTrace: [],
+      }));
+    }
+
+    run = this.agentProgressStore.get(runId)!;
+    const totalSteps = run.plan?.steps.length ?? 0;
+    const summary = run.failedStepIds.length > 0
+      ? `本轮完成 ${run.completedStepIds.length}/${totalSteps} 项任务，${run.failedStepIds.length} 项未完成。可在工作进度和 tool_calls 中查看详情。`
+      : `本轮 ${totalSteps} 项任务已完成，结果已保存到对应 tool_calls${run.plan?.requestedOutputs.includes("report") ? "，报告卡片已生成" : ""}。`;
+    const current = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(run.messageId));
+    const summaryBlock: AssistantBlock = { id: `agent-summary-${runId}`, type: "text", content: summary };
+    const artifactBlocks = current.blocks.filter((block) => Boolean(block.toolCallId) || block.type === "visualization");
+    const completedMessage = this.updateMessage(run.messageId, {
+      status: run.failedStepIds.length > 0 && run.completedStepIds.length === 0 ? "error" : "completed",
+      content: summary,
+      blocks: [summaryBlock, ...artifactBlocks],
+      errorMessage: run.failedStepIds.length > 0 && run.completedStepIds.length === 0 ? run.error?.message : undefined,
+    });
+    this.options.emit({ type: "message", conversationId: run.conversationId, message: completedMessage });
+    this.agentTurnOrchestrator.finish(runId, summary);
+    this.options.emit({
+      type: "stream-content",
+      conversationId: run.conversationId,
+      event: { type: "message_stream_completed", messageId: run.messageId, completedAt: completedMessage.updatedAt },
+    });
+  }
+
+  private async executeDualModelStep(input: {
+    runId: string;
+    step: PlannerStep;
+    input: AssistantSendInput;
+    tool: ToolDefinition;
+    context: string;
+    modelName: string;
+    apiKey: string;
+    signal: AbortSignal;
+  }) {
+    const adapter = new ExecutionParameterAdapter({
+      providerName: "siliconflow",
+      baseURL: "https://api.siliconflow.cn/v1",
+      apiKey: input.apiKey,
+      model: input.modelName,
+      timeoutMs: MODEL_STREAM_TIMEOUT_MS,
+    });
+    let parameterValidationStarted = false;
+    return this.withAgentHeartbeat(
+      input.runId,
+      "preparing_step",
+      `${this.agentToolLabel(input.step.toolKind)}仍在准备参数或执行。`,
+      adapter.execute({
+        conversationId: input.input.conversationId!,
+        messageId: this.agentProgressStore.get(input.runId)!.messageId,
+        step: input.step,
+        messages: executionMessages(input.context, input.input.prompt, input.step, input.tool),
+        tool: input.tool,
+        signal: input.signal,
+        onEvent: (event) => {
+          if (event.type === "model-observation") this.appendModelObservationLog(input.input, input.input.conversationId!, this.agentProgressStore.get(input.runId)!.messageId, event);
+          if (event.type === "tool-call-start" && !parameterValidationStarted) {
+            parameterValidationStarted = true;
+            this.agentTurnOrchestrator.validatingParameters(input.runId, input.step, event.toolCallId);
+          }
+        },
+      }),
+      { stepId: input.step.stepId },
+    );
+  }
+
+  private async completeDualModelText(
+    runId: string,
+    conversationId: string,
+    messageId: string,
+    content: string,
+    outcome: "respond" | "clarify",
+  ) {
+    if (outcome === "clarify") this.agentTurnOrchestrator.clarifying(runId, "需要补充信息，已生成具体说明。");
+    else this.agentTurnOrchestrator.responding(runId, "无需调用工具，正在生成回答。");
+    const completed = this.updateMessage(messageId, { status: "completed", content, blocks: [{ id: randomUUID(), type: "text", content }] });
+    this.options.emit({ type: "stream-content", conversationId, event: {
+      type: "text_delta",
+      messageId,
+      segmentId: generalTextStreamSegmentId(messageId),
+      sequence: 1,
+      delta: content,
+      contentRole: "general",
+    } });
+    this.options.emit({ type: "message", conversationId, message: completed });
+    this.agentTurnOrchestrator.finish(runId, outcome === "clarify" ? "已说明继续任务所需的信息。" : "回答已完成。");
+    this.options.emit({ type: "stream-content", conversationId, event: { type: "message_stream_completed", messageId, completedAt: completed.updatedAt } });
+  }
+
+  private async buildDualModelContext(
+    input: AssistantSendInput,
+    conversation: AssistantConversation,
+    modelRole: "reasoning" | "execution",
+    step?: PlannerStep,
+  ) {
+    const completedHistory = this.getConversationMessages(input.userId, conversation.id)
+      .filter((message) => (message.role === "user" || message.role === "assistant") && message.status === "completed" && message.content.trim())
+      .filter((message, index, messages) => !(
+        index === messages.length - 1 &&
+        message.role === "user" &&
+        message.content.trim() === input.prompt.trim()
+      ));
+
+    if (modelRole === "reasoning") {
+      const [workflow, recentToolArtifactContext] = await Promise.all([
+        this.workflowContextBuilder.build(conversation.id),
+        this.recentToolArtifactContext(conversation.id, false),
+      ]);
+      const fields = (input.selectedFieldRefs ?? [])
+        .filter((field) => field.status === "valid" && field.rawText && field.physicalName)
+        .filter((field, index, all) => all.findIndex((item) => item.rawText === field.rawText && item.physicalName === field.physicalName) === index)
+        .map((field) => `- #${field.rawText} => ${field.physicalName}${field.displayName ? `（${field.displayName}）` : ""}`)
+        .join("\n");
+      const workflowSummary = !workflow.workflowId && workflow.datasets.length === 0
+        ? null
+        : [
+            "可复用工作流摘要：",
+            `- workflowId: ${workflow.workflowId ?? "--"}`,
+            `- activeDataset: ${workflow.activeDataset ? `${workflow.activeDataset.datasetId} / ${workflow.activeDataset.name}` : "--"}`,
+            `- latestSqlDataset: ${workflow.latestSqlDataset?.datasetId ?? "--"}`,
+            `- latestPythonAnalysis: ${workflow.latestPythonAnalysis ? `${workflow.latestPythonAnalysis.pythonExecutionId ?? "--"} / ${truncateText(workflow.latestPythonAnalysis.summary ?? "--", 300)}` : "--"}`,
+            `- latestReport: ${workflow.latestReport ? `${workflow.latestReport.reportVersionId ?? "--"} / ${truncateText(workflow.latestReport.summary ?? "--", 300)}` : "--"}`,
+            ...workflow.datasets.slice(-6).map((dataset) =>
+              `- dataset: ${dataset.datasetId}; name=${dataset.name}; rows=${dataset.rowCount ?? "--"}; columns=${dataset.columnCount ?? "--"}`
+            ),
+          ].join("\n");
+      const history = completedHistory
+        .slice(-4)
+        .map((message) => `${message.role === "user" ? "用户" : "助手"}：${message.content.slice(0, 600)}`)
+        .join("\n");
+      return [
+        `当前数据源：${input.dataSourceLabel || "未选择"}`,
+        `当前 Skill：${input.skill || "未选择"}`,
+        fields ? `本轮真实字段引用：\n${fields}` : undefined,
+        workflowSummary || undefined,
+        recentToolArtifactContext || undefined,
+        history ? `最近对话摘要：\n${history}` : undefined,
+        "只规划用户明确要求的目标；禁止使用模拟数据或扩展指标、图表和报告章节。",
+      ].filter(Boolean).join("\n\n");
+    }
+
+    const toolKind = step?.toolKind;
+    const needsWorkflowContext = toolKind === "python_analysis";
+    const needsArtifactContext = toolKind !== "sql_query";
+    const [workflowContext, recentToolArtifactContext, recentToolResultShapeContext] = await Promise.all([
+      needsWorkflowContext ? this.workflowContextBuilder.buildMarkdown(conversation.id) : Promise.resolve(""),
+      needsArtifactContext ? this.recentToolArtifactContext(conversation.id) : Promise.resolve(null),
+      toolKind ? this.recentToolResultShapeContext(conversation.id, toolKind) : Promise.resolve(null),
+    ]);
+    const fields = selectedFieldReferencesMarkdown(input.selectedFieldRefs);
+    const history = completedHistory
+      .slice(-4)
+      .map((message) => `${message.role === "user" ? "用户" : "助手"}：${message.content.slice(0, 800)}`)
+      .join("\n");
+    return [
+      `模型角色：${modelRole}`,
+      `当前数据源：${input.dataSourceLabel || "未选择"}`,
+      `当前 Skill：${input.skill || "未选择"}`,
+      `审批权限：${input.approvalMode}`,
+      step ? `当前步骤输入策略：${step.inputResolution}` : undefined,
+      fields || undefined,
+      toolKind === "sql_query" && input.schemaContextMarkdown ? `已授权数据源 Schema：\n${input.schemaContextMarkdown}` : undefined,
+      workflowContext || undefined,
+      recentToolArtifactContext || undefined,
+      recentToolResultShapeContext || undefined,
+      history ? `最近对话摘要：\n${history}` : undefined,
+      "禁止使用模拟数据；禁止扩展用户未明确要求的字段、指标、图表或报告章节。",
+    ].filter(Boolean).join("\n\n");
+  }
+
+  private persistableAgentInput(input: AssistantSendInput): Record<string, unknown> {
+    return JSON.parse(JSON.stringify({
+      userId: input.userId,
+      conversationId: input.conversationId,
+      clientRequestId: input.clientRequestId,
+      prompt: input.prompt,
+      modelName: input.modelName,
+      executionModelName: input.executionModelName,
+      dualModelOrchestrationEnabled: true,
+      dataSourceId: input.dataSourceId,
+      dataSourceLabel: input.dataSourceLabel,
+      selectedTempDataSourceIds: input.selectedTempDataSourceIds,
+      selectedFieldRefs: input.selectedFieldRefs,
+      tempSchemaFieldLimit: input.tempSchemaFieldLimit,
+      schemaContextMarkdown: input.schemaContextMarkdown,
+      skill: input.skill,
+      approvalMode: input.approvalMode,
+    }));
+  }
+
+  private findAgentToolCall(messageId: string, runId: string, stepId: string) {
+    const rows = this.db.prepare("select * from tool_calls where message_id = ? order by created_at desc").all(messageId) as Array<Record<string, unknown>>;
+    return rows.map((row) => this.toolCallFromRow(row)).find((toolCall) =>
+      toolCall.metadata?.agentRunId === runId && toolCall.metadata?.agentStepId === stepId,
+    );
+  }
+
+  private markAgentToolParametersValidated(input: AssistantSendInput, toolCallId: string) {
+    if (!input.agentRunId || !input.agentStepId) return;
+    const run = this.agentProgressStore.get(input.agentRunId);
+    const step = run?.plan?.steps.find((item) => item.stepId === input.agentStepId);
+    if (run && step) {
+      this.agentTurnOrchestrator.toolExecuting(run.runId, step, toolCallId);
+    }
+  }
+
+  private executionParameterIssues(execution: { invoked: boolean; output?: unknown; error?: string; content?: string }) {
+    if (execution.error) return [execution.error];
+    if (!execution.invoked) return [execution.content?.trim() || "执行模型未调用指定工具。"];
+    if (!isPlainRecordValue(execution.output)) return [];
+    if (execution.output.status !== "parameter_issue" && execution.output.status !== "waiting_input") return [];
+    const invalid = Array.isArray(execution.output.invalidParameters) ? execution.output.invalidParameters : [];
+    const messages = invalid.flatMap((item) => isPlainRecordValue(item) && typeof item.message === "string" ? [item.message] : []);
+    return messages.length > 0 ? messages : [typeof execution.output.message === "string" ? execution.output.message : "工具参数不完整。"];
+  }
+
+  private agentToolCompletionSummary(step: PlannerStep, toolCall: AssistantToolCall) {
+    if (step.toolKind === "sql_query") {
+      const rowCount = parseSqlToolRowCount(toolCall.result);
+      return rowCount == null ? "SQL 查询已完成。" : `SQL 查询已完成，共获得 ${rowCount} 条记录。`;
+    }
+    return `${this.agentToolLabel(step.toolKind)}已完成。`;
+  }
+
+  private agentToolLabel(toolKind: ToolKind) {
+    if (toolKind === "sql_query") return "SQL 查询";
+    if (toolKind === "python_analysis") return "Python 分析";
+    if (toolKind === "chart_rendering") return "绘制图表";
+    return "生成报告";
+  }
+
+  private normalizeAgentRunError(error: unknown, phase: AgentProgressEvent["phase"]) {
+    if (isPlainRecordValue(error) && typeof error.code === "string" && typeof error.message === "string") {
+      return agentRunError({ ...(error as ReturnType<typeof agentRunError>), phase });
+    }
+    return agentRunError({
+      code: "AGENT_RUN_FAILED",
+      phase,
+      message: error instanceof Error ? error.message : "Agent Run 执行失败。",
+      recoverable: true,
+    });
+  }
+
+  private async withAgentHeartbeat<T>(
+    runId: string,
+    phase: AgentProgressEvent["phase"],
+    summary: string,
+    promise: Promise<T>,
+    context: { stepId?: string; toolCallId?: string } = {},
+  ) {
+    const timer = setInterval(() => {
+      const run = this.agentProgressStore.get(runId);
+      if (run && run.status !== "cancelled" && run.status !== "failed" && run.status !== "completed" && run.status !== "partial") {
+        this.agentTurnOrchestrator.progress(runId, { phase, status: "running", summary, ...context });
+      }
+    }, 8_000);
+    try {
+      return await promise;
+    } finally {
+      clearInterval(timer);
+    }
+  }
+
   private async routeDeterministicTempCsvToolPlan(
     input: AssistantSendInput,
     conversation: AssistantConversation,
@@ -7215,6 +7949,7 @@ export class AssistantRuntime {
         ].join(" "),
       };
     }
+    this.markAgentToolParametersValidated(input, modelToolCallId);
     const currentMessage = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(assistantMessage.id));
     await this.handleToolCall(
       {
@@ -7275,6 +8010,7 @@ export class AssistantRuntime {
         message: "request_python_analysis_execution 需要提供 script 字段，或先完成可分析 SQL/Workflow 数据集。",
       };
     }
+    this.markAgentToolParametersValidated(input, modelToolCallId);
     const currentMessage = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(assistantMessage.id));
     await this.handleToolCall(
       {
@@ -7333,12 +8069,19 @@ export class AssistantRuntime {
       inlineDataMaxBytes: 64 * 1024,
     });
     if (!parsed.success) {
-      return {
-        status: "waiting_input",
+      return buildModelToolParameterIssueFeedback({
+        toolKind: "chart_rendering",
         toolCallId: modelToolCallId,
-        message: `request_chart_rendering 需要提供合法 visualizationSpec：${parsed.error.message}`,
-      };
+        invalidParameters: [{
+          parameterName: "visualizationSpec",
+          value: request.visualizationSpec,
+          reason: "incompatible",
+          message: [parsed.error.message, ...(parsed.error.details ?? [])].join(" "),
+        }],
+        latestToolState: toolState,
+      });
     }
+    this.markAgentToolParametersValidated(input, modelToolCallId);
     const record = await this.registerGeneratedToolRecord({
       toolKind: "chart_rendering",
       toolCallId: `chart_${modelToolCallId}`,
@@ -7427,6 +8170,7 @@ export class AssistantRuntime {
         message: "request_markdown_report_generation 需要提供 markdown 字段，或先完成报告内容生成。",
       };
     }
+    this.markAgentToolParametersValidated(input, modelToolCallId);
     markdown = appendVisualizationReferencesToReport(markdown, {
       userRequest: toolRequestText(request, input.prompt),
       chartToolCallId: toolState.latestSuccessfulChartToolCallId,

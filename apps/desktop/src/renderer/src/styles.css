@@ -1575,6 +1575,74 @@ button {
   line-height: 1;
 }
 
+.assistant-message-duration-button {
+  gap: 3px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+}
+
+.assistant-message-duration-button:hover {
+  color: var(--workbench-foreground, #e6edf6);
+}
+
+.assistant-agent-progress {
+  width: min(100%, 720px);
+  margin: 0 0 6px 44px;
+  padding: 10px 12px;
+  border-left: 2px solid color-mix(in srgb, var(--workbench-accent, #65d6d2) 45%, transparent);
+  color: color-mix(in srgb, var(--workbench-foreground, #e6edf6) 72%, transparent);
+  font-size: 12px;
+}
+
+.assistant-agent-progress-heading {
+  display: flex;
+  gap: 7px;
+  align-items: center;
+  margin-bottom: 8px;
+  color: var(--workbench-foreground, #e6edf6);
+  font-weight: 600;
+}
+
+.assistant-agent-progress-events {
+  display: grid;
+  gap: 6px;
+}
+
+.assistant-agent-progress-event {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  gap: 6px;
+  align-items: start;
+  line-height: 1.45;
+}
+
+.assistant-agent-progress-event-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 17px;
+}
+
+.assistant-agent-progress-event.is-success {
+  color: color-mix(in srgb, var(--workbench-foreground, #e6edf6) 82%, transparent);
+}
+
+.assistant-agent-progress-event.is-error,
+.assistant-agent-progress-event.is-cancelled {
+  color: var(--astryx-color-text-danger, #ff8e8e);
+}
+
+@media (max-width: 720px) {
+  .assistant-agent-progress {
+    width: 100%;
+    margin-left: 0;
+  }
+}
+
 .assistant-message-status-spinner {
   animation: assistant-spin 0.9s linear infinite;
 }
