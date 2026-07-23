@@ -1,11 +1,26 @@
 import { describe, expect, it } from "vitest";
-import { appendVisualizationReferencesToReport, buildFallbackTempCsvSqlForAnalysisRequest, buildGenericSqlResultAnalysisPythonScript, buildModelToolParameterIssueFeedback, buildOverallRiskDistributionMarkdown, detectToolFromAssistantOutput, formatStoppedGenerationMessage, generalStreamSegmentId, generalTextStreamSegmentId, generatedReportArtifactId, generatedReportToolCallId, inferReportTitle, isPreToolTextGuidanceRequiredInputs, isPythonReportCardContent, isReportGenerationContent, normalizeAnalysisReportMarkdown, normalizeAnalysisReportTitle, normalizeChartVisualizationSpec, providerToolFallbackText, renderLocalToolPlanContext, reportStreamSegmentId, selectedFieldReferencesMarkdown, shouldAnalyzePriorSqlResult, shouldAutoStartPythonReport, shouldDeferChartUntilUpstreamTools, shouldDeferReportUntilChartTool, shouldEagerStartToolFromAssistantStream, shouldForceGenericSqlResultAnalysisScript, shouldGenerateReportFromAnalysisResult, shouldKeepProviderToolActivityMessage, shouldRegisterAssistantGeneratedArtifacts, shouldRequireDetailSqlForCompositeAnalysis, shouldRouteDeterministicTempCsvToolPlan, shouldRouteSkillThroughModel, shouldStartOverallRiskWorkflowAfterModelText, shouldUseModelForPriorResultVisualization, shouldUseModelForUnclearTaskGoal } from "./assistantRuntime";
+import { appendVisualizationReferencesToReport, buildFallbackTempCsvSqlForAnalysisRequest, buildGenericSqlResultAnalysisPythonScript, buildModelToolParameterIssueFeedback, buildOverallRiskDistributionMarkdown, detectToolFromAssistantOutput, formatStoppedGenerationMessage, generalStreamSegmentId, generalTextStreamSegmentId, generatedReportArtifactId, generatedReportToolCallId, inferReportTitle, isPreToolTextGuidanceRequiredInputs, isPythonReportCardContent, isReportGenerationContent, mergeReportChartSections, normalizeAnalysisReportMarkdown, normalizeAnalysisReportTitle, normalizeChartVisualizationSpec, providerToolFallbackText, renderLocalToolPlanContext, reportStreamSegmentId, selectedFieldReferencesMarkdown, shouldAnalyzePriorSqlResult, shouldAutoStartPythonReport, shouldDeferChartUntilUpstreamTools, shouldDeferReportUntilChartTool, shouldEagerStartToolFromAssistantStream, shouldForceGenericSqlResultAnalysisScript, shouldGenerateReportFromAnalysisResult, shouldKeepProviderToolActivityMessage, shouldRegisterAssistantGeneratedArtifacts, shouldRequireDetailSqlForCompositeAnalysis, shouldRouteDeterministicTempCsvToolPlan, shouldRouteSkillThroughModel, shouldStartOverallRiskWorkflowAfterModelText, shouldUseModelForPriorResultVisualization, shouldUseModelForUnclearTaskGoal, summarizeToolArguments } from "./assistantRuntime";
 import { TOOL_NAMES, type ToolExecutionPlan } from "./toolOrchestration";
 import { MissingInputDetector } from "./agentGuidance";
 import type { ChatCsvSelectedFieldRef, ConversationTempCsvTable } from "./chatCsvTempSource";
 import { validateVisualizationSpec } from "../shared/visualization";
 
 describe("AssistantRuntime workflow intent", () => {
+  it("logs parameter shape without persisting raw model arguments", () => {
+    const summary = summarizeToolArguments(JSON.stringify({
+      sql: "select secret_value from private_table",
+      dimensionFields: ["branch_name"],
+      options: { sort: "desc" },
+    }));
+    expect(summary).toMatchObject({
+      parseable: true,
+      keys: ["dimensionFields", "options", "sql"],
+      arrayLengths: { dimensionFields: 1 },
+      objectKeys: { options: ["sort"] },
+    });
+    expect(JSON.stringify(summary)).not.toContain("private_table");
+  });
+
   it("normalizes partial chart parameters locally without another model request", () => {
     const spec = normalizeChartVisualizationSpec({
       userRequest: "绘制行业占比横向条形图",
@@ -149,11 +164,67 @@ describe("AssistantRuntime workflow intent", () => {
     expect(markdown).toContain("```visualization");
     expect(markdown).toContain('"artifactId": "chart-artifact-1"');
     expect(markdown).toContain('"sourceRequestId": "chart-1"');
+    expect(markdown).toContain("## 可视化图表");
+    expect(markdown).toContain('"title": "可视化图表"');
     expect(appendVisualizationReferencesToReport(markdown, {
       userRequest: "绘制风险分布图并生成报告",
       chartToolCallId: "chart-1",
       chartArtifactIds: ["chart-artifact-1"],
     }).match(/```visualization/g)).toHaveLength(1);
+  });
+
+  it("merges chart conclusions and embedded visualizations into one report section", () => {
+    const historicalMarkdown = [
+      "# 信贷风险分析报告",
+      "",
+      "### 3. 图表分析",
+      "*(图表引用：assistant-chart-spec:chart-1)*",
+      "批发业风险率高于零售业。",
+      "",
+      "### 结论",
+      "建议关注高风险行业。",
+      "",
+      "## 图表",
+      "```visualization",
+      '{"artifactId":"chart-artifact-1"}',
+      "```",
+    ].join("\n");
+    const merged = mergeReportChartSections(historicalMarkdown);
+
+    expect(merged.match(/^#{1,6}\s+.*(?:图表|可视化).*$/gm)).toHaveLength(1);
+    expect(merged).toContain("批发业风险率高于零售业。");
+    expect(merged).toContain("### 结论");
+    expect(merged).toContain("```visualization");
+    expect(merged).not.toContain("图表引用");
+
+    const sanitized = mergeReportChartSections([
+      "# 风险分析报告",
+      "",
+      "根据上游 Python 分析结果（Artifact: assistant-python-analysis:6b0bdf70-101d-48d6-bf8a-076670d755c1），关注类占比最高。",
+      "结合生成的条形图（Artifact: assistant-chart-spec:chatcmpl-tool-8373cf7c7a0fbff9），上海分行排名第一。",
+      "![批发业与零售业条形图](assistant-chart-spec:chatcmpl-tool-8373cf7c7a0fbff9)",
+      '<img src="/private/tmp/risk-chart.png" alt="临时图表">',
+    ].join("\n"));
+    expect(sanitized).toContain("根据分析结果，关注类占比最高。");
+    expect(sanitized).toContain("结合可视化图表，上海分行排名第一。");
+    expect(sanitized).not.toContain("Artifact:");
+    expect(sanitized).not.toContain("assistant-python-analysis");
+    expect(sanitized).not.toContain("assistant-chart-spec");
+    expect(sanitized).not.toContain("![");
+    expect(sanitized).not.toContain("<img");
+    expect(sanitized).not.toContain("/private/tmp");
+
+    const appended = appendVisualizationReferencesToReport(
+      "# 风险分析报告\n\n### 图表分析\n已有分析结论。\n\n### 结论\n总体结论。",
+      {
+        userRequest: "绘制条形图并生成报告",
+        chartToolCallId: "chart-1",
+        chartArtifactIds: ["chart-artifact-1"],
+      },
+    );
+    expect(appended.match(/^#{1,6}\s+.*(?:图表|可视化).*$/gm)).toHaveLength(1);
+    expect(appended.indexOf("```visualization")).toBeLessThan(appended.indexOf("### 结论"));
+    expect(appended).not.toContain("图表引用");
   });
 
   it("renders compact local tool planning context without full prompt content", () => {

@@ -30,6 +30,7 @@ export type WorkbenchSettings = {
     modelName: string;
     executionModelName?: string;
     dualModelOrchestrationEnabled?: boolean;
+    thinkingOptimizationEnabled?: boolean;
     apiKeyStatus: "not_configured" | "configured";
     skillEnabled: boolean;
     mcpEnabled: boolean;

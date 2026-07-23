@@ -18,6 +18,9 @@ pnpm desktop:build
 - `plan`: 系统分析和方案设计输入。
 - `reference`: 存续期业务背景资料。
 
+双模型职责、L0-L4 路由、Thinking Budget、统一事件协议、配置、监控、灰度与回滚说明见
+[双模型 Thinking 配置与流式架构](docs/architecture/thinking-optimization.md)。
+
 ## Agent 工作流流程示意图
 
 当前版本的 Agent 工作流以 `AssistantRuntime.sendMessage` 为入口，围绕“会话上下文准备、缺参与断点恢复、大模型推理、受控工具调用、Artifact/报告产出、异常恢复”推进。下图参照 `beautiful-mermaid` 的 **System Architecture** 分层图样式组织，将流程拆为 Client、Runtime、Tool、Data 和 Recovery 五层；渲染时使用 `THEMES['dracula']` 主题，保持与示例站点 Dracula 主题图表风格一致。

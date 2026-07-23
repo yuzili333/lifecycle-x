@@ -23,14 +23,15 @@ describe("AgentProgressPanel", () => {
   it("merges planning updates into one thinking record", () => {
     const run = createRun("planning", [
       createEvent("accepted", "running", "已接收任务，正在分析目标与可用数据。"),
-      createEvent("planning", "running", "思考中"),
-      createEvent("planning", "running", "思考中"),
+      createEvent("planning", "running", "推理模型正在规划任务。"),
+      createEvent("planning", "running", "推理模型仍在规划任务，已持续等待。"),
     ]);
 
     const html = renderToStaticMarkup(<AgentProgressPanel run={run} />);
 
     expect(html.match(/思考中/g)).toHaveLength(1);
     expect(html).not.toContain("已接收任务，正在分析目标与可用数据。");
+    expect(html).not.toContain("推理模型仍在规划任务，已持续等待。");
     expect(shouldShowMessageMetadataStatus(true, run)).toBe(false);
   });
 
@@ -38,6 +39,7 @@ describe("AgentProgressPanel", () => {
     const run = createRun("completed", [
       createEvent("preparing_step", "running", "SQL 查询仍在执行。", "query"),
       createEvent("step_completed", "success", "SQL 查询已完成。", "query"),
+      createEvent("fallback", "info", "推理模型已超时，已使用 Qwen 降级计划。"),
       createEvent("completed", "success", "本轮 1 项任务已完成。"),
     ]);
 
@@ -47,6 +49,8 @@ describe("AgentProgressPanel", () => {
     expect(formatDurationMs(125_000)).toBe("2m 5s");
     expect(html).toContain("Assistant 工作记录");
     expect(html).toContain("本轮 1 项任务已完成。");
+    expect(html).toContain("推理模型已超时，已使用 Qwen 降级计划。");
+    expect(html).toContain("lucide-badge-info");
     expect(html).not.toContain("SQL 查询仍在执行。");
     expect(html).not.toContain("assistant-message-status-spinner");
     expect(html).not.toContain("等待审批 45s");
@@ -64,6 +68,8 @@ function createRun(status: AgentRunRecord["status"], events: AgentProgressEvent[
     status,
     reasoningModelName: "reasoning-model",
     executionModelName: "execution-model",
+    kimiCallCount: 0,
+    cumulativeThinkingBudget: 0,
     completedStepIds: status === "completed" ? ["query"] : [],
     failedStepIds: [],
     activeDurationMs: 125_000,

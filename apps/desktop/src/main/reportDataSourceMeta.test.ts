@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { artifactDataSourceMeta } from "../renderer/src/DataAssistantWorkspace";
+import { artifactDataSourceMeta, sortToolRecordsByExecutionOrder, toolRecordDurationMs } from "../renderer/src/DataAssistantWorkspace";
 import type { AssistantMessage } from "./assistantRuntime";
 import type { ConversationToolState, ToolCallRecord } from "./toolOrchestration";
 
@@ -86,5 +86,38 @@ describe("artifactDataSourceMeta", () => {
       count: 1,
       labels: ["loan_contracts.csv"],
     });
+  });
+});
+
+describe("tool call presentation", () => {
+  it("sorts tool records by actual completion order and reads recorded durations", () => {
+    const report = {
+      ...record("report-1", "report_generation", {}),
+      createdAt: "2026-07-17T00:00:00.000Z",
+      updatedAt: "2026-07-17T00:00:04.000Z",
+      completedAt: "2026-07-17T00:00:04.000Z",
+      metadata: { toolDurationMs: 200 },
+    };
+    const sql = {
+      ...record("sql-1", "sql_query", {}),
+      createdAt: "2026-07-17T00:00:01.000Z",
+      updatedAt: "2026-07-17T00:00:02.000Z",
+      completedAt: "2026-07-17T00:00:02.000Z",
+      metadata: { toolDurationMs: 1_000 },
+    };
+    const chart = {
+      ...record("chart-1", "chart_rendering", {}),
+      createdAt: "2026-07-17T00:00:00.000Z",
+      updatedAt: "2026-07-17T00:00:03.000Z",
+      completedAt: "2026-07-17T00:00:03.000Z",
+      metadata: { toolDurationMs: 80 },
+    };
+
+    expect(sortToolRecordsByExecutionOrder([report, chart, sql]).map((item) => item.toolCallId)).toEqual([
+      "sql-1",
+      "chart-1",
+      "report-1",
+    ]);
+    expect(toolRecordDurationMs(report)).toBe(200);
   });
 });

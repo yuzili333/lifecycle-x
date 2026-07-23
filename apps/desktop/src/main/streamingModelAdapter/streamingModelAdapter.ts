@@ -1,6 +1,6 @@
 import { ModelAdapterError, toModelAdapterError } from "./errors";
 import { StreamingMarkdownParser } from "./markdownStreamParser";
-import { OpenAICompatibleProvider, type ProviderStreamEvent } from "./openAICompatibleProvider";
+import { OpenAICompatibleProvider, type ProviderStreamEvent, type ProviderUsage } from "./openAICompatibleProvider";
 import { aggregateToolCallDelta, ToolRegistry } from "./toolRegistry";
 import type {
   AggregatedToolCall,
@@ -179,9 +179,17 @@ export class StreamingModelAdapter {
     const requestedAtMs = Date.now();
     let firstModelEventMs: number | null = null;
     let firstTokenMs: number | null = null;
+    let firstReasoningTokenMs: number | null = null;
     let firstContentTokenMs: number | null = null;
     let firstToolCallMs: number | null = null;
     let contentDeltaChars = 0;
+    let reasoningDeltaChars = 0;
+    let lastReasoningProgressChars = 0;
+    let usage: ProviderUsage | null = null;
+    const requestOptions = input.requestOptions ?? this.config.requestOptions;
+    const modelRole = typeof input.metadata?.modelRole === "string" ? input.metadata.modelRole : undefined;
+    const orchestrationPhase = typeof input.metadata?.orchestrationPhase === "string" ? input.metadata.orchestrationPhase : undefined;
+    const toolKind = typeof input.metadata?.toolKind === "string" ? input.metadata.toolKind : undefined;
     let finishReason: string | undefined;
 
     yield this.modelObservationEvent(input, traceId, "provider-round-start", "info", "模型请求开始。", {
@@ -189,6 +197,8 @@ export class StreamingModelAdapter {
       allowTools,
       model: input.model ?? this.config.model,
       timeoutMs: input.timeoutMs ?? this.config.timeoutMs,
+      firstEventTimeoutMs: input.firstEventTimeoutMs,
+      requestOptions: sanitizedRequestOptions(requestOptions),
       ...requestSummary,
     });
 
@@ -201,9 +211,32 @@ export class StreamingModelAdapter {
         tools,
         signal: input.signal,
         timeoutMs: input.timeoutMs,
+        firstEventTimeoutMs: input.firstEventTimeoutMs,
+        requestOptions: input.requestOptions,
       })) {
+        if (providerEvent.type === "request-retry") {
+          yield this.modelObservationEvent(input, traceId, "provider-retry", "info", "模型服务请求正在进行有限重试。", {
+            roundIndex,
+            retryAttempt: providerEvent.attempt,
+            retryReason: providerEvent.reason,
+            retryDelayMs: providerEvent.delayMs,
+          });
+          continue;
+        }
         firstModelEventMs ??= Date.now() - requestedAtMs;
-        if (providerEvent.type === "content-delta") {
+        if (providerEvent.type === "reasoning-delta") {
+          firstTokenMs ??= Date.now() - requestedAtMs;
+          firstReasoningTokenMs ??= Date.now() - requestedAtMs;
+          reasoningDeltaChars += providerEvent.delta.length;
+          if (lastReasoningProgressChars === 0 || reasoningDeltaChars - lastReasoningProgressChars >= 1_024) {
+            lastReasoningProgressChars = reasoningDeltaChars;
+            yield this.modelObservationEvent(input, traceId, "reasoning-progress", "info", "推理模型正在规划。", {
+              roundIndex,
+              firstReasoningTokenMs,
+              reasoningDeltaChars,
+            });
+          }
+        } else if (providerEvent.type === "content-delta") {
           firstTokenMs ??= Date.now() - requestedAtMs;
           firstContentTokenMs ??= Date.now() - requestedAtMs;
           contentDeltaChars += providerEvent.delta.length;
@@ -232,6 +265,8 @@ export class StreamingModelAdapter {
           );
         } else if (providerEvent.type === "end") {
           finishReason = providerEvent.finishReason;
+        } else if (providerEvent.type === "usage") {
+          usage = providerEvent.usage;
         }
       }
     } catch (error) {
@@ -243,13 +278,29 @@ export class StreamingModelAdapter {
         durationMs: Date.now() - requestedAtMs,
         firstModelEventMs,
         firstTokenMs,
+        firstReasoningTokenMs,
         firstContentTokenMs,
         firstToolCallMs,
         returnedToolCalls: toolCalls.size > 0,
         toolCallCount: toolCalls.size,
         toolCallNames: Array.from(toolCalls.values()).map((toolCall) => toolCall.name).filter(Boolean),
+        toolCallParameterShapes: Array.from(toolCalls.values()).map(summarizeAggregatedToolCall),
         contentDeltaChars,
+        reasoningDeltaChars,
+        usage,
         finishReason: finishReason ?? "error",
+        ...standardTelemetry({
+          modelRole,
+          orchestrationPhase,
+          toolKind,
+          durationMs: Date.now() - requestedAtMs,
+          firstModelEventMs,
+          firstContentTokenMs,
+          firstToolCallMs,
+          reasoningDeltaChars,
+          requestOptions,
+          usage,
+        }),
         error: adapterError.serialize(),
       });
       throw error;
@@ -268,13 +319,29 @@ export class StreamingModelAdapter {
       durationMs: Date.now() - requestedAtMs,
       firstModelEventMs,
       firstTokenMs,
+      firstReasoningTokenMs,
       firstContentTokenMs,
       firstToolCallMs,
       returnedToolCalls: toolCalls.size > 0,
       toolCallCount: toolCalls.size,
       toolCallNames: Array.from(toolCalls.values()).map((toolCall) => toolCall.name).filter(Boolean),
+      toolCallParameterShapes: Array.from(toolCalls.values()).map(summarizeAggregatedToolCall),
       contentDeltaChars,
+      reasoningDeltaChars,
+      usage,
       finishReason: finishReason ?? "unknown",
+      ...standardTelemetry({
+        modelRole,
+        orchestrationPhase,
+        toolKind,
+        durationMs: Date.now() - requestedAtMs,
+        firstModelEventMs,
+        firstContentTokenMs,
+        firstToolCallMs,
+        reasoningDeltaChars,
+        requestOptions,
+        usage,
+      }),
     });
 
     return Array.from(toolCalls.values()).filter((toolCall) => toolCall.name);
@@ -479,6 +546,75 @@ function estimateTokens(value: string) {
   }
   const cjkChars = value.match(/[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]/g)?.length ?? 0;
   return Math.ceil(cjkChars + (value.length - cjkChars) / 4);
+}
+
+function sanitizedRequestOptions(options: StreamChatInput["requestOptions"]) {
+  if (!options) return undefined;
+  return {
+    enableThinking: options.enableThinking ?? false,
+    thinkingBudget: options.enableThinking ? options.thinkingBudget : undefined,
+    stream: options.stream ?? true,
+    temperature: options.temperature,
+    maxTokens: options.maxTokens,
+    responseFormat: options.responseFormat ? "configured" : undefined,
+  };
+}
+
+function standardTelemetry(input: {
+  modelRole?: string;
+  orchestrationPhase?: string;
+  toolKind?: string;
+  durationMs: number;
+  firstModelEventMs: number | null;
+  firstContentTokenMs: number | null;
+  firstToolCallMs: number | null;
+  reasoningDeltaChars: number;
+  requestOptions?: StreamChatInput["requestOptions"];
+  usage: ProviderUsage | null;
+}) {
+  const isReasoner = input.modelRole === "reasoning";
+  const isReport = input.orchestrationPhase === "parameter_generation" && input.toolKind === "report_generation";
+  return {
+    firstVisibleContentLatencyMs: input.firstContentTokenMs ?? input.firstToolCallMs,
+    kimiFirstEventLatencyMs: isReasoner ? input.firstModelEventMs : undefined,
+    kimiReasoningDurationMs: isReasoner && input.reasoningDeltaChars > 0 ? input.durationMs : undefined,
+    reportTtftMs: isReport ? input.firstToolCallMs ?? input.firstContentTokenMs : undefined,
+    kimiPromptTokens: isReasoner ? input.usage?.promptTokens : undefined,
+    kimiReasoningTokens: isReasoner ? input.usage?.reasoningTokens : undefined,
+    kimiOutputTokens: isReasoner ? input.usage?.completionTokens : undefined,
+    qwenPromptTokens: !isReasoner ? input.usage?.promptTokens : undefined,
+    qwenOutputTokens: !isReasoner ? input.usage?.completionTokens : undefined,
+    thinkingBudgetRequested: input.requestOptions?.enableThinking ? input.requestOptions.thinkingBudget : undefined,
+    thinkingBudgetActual: input.usage?.reasoningTokens,
+    estimatedCost: null,
+  };
+}
+
+function summarizeAggregatedToolCall(toolCall: AggregatedToolCall) {
+  try {
+    const parsed = JSON.parse(toolCall.argumentsText || "{}") as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return { toolName: toolCall.name, parseable: false, argumentChars: toolCall.argumentsText.length, keys: [] };
+    }
+    const record = parsed as Record<string, unknown>;
+    const keys = Object.keys(record).sort();
+    return {
+      toolName: toolCall.name,
+      parseable: true,
+      argumentChars: toolCall.argumentsText.length,
+      keys,
+      stringLengths: Object.fromEntries(keys.flatMap((key) => typeof record[key] === "string" ? [[key, (record[key] as string).length]] : [])),
+      arrayLengths: Object.fromEntries(keys.flatMap((key) => Array.isArray(record[key]) ? [[key, (record[key] as unknown[]).length]] : [])),
+      objectKeys: Object.fromEntries(keys.flatMap((key) => {
+        const value = record[key];
+        return value && typeof value === "object" && !Array.isArray(value)
+          ? [[key, Object.keys(value as Record<string, unknown>).sort()]]
+          : [];
+      })),
+    };
+  } catch {
+    return { toolName: toolCall.name, parseable: false, argumentChars: toolCall.argumentsText.length, keys: [] };
+  }
 }
 
 function toolCallsAssistantMessage(input: StreamChatInput, toolCalls: AggregatedToolCall[]): ConversationMessage {

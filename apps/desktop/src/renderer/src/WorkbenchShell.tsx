@@ -87,6 +87,7 @@ const defaultSettings: WorkbenchSettings = {
     modelName: "",
     executionModelName: "",
     dualModelOrchestrationEnabled: true,
+    thinkingOptimizationEnabled: true,
     apiKeyStatus: "not_configured",
     skillEnabled: false,
     mcpEnabled: false,
@@ -734,8 +735,9 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
             <DataAssistantWorkspace
               user={auth.user}
               modelName={settings.configuration.modelName}
-              executionModelName={settings.configuration.executionModelName?.trim() || settings.configuration.modelName}
+              executionModelName={settings.configuration.executionModelName?.trim() || ""}
               dualModelOrchestrationEnabled={settings.configuration.dualModelOrchestrationEnabled !== false}
+              thinkingOptimizationEnabled={settings.configuration.thinkingOptimizationEnabled !== false}
               isModelConfigured={isModelConfigurationReady(settings)}
               canReadDataSources={auth.permissions.includes("datasource:read")}
               requestWithRefresh={requestWithRefresh}
@@ -1001,7 +1003,7 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
                     <TextInput
                       label="执行模型名称"
                       value={settings.configuration.executionModelName ?? ""}
-                      placeholder="留空时使用推理模型"
+                      placeholder="留空时使用系统配置的 Qwen 执行模型"
                       width="100%"
                       onChange={(executionModelName) =>
                         setSettings((current) => ({
@@ -1017,6 +1019,16 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
                         setSettings((current) => ({
                           ...current,
                           configuration: { ...current.configuration, dualModelOrchestrationEnabled },
+                        }))
+                      }
+                    />
+                    <Switch
+                      label="启用动态 Thinking"
+                      value={settings.configuration.thinkingOptimizationEnabled !== false}
+                      onChange={(thinkingOptimizationEnabled) =>
+                        setSettings((current) => ({
+                          ...current,
+                          configuration: { ...current.configuration, thinkingOptimizationEnabled },
                         }))
                       }
                     />

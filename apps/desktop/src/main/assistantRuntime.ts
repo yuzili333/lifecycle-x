@@ -44,18 +44,36 @@ import {
 import { createStreamingModelAdapter, type ConversationMessage, type ModelStreamEvent, type ToolDefinition } from "./streamingModelAdapter";
 import {
   AgentTurnOrchestrator,
+  AnalysisPlanningAdapter,
   ExecutionParameterAdapter,
   ReasoningPlannerAdapter,
   SQLiteAgentProgressStore,
+  TaskRouterAdapter,
   agentRunError,
+  analysisPlanMessages,
+  analysisPlanToPlannerDecision,
+  compressReasoningContext,
+  executionToolDescription,
+  executionToolSchema,
   executionMessages,
+  isOptimizationEnabledForScope,
   orderPlannerSteps,
+  parseAnalysisPlanContent,
   plannerMessages,
+  qwenProfileForTool,
+  resolveThinkingOptimizationConfig,
+  routeToPlannerDecision,
+  taskRouterMessages,
+  thinkingDecisionForComplexity,
+  upgradeThinkingDecision,
+  validateTaskRoute,
   validatePlannerDecision,
   type AgentProgressEvent,
   type AgentRunRecord,
+  type AnalysisPlan,
   type PlannerDecision,
   type PlannerStep,
+  type TaskRoute,
 } from "./agentOrchestration";
 import {
   chatCsvError,
@@ -192,6 +210,7 @@ export type AssistantSendInput = {
   modelName: string;
   executionModelName?: string;
   dualModelOrchestrationEnabled?: boolean;
+  thinkingOptimizationEnabled?: boolean;
   dataSourceId?: string | null;
   dataSourceLabel?: string | null;
   selectedTempDataSourceIds?: string[];
@@ -211,6 +230,7 @@ export type AssistantRetryInput = {
   modelName: string;
   executionModelName?: string;
   dualModelOrchestrationEnabled?: boolean;
+  thinkingOptimizationEnabled?: boolean;
   dataSourceLabel?: string | null;
   selectedTempDataSourceIds?: string[];
   selectedFieldRefs?: ChatCsvSelectedFieldRef[];
@@ -323,8 +343,60 @@ const SILICONFLOW_CHAT_COMPLETIONS_URL = "https://api.siliconflow.cn/v1/chat/com
 const MAX_STORED_MESSAGES_FOR_CONTEXT = 12;
 const MAX_STREAM_CHARS = 120_000;
 const MODEL_STREAM_TIMEOUT_MS = 180_000;
-const PLANNER_TOTAL_TIMEOUT_MS = 90_000;
 const PYTHON_TIMEOUT_MS = 5_000;
+
+function modelIntentRecognitionFailureMessage(errorCode?: string) {
+  if (errorCode === "PROVIDER_TIMEOUT" || errorCode === "PROVIDER_FIRST_EVENT_TIMEOUT") {
+    return "模型服务响应超时，未能完成任务意图识别，请重试本轮任务。";
+  }
+  if (errorCode === "PROVIDER_REQUEST_FAILED" || errorCode === "PROVIDER_STREAM_PARSE_FAILED") {
+    return "模型服务连接失败，未能完成任务意图识别，请检查网络后重试。";
+  }
+  return "模型服务暂时不可用，未能完成任务意图识别，请稍后重试。";
+}
+
+function modelPlanningFailureMessage(errorCode?: string) {
+  if (errorCode === "PROVIDER_TIMEOUT" || errorCode === "PROVIDER_FIRST_EVENT_TIMEOUT") {
+    return "模型服务响应超时，未能完成分析计划，请重试本轮任务。";
+  }
+  if (errorCode === "PROVIDER_REQUEST_FAILED" || errorCode === "PROVIDER_STREAM_PARSE_FAILED") {
+    return "模型服务连接失败，未能完成分析计划，请检查网络后重试。";
+  }
+  return "模型服务暂时不可用，未能完成分析计划，请稍后重试。";
+}
+
+type PlannerFallbackReason =
+  | "reasoner_first_event_timeout"
+  | "reasoning_overrun"
+  | "reasoner_unavailable"
+  | "invalid_analysis_plan";
+
+export function planningFallbackProgressSummary(reason: PlannerFallbackReason, planningTimeoutMs: number) {
+  if (reason === "reasoner_first_event_timeout") {
+    return "首响应超时，正在生成降级计划。";
+  }
+  if (reason === "reasoning_overrun") {
+    const timeoutSeconds = Math.max(1, Math.round(planningTimeoutMs / 1_000));
+    return `已返回推理内容，但未在 ${timeoutSeconds} 秒规划总预算内完成合法计划，正在生成降级计划。`;
+  }
+  if (reason === "reasoner_unavailable") {
+    return "规划调用异常，正在生成降级计划。";
+  }
+  return "返回的计划未通过结构校验，正在生成降级计划。";
+}
+
+function isDataSourceAmbiguity(item: TaskRoute["ambiguities"][number]) {
+  return /(数据源|数据集|dataset|data\s*source)/i.test(`${item.field} ${item.description}`);
+}
+
+export function resolveDefaultDataSourceAmbiguities(route: TaskRoute, hasPreferredDataSource: boolean): TaskRoute {
+  if (!hasPreferredDataSource || !route.ambiguities.some(isDataSourceAmbiguity)) return route;
+  return {
+    ...route,
+    ambiguities: route.ambiguities.filter((item) => !isDataSourceAmbiguity(item)),
+  };
+}
+
 const MAX_TOOL_CONTEXT_CHARS = 30_000;
 const MAX_EXECUTION_RESULT_CONTEXT_CHARS = 4_000;
 const WORKFLOW_DATASET_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -381,6 +453,35 @@ function formatReportDateTime(value: string | Date = new Date()) {
 
 function isPlainRecordValue(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+export function summarizeToolArguments(argumentsText: unknown) {
+  if (typeof argumentsText !== "string") {
+    return { parseable: false, argumentChars: 0, keys: [] as string[] };
+  }
+  try {
+    const parsed = JSON.parse(argumentsText) as unknown;
+    if (!isPlainRecordValue(parsed)) {
+      return { parseable: false, argumentChars: argumentsText.length, keys: [] as string[] };
+    }
+    const keys = Object.keys(parsed).sort();
+    return {
+      parseable: true,
+      argumentChars: argumentsText.length,
+      keys,
+      stringLengths: Object.fromEntries(
+        keys.flatMap((key) => typeof parsed[key] === "string" ? [[key, (parsed[key] as string).length]] : []),
+      ),
+      arrayLengths: Object.fromEntries(
+        keys.flatMap((key) => Array.isArray(parsed[key]) ? [[key, (parsed[key] as unknown[]).length]] : []),
+      ),
+      objectKeys: Object.fromEntries(
+        keys.flatMap((key) => isPlainRecordValue(parsed[key]) ? [[key, Object.keys(parsed[key] as Record<string, unknown>).sort()]] : []),
+      ),
+    };
+  } catch {
+    return { parseable: false, argumentChars: argumentsText.length, keys: [] as string[] };
+  }
 }
 
 function stringValue(value: unknown) {
@@ -779,7 +880,7 @@ export function appendVisualizationReferencesToReport(
       specVersion: "1.0",
       visualizationId: `report_viz_${index + 1}_${sha256(artifactId).slice(0, 8)}`,
       type: "table",
-      title: index === 0 ? "报告引用图表" : `报告引用图表 ${index + 1}`,
+      title: index === 0 ? "可视化图表" : `可视化图表 ${index + 1}`,
       data: {
         mode: "artifact",
         artifactId,
@@ -803,7 +904,124 @@ export function appendVisualizationReferencesToReport(
       "```",
     ].join("\n");
   });
-  return [markdown.trim(), "", "## 图表", "", ...blocks].join("\n");
+  return appendToReportChartSection(markdown, blocks);
+}
+
+type ReportMarkdownHeading = {
+  lineIndex: number;
+  level: number;
+  title: string;
+};
+
+function reportMarkdownHeadings(lines: string[]) {
+  const headings: ReportMarkdownHeading[] = [];
+  let fence: { marker: "`" | "~"; length: number } | null = null;
+  for (const [lineIndex, line] of lines.entries()) {
+    const trimmed = line.trim();
+    const fenceMatch = trimmed.match(/^(`{3,}|~{3,})/);
+    if (fenceMatch) {
+      const marker = fenceMatch[1][0] as "`" | "~";
+      if (!fence) {
+        fence = { marker, length: fenceMatch[1].length };
+      } else if (
+        fence.marker === marker &&
+        fenceMatch[1].length >= fence.length &&
+        trimmed.slice(fenceMatch[1].length).trim().length === 0
+      ) {
+        fence = null;
+      }
+      continue;
+    }
+    if (fence) continue;
+    const heading = line.match(/^(#{1,6})\s+(.+?)\s*$/);
+    if (heading) {
+      headings.push({ lineIndex, level: heading[1].length, title: heading[2].trim() });
+    }
+  }
+  return headings;
+}
+
+function isReportChartHeading(heading: ReportMarkdownHeading) {
+  return /图表|可视化/.test(heading.title);
+}
+
+function reportSectionEnd(heading: ReportMarkdownHeading, headings: ReportMarkdownHeading[], lineCount: number) {
+  return headings.find((candidate) => candidate.lineIndex > heading.lineIndex && candidate.level <= heading.level)?.lineIndex ?? lineCount;
+}
+
+export function sanitizeReportInternalReferences(markdown: string) {
+  const artifactReference = String.raw`[（(]\s*Artifact\s*[：:]\s*[a-zA-Z0-9:._-]+\s*[）)]`;
+  return markdown
+    .split(/\r?\n/)
+    .filter((line) => !new RegExp(String.raw`^\s*(?:[-*_]+\s*)?Artifact\s*[：:]\s*[a-zA-Z0-9:._-]+\s*$`, "i").test(line))
+    .map((line) =>
+      line
+        .replace(/<img\b[^>]*\/?>/gi, "")
+        .replace(/!\[[^\]\r\n]*\]\(\s*(?:<[^>\r\n]+>|[^)\r\n]+)\s*\)/g, "")
+        .replace(/!\[[^\]\r\n]*\]\[[^\]\r\n]*\]/g, "")
+        .replace(new RegExp(String.raw`根据上游\s*Python\s*分析结果\s*${artifactReference}`, "gi"), "根据分析结果")
+        .replace(new RegExp(String.raw`结合生成的([^，。；;\n]{0,24}(?:图|图表))\s*${artifactReference}`, "gi"), "结合可视化图表")
+        .replace(new RegExp(artifactReference, "gi"), "")
+        .replace(/上游\s*Python\s*分析结果/gi, "分析结果")
+        .replace(/[ \t]{2,}/g, " ")
+        .trimEnd(),
+    )
+    .join("\n");
+}
+
+export function mergeReportChartSections(markdown: string) {
+  const withoutReferencePlaceholders = sanitizeReportInternalReferences(markdown)
+    .split(/\r?\n/)
+    .filter((line) => !/图表引用\s*[：:]\s*(?:assistant-|workflow-|chart-|report-)?[a-zA-Z0-9:._-]+/i.test(line))
+    .join("\n");
+  const lines = withoutReferencePlaceholders.split(/\r?\n/);
+  const headings = reportMarkdownHeadings(lines);
+  const chartHeadings = headings.filter(isReportChartHeading);
+  if (chartHeadings.length <= 1) return withoutReferencePlaceholders.trim();
+
+  const ranges = chartHeadings.map((heading) => ({
+    heading,
+    start: heading.lineIndex,
+    end: reportSectionEnd(heading, headings, lines.length),
+  }));
+  const rootRanges = ranges.filter((range) =>
+    !ranges.some((candidate) => candidate.start < range.start && candidate.end > range.start)
+  );
+  if (rootRanges.length <= 1) return withoutReferencePlaceholders.trim();
+
+  const chartHeadingLineIndexes = new Set(chartHeadings.map((heading) => heading.lineIndex));
+  const mergedBody = rootRanges.flatMap((range, index) => {
+    const body = lines
+      .slice(range.start + 1, range.end)
+      .filter((_line, offset) => !chartHeadingLineIndexes.has(range.start + 1 + offset));
+    while (body[0]?.trim() === "") body.shift();
+    while (body.at(-1)?.trim() === "") body.pop();
+    return body.length > 0 ? [...(index > 0 ? [""] : []), ...body] : [];
+  });
+  const firstRange = rootRanges[0];
+  const skipped = new Set<number>();
+  for (const range of rootRanges) {
+    for (let index = range.start; index < range.end; index += 1) skipped.add(index);
+  }
+  const output: string[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (index === firstRange.start) output.push(lines[index], "", ...mergedBody);
+    if (!skipped.has(index)) output.push(lines[index]);
+  }
+  return output.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function appendToReportChartSection(markdown: string, blocks: string[]) {
+  const normalized = mergeReportChartSections(markdown.trim());
+  const lines = normalized.split(/\r?\n/);
+  const headings = reportMarkdownHeadings(lines);
+  const chartHeading = headings.find(isReportChartHeading);
+  if (!chartHeading) {
+    return [normalized, "", "## 可视化图表", "", ...blocks].join("\n");
+  }
+  const insertAt = reportSectionEnd(chartHeading, headings, lines.length);
+  lines.splice(insertAt, 0, "", ...blocks);
+  return mergeReportChartSections(lines.join("\n").replace(/\n{3,}/g, "\n\n").trim());
 }
 
 export function renderLocalToolPlanContext(plan: ToolExecutionPlan) {
@@ -1780,7 +1998,7 @@ export function normalizeAnalysisReportMarkdown(markdown: string, context: { tit
   if (selectedFieldNames.length > 0) {
     upsertMetadataLine(lines, "筛选字段", selectedFieldNames.join("、"), ["分析对象", "样本数量"]);
   }
-  return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  return mergeReportChartSections(lines.join("\n").replace(/\n{3,}/g, "\n\n").trim());
 }
 
 function uniqueValues<T>(values: T[]) {
@@ -3072,7 +3290,14 @@ export class AssistantRuntime {
     if (!isConversationArtifact) {
       return null;
     }
-    return this.toolArtifactManager.getArtifact(normalizedArtifactId);
+    const artifact = await this.toolArtifactManager.getArtifact(normalizedArtifactId);
+    if (artifact?.artifactType === "report_markdown" && artifact.contentType === "markdown" && typeof artifact.content === "string") {
+      return {
+        ...artifact,
+        content: mergeReportChartSections(artifact.content),
+      };
+    }
+    return artifact;
   }
 
   async resolveConversationReportVisualization(
@@ -4399,6 +4624,62 @@ export class AssistantRuntime {
         log.createdAt,
       );
 
+    try {
+      mkdirSync(dirname(this.options.toolLogPath), { recursive: true });
+      appendFileSync(this.options.toolLogPath, `${JSON.stringify(log)}\n`, "utf8");
+    } catch {
+      // SQLite logs remain available if file logging is temporarily unavailable.
+    }
+  }
+
+  private appendAgentParameterObservationLog(
+    input: AssistantSendInput,
+    step: PlannerStep,
+    event: ModelStreamEvent,
+    outcome: "generated" | "passed" | "failed",
+    detail: Record<string, unknown>,
+  ) {
+    const log = {
+      id: randomUUID(),
+      toolCallId: event.toolCallId ?? null,
+      conversationId: event.conversationId,
+      userId: input.userId,
+      kind: "model",
+      phase: "tool-parameter-validation",
+      status: outcome === "failed" ? "error" as const : outcome === "passed" ? "success" as const : "info" as const,
+      message: outcome === "generated"
+        ? `${this.agentToolLabel(step.toolKind)}参数已生成，等待本地校验。`
+        : outcome === "passed"
+          ? `${this.agentToolLabel(step.toolKind)}参数通过本地校验。`
+          : `${this.agentToolLabel(step.toolKind)}参数未通过本地校验。`,
+      detail: {
+        stepId: step.stepId,
+        toolKind: step.toolKind,
+        modelRole: "execution",
+        traceId: event.traceId,
+        eventId: event.eventId,
+        ...detail,
+      },
+      createdAt: nowIso(),
+    };
+    this.db
+      .prepare(
+        `insert into tool_call_logs
+          (id, tool_call_id, conversation_id, user_id, kind, phase, status, message, detail_json, created_at)
+         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        log.id,
+        log.toolCallId,
+        log.conversationId,
+        log.userId,
+        log.kind,
+        log.phase,
+        log.status,
+        log.message,
+        JSON.stringify(log.detail),
+        log.createdAt,
+      );
     try {
       mkdirSync(dirname(this.options.toolLogPath), { recursive: true });
       appendFileSync(this.options.toolLogPath, `${JSON.stringify(log)}\n`, "utf8");
@@ -6380,6 +6661,7 @@ export class AssistantRuntime {
     summary: string;
     artifact: Parameters<ArtifactManager["createArtifact"]>[0];
     parentKinds: ToolKind[];
+    startedAtMs?: number;
   }) {
     const parents = (await Promise.all(input.parentKinds.map((toolKind) => this.toolResultRegistry.getLatestSuccessful(input.message.conversationId, toolKind))))
       .filter((record): record is ToolCallRecord => Boolean(record));
@@ -6392,6 +6674,8 @@ export class AssistantRuntime {
       ...parents.flatMap((record) => record.outputArtifactIds ?? record.result?.artifactIds ?? []),
       ...declaredVisualizationArtifactIds,
     ]);
+    const startedAt = input.startedAtMs == null ? input.message.createdAt : new Date(input.startedAtMs).toISOString();
+    const completedAt = nowIso();
     const parentToolCallIds = uniqueValues(parents.map((record) => record.toolCallId));
     const primaryParent = parents[0];
     const reportContext = input.toolKind === "report_generation" ? this.analysisReportContextFromRecords(parents) : { sourceName: null, selectedFieldNames: [] };
@@ -6456,6 +6740,7 @@ export class AssistantRuntime {
         metadata: {
           ...(existing.metadata ?? {}),
           title,
+          ...(input.startedAtMs == null ? {} : { toolDurationMs: Math.max(0, Date.now() - input.startedAtMs) }),
         },
       });
       await this.toolResultRegistry.markLatestSuccessful(input.message.conversationId, input.toolCallId);
@@ -6496,7 +6781,7 @@ export class AssistantRuntime {
         artifactIds: [artifact.artifactId],
         primaryArtifactId: artifact.artifactId,
         summary,
-        createdAt: input.message.updatedAt,
+        createdAt: completedAt,
         metadata: {
           messageId: input.message.id,
           artifactType: artifact.artifactType,
@@ -6510,12 +6795,13 @@ export class AssistantRuntime {
       outputArtifactIds: [artifact.artifactId],
       version,
       isLatestSuccessful: false,
-      createdAt: input.message.createdAt,
-      updatedAt: input.message.updatedAt,
-      completedAt: input.message.updatedAt,
+      createdAt: startedAt,
+      updatedAt: completedAt,
+      completedAt,
       metadata: {
         source: "assistant-generated-message",
         title,
+        ...(input.startedAtMs == null ? {} : { toolDurationMs: Math.max(0, Date.now() - input.startedAtMs) }),
       },
     };
     await this.toolResultRegistry.register(record);
@@ -6999,13 +7285,19 @@ export class AssistantRuntime {
     signal: AbortSignal,
   ) {
     const runId = `agent_run_${randomUUID()}`;
-    const reasoningModelName = input.modelName.trim();
-    const executionModelName = input.executionModelName?.trim() || reasoningModelName;
+    const config = resolveThinkingOptimizationConfig({
+      enabled: input.thinkingOptimizationEnabled !== false,
+      reasonerModel: input.modelName.trim(),
+      executorModel: input.executionModelName?.trim() || undefined,
+    });
+    const reasoningModelName = config.reasonerModel;
+    const executionModelName = config.executorModel;
     const persistedInput = this.persistableAgentInput({
       ...input,
       conversationId: conversation.id,
       executionModelName,
       dualModelOrchestrationEnabled: true,
+      thinkingOptimizationEnabled: input.thinkingOptimizationEnabled,
     });
     this.agentTurnOrchestrator.start({
       runId,
@@ -7030,66 +7322,300 @@ export class AssistantRuntime {
         });
       }
 
-      const context = await this.buildDualModelContext(input, conversation, "reasoning");
-      const planner = new ReasoningPlannerAdapter({
+      const context = await this.buildDualModelContext(
+        input,
+        conversation,
+        "reasoning",
+        undefined,
+        config.reasoningContextTokenBudget,
+        assistantMessage.id,
+      );
+      const optimizationEnabled = isOptimizationEnabledForScope(config, {
+        userId: input.userId,
+        conversationId: conversation.id,
+        taskId: runId,
+      });
+      if (!optimizationEnabled || !config.enableDynamicRouting) {
+        await this.startLegacyDualModelPlanning({
+          runId,
+          input,
+          conversation,
+          assistantMessage,
+          signal,
+          apiKey,
+          reasoningModelName,
+          context,
+          planningTimeoutMs: config.planningTimeoutMs,
+        });
+        return;
+      }
+
+      this.agentTurnOrchestrator.routing(runId);
+      const router = new TaskRouterAdapter({
         providerName: "siliconflow",
         baseURL: "https://api.siliconflow.cn/v1",
         apiKey,
-        model: reasoningModelName,
-        timeoutMs: PLANNER_TOTAL_TIMEOUT_MS,
+        model: executionModelName,
+        timeoutMs: Math.min(30_000, config.planningTimeoutMs),
+        requestOptions: config.qwenProfiles.router,
       });
-      const planningDeadlineMs = Date.now() + PLANNER_TOTAL_TIMEOUT_MS;
-      const callPlanner = (repairErrors?: string[]) => planner.plan({
+      let routeSummary = "";
+      const callRouter = (repairErrors?: string[]) => router.route({
         conversationId: conversation.id,
         messageId: assistantMessage.id,
-        messages: plannerMessages(context, input.prompt),
+        messages: taskRouterMessages(context, input.prompt),
         signal,
-        timeoutMs: Math.max(250, planningDeadlineMs - Date.now()),
         repairErrors,
         onEvent: (event) => {
           if (event.type === "model-observation") this.appendModelObservationLog(input, conversation.id, assistantMessage.id, event);
         },
+        onSummaryDelta: (delta) => {
+          routeSummary += delta;
+          if (routeSummary.trim()) {
+            this.agentTurnOrchestrator.progress(runId, {
+              phase: "routing",
+              status: "running",
+              summary: routeSummary.trim(),
+              modelRole: "execution",
+            });
+          }
+        },
       });
-
-      let plannerOutput = await this.withAgentHeartbeat(
+      let routerOutput = await this.withAgentHeartbeat(
         runId,
-        "planning",
-        "思考中",
-        callPlanner(),
+        "routing",
+        "正在理解分析目标",
+        callRouter(),
       );
       throwIfAssistantOperationCancelled(signal);
-      let modelResponseText = plannerOutput.content.trim();
-      let validation = plannerOutput.decision === undefined
-        ? null
-        : validatePlannerDecision(plannerOutput.decision);
-      if (validation && !validation.valid && planningDeadlineMs - Date.now() > 500) {
-        this.agentTurnOrchestrator.fallback(runId, "规划结果未通过校验，正在进行一次结构化修复。", { validationErrorCount: validation.errors.length });
+      let routeValidation = validateTaskRoute(routerOutput.route);
+      if (!routeValidation.valid && !routerOutput.error) {
+        this.agentTurnOrchestrator.fallback(runId, "任务路由未通过结构化校验，正在进行一次修复。", {
+          validationErrorCount: routeValidation.errors.length,
+          validationErrors: routeValidation.errors.slice(0, 20),
+        });
+        routerOutput = await this.withAgentHeartbeat(
+          runId,
+          "routing",
+          "正在修复任务路由",
+          callRouter(routeValidation.errors),
+        );
+        routeValidation = validateTaskRoute(routerOutput.route);
+      }
+      if (!routeValidation.valid) {
+        if (routerOutput.error) {
+          throw agentRunError({
+            code: routerOutput.errorCode || "TASK_ROUTER_MODEL_FAILED",
+            phase: "routing",
+            message: modelIntentRecognitionFailureMessage(routerOutput.errorCode),
+            recoverable: true,
+            traceId: routerOutput.traceId,
+            retryTrace: routerOutput.errorCause ? [routerOutput.errorCause] : [],
+          });
+        }
+        const modelResponse = routerOutput.content.trim();
+        if (modelResponse) {
+          await this.completeDualModelText(
+            runId,
+            conversation.id,
+            assistantMessage.id,
+            modelResponse,
+            "clarify",
+          );
+          return;
+        }
+        throw agentRunError({
+          code: "TASK_ROUTE_INVALID",
+          phase: "routing",
+          message: "模型未返回有效的任务意图识别结果，请重试本轮任务。",
+          recoverable: true,
+          traceId: routerOutput.traceId,
+        });
+      }
+      const preferredDataSourceLabel = await this.resolvePreferredDataSourceLabel(input, conversation.id);
+      const route = resolveDefaultDataSourceAmbiguities(routeValidation.route, Boolean(preferredDataSourceLabel));
+      let thinkingDecision = thinkingDecisionForComplexity(route.complexity, config);
+      const selectedSourceCount = Math.max(
+        input.selectedTempDataSourceIds?.length ?? 0,
+        input.dataSourceId || input.dataSourceLabel ? 1 : 0,
+      );
+      const requestedToolCount = [
+        route.requiresSql,
+        route.requiresPython,
+        route.requiresChart,
+        route.requiresReport,
+      ].filter(Boolean).length;
+      thinkingDecision = upgradeThinkingDecision(thinkingDecision, config, {
+        tableCount: selectedSourceCount,
+        nonBlockingAmbiguityCount: route.ambiguities.filter((item) => !item.blocking).length,
+        asksForExplanation: /为什么|原因|解释|归因/.test(input.prompt),
+        requiresMethodSelection: route.taskType === "root_cause_analysis",
+        toolCallCount: requestedToolCount,
+        requiresSecondValidationQuery: /二次验证|第二轮验证|再次验证/.test(input.prompt),
+        crossPeriodAttribution: /风险迁徙|跨周期|多维归因/.test(input.prompt),
+        userRequestedDeepAnalysis: /深度分析|专题研究/.test(input.prompt),
+      });
+      this.agentTurnOrchestrator.routeCompleted(runId, route, thinkingDecision);
+
+      if (!thinkingDecision.useKimi) {
+        const decision = routeToPlannerDecision(route);
+        if (decision.outcome !== "execute") {
+          await this.completeDualModelQwenResponse({
+            runId,
+            input,
+            conversation,
+            assistantMessage,
+            signal,
+            apiKey,
+            executionModelName,
+            context: [
+              context,
+              input.schemaContextMarkdown ? `与当前任务相关的已授权 Schema：\n${truncateText(input.schemaContextMarkdown, 12_000)}` : "",
+            ].filter(Boolean).join("\n\n"),
+          });
+          return;
+        }
+        this.agentTurnOrchestrator.planReady(runId, decision);
+        await this.continueDualModelRun(runId, signal);
+        return;
+      }
+
+      this.agentTurnOrchestrator.planning(runId, thinkingDecision);
+      const planner = new AnalysisPlanningAdapter({
+        providerName: "siliconflow",
+        baseURL: "https://api.siliconflow.cn/v1",
+        apiKey,
+        model: reasoningModelName,
+        timeoutMs: config.planningTimeoutMs,
+        firstEventTimeoutMs: config.firstEventTimeoutMs,
+        requestOptions: thinkingDecision.request,
+        profileName: thinkingDecision.profile,
+      });
+      const planningDeadlineMs = Date.now() + config.planningTimeoutMs;
+      let kimiCallCount = 0;
+      let cumulativeBudget = 0;
+      const callPlanner = async (repairErrors?: string[]) => {
+        kimiCallCount += 1;
+        cumulativeBudget += thinkingDecision.request.thinkingBudget ?? 0;
+        this.agentProgressStore.update(runId, {
+          kimiCallCount,
+          cumulativeThinkingBudget: cumulativeBudget,
+        });
+        return planner.plan({
+          conversationId: conversation.id,
+          messageId: assistantMessage.id,
+          messages: analysisPlanMessages(context, input.prompt, repairErrors),
+          signal,
+          timeoutMs: Math.max(250, planningDeadlineMs - Date.now()),
+          onEvent: (event) => {
+            if (event.type === "model-observation") {
+              this.appendModelObservationLog(input, conversation.id, assistantMessage.id, event);
+              if (event.payload.phase === "reasoning-progress") {
+                this.agentTurnOrchestrator.planningProgress(runId, "正在规划数据查询和分析路径");
+              }
+            }
+          },
+        });
+      };
+      let plannerOutput = await this.withAgentHeartbeat(runId, "planning", "正在规划分析路径", callPlanner());
+      throwIfAssistantOperationCancelled(signal);
+      let planValidation = parseAnalysisPlanContent(plannerOutput.content);
+      const canRepair = (
+        !planValidation.valid &&
+        !plannerOutput.error &&
+        kimiCallCount < config.maxKimiCallsPerTask &&
+        cumulativeBudget + (thinkingDecision.request.thinkingBudget ?? 0) <= config.maxCumulativeThinkingBudget &&
+        planningDeadlineMs - Date.now() > 500
+      );
+      if (canRepair && !planValidation.valid) {
+        this.agentTurnOrchestrator.fallback(runId, "分析计划未通过结构化校验，正在进行一次同预算修复。", {
+          validationErrorCount: planValidation.errors.length,
+          validationErrors: planValidation.errors.slice(0, 20),
+          thinkingBudget: thinkingDecision.request.thinkingBudget,
+        });
         plannerOutput = await this.withAgentHeartbeat(
           runId,
           "planning",
-          "思考中",
-          callPlanner(validation.errors),
+          "正在修复分析计划",
+          callPlanner(planValidation.errors),
         );
-        modelResponseText = plannerOutput.content.trim() || modelResponseText;
-        validation = plannerOutput.decision === undefined ? null : validatePlannerDecision(plannerOutput.decision);
+        planValidation = parseAnalysisPlanContent(plannerOutput.content);
       }
-
-      let decision: PlannerDecision | null = validation?.valid ? validation.decision : null;
-      if (!decision && modelResponseText) {
-        decision = {
-          outcome: "respond",
-          summary: "无需调用数据工具，直接回答用户问题。",
-          responseText: modelResponseText,
-          requestedOutputs: [],
-          steps: [],
-        };
-      }
-      if (!decision) {
-        const message = plannerOutput.error
-          ? `推理模型暂时无法完成任务规划：${plannerOutput.error}`
-          : "推理模型未返回可用的计划或文本响应，请重新描述任务目标后再试。";
-        await this.completeDualModelText(runId, conversation.id, assistantMessage.id, message, "clarify");
-        return;
+      let decision: PlannerDecision;
+      let analysisPlan: AnalysisPlan | undefined;
+      const plannerFallbackReason: PlannerFallbackReason = plannerOutput.errorCode === "PROVIDER_FIRST_EVENT_TIMEOUT"
+        ? "reasoner_first_event_timeout"
+        : plannerOutput.errorCode === "PROVIDER_TIMEOUT" && plannerOutput.reasoningObserved
+          ? "reasoning_overrun"
+          : plannerOutput.error
+            ? "reasoner_unavailable"
+            : "invalid_analysis_plan";
+      if (planValidation.valid) {
+        analysisPlan = planValidation.plan;
+        decision = analysisPlanToPlannerDecision(planValidation.plan);
+      } else if (config.enableQwenFallback) {
+        this.agentTurnOrchestrator.fallback(runId, planningFallbackProgressSummary(plannerFallbackReason, config.planningTimeoutMs), {
+          fallbackReason: plannerFallbackReason,
+          providerErrorCode: plannerOutput.errorCode,
+          reasoningObserved: plannerOutput.reasoningObserved,
+          kimiCallCount,
+          cumulativeThinkingBudget: cumulativeBudget,
+          ...(!planValidation.valid ? { validationErrors: planValidation.errors.slice(0, 20) } : {}),
+        });
+        const fallback = await this.buildQwenFallbackPlan({
+          runId,
+          input,
+          conversation,
+          assistantMessage,
+          signal,
+          apiKey,
+          executionModelName,
+          context,
+          route,
+          reason: plannerFallbackReason,
+        });
+        if (!fallback.decision) {
+          if (fallback.error) {
+            throw agentRunError({
+              code: fallback.errorCode || "QWEN_FALLBACK_PLANNER_FAILED",
+              phase: "planning",
+              message: modelPlanningFailureMessage(fallback.errorCode),
+              recoverable: true,
+              traceId: fallback.traceId,
+              retryTrace: fallback.errorCause ? [fallback.errorCause] : [],
+            });
+          }
+          const modelResponse = fallback.content.trim() || plannerOutput.content.trim();
+          if (modelResponse) {
+            await this.completeDualModelText(
+              runId,
+              conversation.id,
+              assistantMessage.id,
+              modelResponse,
+              "clarify",
+            );
+            return;
+          }
+          throw agentRunError({
+            code: "ANALYSIS_PLAN_EMPTY",
+            phase: "planning",
+            message: "模型未返回可执行的分析计划，请重试本轮任务。",
+            recoverable: true,
+            traceId: fallback.traceId || plannerOutput.traceId,
+          });
+        }
+        decision = fallback.decision;
+      } else {
+        throw agentRunError({
+          code: plannerFallbackReason === "reasoner_first_event_timeout"
+            ? "reasoner_first_event_timeout"
+            : plannerFallbackReason === "reasoning_overrun"
+              ? "reasoning_overrun"
+              : "ANALYSIS_PLAN_INVALID",
+          phase: "planning",
+          message: "复杂任务规划暂时不可用，请稍后重试。",
+          recoverable: true,
+        });
       }
       if (decision.outcome !== "execute") {
         await this.completeDualModelText(
@@ -7101,8 +7627,7 @@ export class AssistantRuntime {
         );
         return;
       }
-
-      this.agentTurnOrchestrator.planReady(runId, decision);
+      this.agentTurnOrchestrator.planReady(runId, decision, analysisPlan);
       await this.continueDualModelRun(runId, signal);
     } catch (error) {
       if (signal.aborted || isAssistantOperationCancelled(error)) {
@@ -7113,6 +7638,148 @@ export class AssistantRuntime {
       this.agentTurnOrchestrator.fail(runId, normalized);
       throw new Error(normalized.message);
     }
+  }
+
+  private async buildQwenFallbackPlan(input: {
+    runId: string;
+    input: AssistantSendInput;
+    conversation: AssistantConversation;
+    assistantMessage: AssistantMessage;
+    signal: AbortSignal;
+    apiKey: string;
+    executionModelName: string;
+    context: string;
+    route: TaskRoute;
+    reason: "reasoner_first_event_timeout" | "reasoning_overrun" | "reasoner_unavailable" | "invalid_analysis_plan";
+  }): Promise<{
+    decision?: PlannerDecision;
+    content: string;
+    traceId?: string;
+    error?: string;
+    errorCode?: string;
+    errorCause?: string;
+  }> {
+    const config = resolveThinkingOptimizationConfig({
+      reasonerModel: input.input.modelName,
+      executorModel: input.executionModelName,
+    });
+    const fallbackPlanner = new ReasoningPlannerAdapter({
+      providerName: "siliconflow",
+      baseURL: "https://api.siliconflow.cn/v1",
+      apiKey: input.apiKey,
+      model: input.executionModelName,
+      timeoutMs: Math.min(config.planningTimeoutMs, MODEL_STREAM_TIMEOUT_MS),
+      requestOptions: {
+        ...config.qwenProfiles.router,
+        maxTokens: Math.max(2_048, config.qwenProfiles.router.maxTokens),
+      },
+      profileName: "router",
+      modelRole: "execution",
+      orchestrationPhase: "qwen_fallback_planning",
+    });
+    const fallbackContext = [
+      input.context,
+      "降级约束：推理模型未形成合法 AnalysisPlan。请基于已验证的任务路由生成最小、只读、可执行的结构化计划。",
+      "禁止使用本地预制计划，禁止新增用户未要求的目标；信息不足时返回 clarify。",
+      `任务路由：${JSON.stringify({
+        taskType: input.route.taskType,
+        complexity: input.route.complexity,
+        requiresSql: input.route.requiresSql,
+        requiresPython: input.route.requiresPython,
+        requiresChart: input.route.requiresChart,
+        requiresReport: input.route.requiresReport,
+        ambiguities: input.route.ambiguities,
+      })}`,
+      `降级原因：${input.reason}`,
+    ].join("\n\n");
+    const output = await this.withAgentHeartbeat(
+      input.runId,
+      "planning",
+      "正在生成受控降级计划",
+      fallbackPlanner.plan({
+        conversationId: input.conversation.id,
+        messageId: input.assistantMessage.id,
+        messages: plannerMessages(fallbackContext, input.input.prompt),
+        signal: input.signal,
+        timeoutMs: Math.min(config.planningTimeoutMs, MODEL_STREAM_TIMEOUT_MS),
+        onEvent: (event) => {
+          if (event.type === "model-observation") {
+            this.appendModelObservationLog(input.input, input.conversation.id, input.assistantMessage.id, event);
+          }
+        },
+      }),
+    );
+    const validation = output.decision === undefined ? null : validatePlannerDecision(output.decision);
+    if (output.error) {
+      this.agentTurnOrchestrator.fallback(input.runId, "降级计划生成失败，已停止自动执行。", {
+        fallbackReason: "qwen_fallback_provider_error",
+        providerErrorCode: output.errorCode,
+      });
+      return {
+        content: output.content,
+        traceId: output.traceId,
+        error: output.error,
+        errorCode: output.errorCode,
+        errorCause: output.errorCause,
+      };
+    }
+    if (!validation?.valid) {
+      this.agentTurnOrchestrator.fallback(input.runId, "降级计划未返回合法结构，已停止自动执行。", {
+        fallbackReason: "qwen_fallback_plan_invalid",
+        validationErrorCount: validation?.errors.length ?? 1,
+        validationErrors: validation && !validation.valid ? validation.errors.slice(0, 20) : [],
+      });
+      return { content: output.content, traceId: output.traceId };
+    }
+    return { decision: validation.decision, content: output.content, traceId: output.traceId };
+  }
+
+  private async startLegacyDualModelPlanning(input: {
+    runId: string;
+    input: AssistantSendInput;
+    conversation: AssistantConversation;
+    assistantMessage: AssistantMessage;
+    signal: AbortSignal;
+    apiKey: string;
+    reasoningModelName: string;
+    context: string;
+    planningTimeoutMs: number;
+  }) {
+    this.agentTurnOrchestrator.planning(input.runId, thinkingDecisionForComplexity("L2", {
+      ...resolveThinkingOptimizationConfig({ reasonerModel: input.reasoningModelName }),
+      maxThinkingBudget: 0,
+      maxCumulativeThinkingBudget: 0,
+    }, "legacy_flow"));
+    const planner = new ReasoningPlannerAdapter({
+      providerName: "siliconflow",
+      baseURL: "https://api.siliconflow.cn/v1",
+      apiKey: input.apiKey,
+      model: input.reasoningModelName,
+      timeoutMs: input.planningTimeoutMs,
+    });
+    const output = await planner.plan({
+      conversationId: input.conversation.id,
+      messageId: input.assistantMessage.id,
+      messages: plannerMessages(input.context, input.input.prompt),
+      signal: input.signal,
+      timeoutMs: input.planningTimeoutMs,
+      onEvent: (event) => {
+        if (event.type === "model-observation") this.appendModelObservationLog(input.input, input.conversation.id, input.assistantMessage.id, event);
+      },
+    });
+    const validation = output.decision === undefined ? null : validatePlannerDecision(output.decision);
+    if (!validation?.valid) {
+      await this.completeDualModelText(
+        input.runId,
+        input.conversation.id,
+        input.assistantMessage.id,
+        output.content.trim() || "当前流程未返回可执行计划，请补充任务目标。",
+        "clarify",
+      );
+      return;
+    }
+    this.agentTurnOrchestrator.planReady(input.runId, validation.decision);
+    await this.continueDualModelRun(input.runId, input.signal);
   }
 
   private async continueDualModelRun(runId: string, signal: AbortSignal) {
@@ -7178,8 +7845,8 @@ export class AssistantRuntime {
         continue;
       }
 
-      const context = await this.buildDualModelContext(executionInput, conversation, "execution", step);
-      const execution = await this.executeDualModelStep({
+      let context = await this.buildDualModelContext(executionInput, conversation, "execution", step, undefined, run.messageId);
+      let execution = await this.executeDualModelStep({
         runId,
         step,
         input: executionInput,
@@ -7189,7 +7856,59 @@ export class AssistantRuntime {
         apiKey,
         signal,
       });
-      const localToolCall = this.findAgentToolCall(run.messageId, runId, step.stepId);
+      let localToolCall = this.findAgentToolCall(run.messageId, runId, step.stepId);
+
+      if (step.toolKind === "sql_query" && localToolCall?.status === "error") {
+        this.agentTurnOrchestrator.fallback(runId, "SQL 执行失败，正在根据数据库错误修复一次。", {
+          fallbackReason: "sql_first_execution_failure",
+          stepId: step.stepId,
+        });
+        context = `${context}\n\n上一次 SQL 已通过参数和安全校验，但数据库执行失败。请根据以下数据库错误修复 SQL，不得改变用户目标：\n${truncateText(localToolCall.errorMessage ?? "未知数据库错误", 1_000)}`;
+        this.agentTurnOrchestrator.preparingStep(runId, step);
+        execution = await this.executeDualModelStep({
+          runId,
+          step,
+          input: executionInput,
+          tool,
+          context,
+          modelName: run.executionModelName,
+          apiKey,
+          signal,
+        });
+        localToolCall = this.findAgentToolCall(run.messageId, runId, step.stepId);
+        if (localToolCall?.status === "error") {
+          const diagnostic = await this.diagnoseRepeatedSqlFailure({
+            runId,
+            input: executionInput,
+            conversation,
+            messageId: run.messageId,
+            context,
+            errorMessage: localToolCall.errorMessage ?? "未知数据库错误",
+            apiKey,
+            signal,
+          });
+          if (diagnostic) {
+            this.agentTurnOrchestrator.fallback(runId, "SQL 第二次执行仍失败，已完成受控业务关系与 Schema 诊断，正在进行最后一次修复。", {
+              fallbackReason: "sql_second_execution_failure",
+              stepId: step.stepId,
+            });
+            context = `${context}\n\n诊断摘要（仅用于修复 SQL，不得扩展用户目标）：\n${diagnostic}`;
+            this.agentTurnOrchestrator.preparingStep(runId, step);
+            execution = await this.executeDualModelStep({
+              runId,
+              step,
+              input: executionInput,
+              tool,
+              context,
+              modelName: run.executionModelName,
+              apiKey,
+              signal,
+            });
+            localToolCall = this.findAgentToolCall(run.messageId, runId, step.stepId);
+          }
+        }
+      }
+
       const issues = this.executionParameterIssues(execution);
 
       if (localToolCall?.status === "pending_approval") {
@@ -7197,6 +7916,7 @@ export class AssistantRuntime {
         return;
       }
       if (localToolCall?.status === "completed") {
+        this.agentTurnOrchestrator.validationCompleted(runId, step, true, [], localToolCall.id);
         this.agentTurnOrchestrator.stepCompleted(runId, step, localToolCall.id, this.agentToolCompletionSummary(step, localToolCall));
         continue;
       }
@@ -7213,6 +7933,13 @@ export class AssistantRuntime {
       }
       const output = isPlainRecordValue(execution.output) ? execution.output : {};
       if (execution.invoked && output.status === "completed") {
+        this.agentTurnOrchestrator.validationCompleted(
+          runId,
+          step,
+          true,
+          [],
+          typeof output.toolCallId === "string" ? output.toolCallId : execution.toolCallId,
+        );
         this.agentTurnOrchestrator.stepCompleted(
           runId,
           step,
@@ -7221,8 +7948,16 @@ export class AssistantRuntime {
         );
         continue;
       }
+      this.agentTurnOrchestrator.validationCompleted(runId, step, false, issues, execution.toolCallId);
+      const failureCode = execution.errorStage === "provider"
+        ? "EXECUTION_MODEL_REQUEST_FAILED"
+        : execution.errorStage === "schema"
+          ? "TOOL_PARAMETER_SCHEMA_INVALID"
+          : issues.length > 0
+            ? "TOOL_PARAMETER_VALIDATION_FAILED"
+            : "TOOL_PARAMETER_GENERATION_FAILED";
       this.agentTurnOrchestrator.stepFailed(runId, step, agentRunError({
-        code: "TOOL_PARAMETER_GENERATION_FAILED",
+        code: failureCode,
         phase: "step_failed",
         stepId: step.stepId,
         toolCallId: execution.toolCallId,
@@ -7266,15 +8001,35 @@ export class AssistantRuntime {
     apiKey: string;
     signal: AbortSignal;
   }) {
+    const runtimeConfig = resolveThinkingOptimizationConfig({
+      reasonerModel: input.input.modelName,
+      executorModel: input.modelName,
+    });
+    const profile = qwenProfileForTool(input.step.toolKind, runtimeConfig);
+    const profileName = input.step.toolKind === "sql_query"
+      ? "sql"
+      : input.step.toolKind === "python_analysis"
+        ? "python"
+        : input.step.toolKind === "chart_rendering" ? "chart" : "report";
     const adapter = new ExecutionParameterAdapter({
       providerName: "siliconflow",
       baseURL: "https://api.siliconflow.cn/v1",
       apiKey: input.apiKey,
       model: input.modelName,
       timeoutMs: MODEL_STREAM_TIMEOUT_MS,
+      requestOptions: profile,
+      profileName,
     });
+    const executionTool: ToolDefinition = {
+      ...input.tool,
+      description: executionToolDescription(input.step.toolKind),
+      inputSchema: executionToolSchema(input.step.toolKind),
+    };
     let parameterValidationStarted = false;
-    return this.withAgentHeartbeat(
+    let reportContent = "";
+    let reportSequence = 0;
+    let reportProgressStarted = false;
+    const execution = await this.withAgentHeartbeat(
       input.runId,
       "preparing_step",
       `${this.agentToolLabel(input.step.toolKind)}仍在准备参数或执行。`,
@@ -7282,19 +8037,202 @@ export class AssistantRuntime {
         conversationId: input.input.conversationId!,
         messageId: this.agentProgressStore.get(input.runId)!.messageId,
         step: input.step,
-        messages: executionMessages(input.context, input.input.prompt, input.step, input.tool),
-        tool: input.tool,
+        messages: executionMessages(input.context, input.input.prompt, input.step, executionTool),
+        tool: executionTool,
         signal: input.signal,
+        onReportDelta: input.step.toolKind === "report_generation"
+          ? (delta) => {
+            if (!delta) return;
+            reportContent += delta;
+            const updated = this.updateMessage(this.agentProgressStore.get(input.runId)!.messageId, {
+              status: "receiving",
+              content: reportContent,
+              blocks: parseAssistantBlocks(reportContent),
+            });
+            if (!reportProgressStarted) {
+              reportProgressStarted = true;
+              this.agentTurnOrchestrator.progress(input.runId, {
+                phase: "reporting",
+                status: "running",
+                summary: "正在生成分析报告",
+                stepId: input.step.stepId,
+                modelRole: "execution",
+              });
+            }
+            this.options.emit({
+              type: "stream-content",
+              conversationId: input.input.conversationId!,
+              event: {
+                type: "markdown_delta",
+                messageId: updated.id,
+                segmentId: generalStreamSegmentId(updated.id),
+                sequence: ++reportSequence,
+                delta,
+                contentRole: "general",
+              },
+            });
+            this.options.emit({
+              type: "message-delta",
+              conversationId: input.input.conversationId!,
+              messageId: updated.id,
+              content: updated.content,
+              blocks: updated.blocks,
+              status: updated.status,
+            });
+          }
+          : undefined,
         onEvent: (event) => {
           if (event.type === "model-observation") this.appendModelObservationLog(input.input, input.input.conversationId!, this.agentProgressStore.get(input.runId)!.messageId, event);
           if (event.type === "tool-call-start" && !parameterValidationStarted) {
             parameterValidationStarted = true;
             this.agentTurnOrchestrator.validatingParameters(input.runId, input.step, event.toolCallId);
           }
+          if (event.type === "tool-call-end") {
+            this.appendAgentParameterObservationLog(input.input, input.step, event, "generated", {
+              parameterShape: summarizeToolArguments(event.payload.argumentsText),
+            });
+          }
+          if (event.type === "tool-execution-error") {
+            const result = isPlainRecordValue(event.payload.result) ? event.payload.result : {};
+            const serializedError = isPlainRecordValue(result.error) ? result.error : {};
+            this.appendAgentParameterObservationLog(input.input, input.step, event, "failed", {
+              validationLayer: serializedError.code === "TOOL_INPUT_INVALID" ? "json_schema" : "tool_handler",
+              errorCode: serializedError.code,
+              errorMessage: serializedError.message,
+            });
+          }
         },
       }),
       { stepId: input.step.stepId },
     );
+    const issues = this.executionParameterIssues(execution);
+    this.appendAgentParameterObservationLog(
+      input.input,
+      input.step,
+      {
+        eventId: randomUUID(),
+        type: execution.error ? "tool-execution-error" : "tool-execution-result",
+        conversationId: input.input.conversationId!,
+        messageId: this.agentProgressStore.get(input.runId)!.messageId,
+        createdAt: nowIso(),
+        payload: {},
+        traceId: execution.traceId,
+        toolCallId: execution.toolCallId,
+      },
+      issues.length > 0 ? "failed" : "passed",
+      {
+        validationLayer: execution.errorStage ?? (issues.length > 0 ? "business_rules" : "local_runtime"),
+        errorCode: execution.errorCode,
+        issueCount: issues.length,
+        issues: issues.slice(0, 3),
+      },
+    );
+    return execution;
+  }
+
+  private async diagnoseRepeatedSqlFailure(input: {
+    runId: string;
+    input: AssistantSendInput;
+    conversation: AssistantConversation;
+    messageId: string;
+    context: string;
+    errorMessage: string;
+    apiKey: string;
+    signal: AbortSignal;
+  }) {
+    const run = this.agentProgressStore.get(input.runId);
+    if (!run) return null;
+    const config = resolveThinkingOptimizationConfig({
+      reasonerModel: run.reasoningModelName,
+      executorModel: run.executionModelName,
+    });
+    let decision = thinkingDecisionForComplexity("L3", config, "sql_repeated_execution_failure");
+    const canCall = (candidate: typeof decision) => {
+      const current = this.agentProgressStore.get(input.runId);
+      const budget = candidate.request.thinkingBudget ?? 0;
+      return Boolean(
+        current &&
+        candidate.useKimi &&
+        current.kimiCallCount < config.maxKimiCallsPerTask &&
+        current.cumulativeThinkingBudget + budget <= config.maxCumulativeThinkingBudget,
+      );
+    };
+    if (!canCall(decision)) {
+      this.agentTurnOrchestrator.fallback(input.runId, "SQL 重复失败，本轮深度诊断次数或推理预算已达到上限。", {
+        fallbackReason: "kimi_budget_or_call_limit",
+      });
+      return null;
+    }
+    const prompt = [
+      input.input.prompt,
+      "当前 SQL 已连续两次通过本地参数、安全和权限校验，但数据库执行失败。",
+      `数据库错误：${truncateText(input.errorMessage, 1_000)}`,
+      "请只诊断可能的表关系、Schema 选择、字段类型或数据库方言问题，并在 AnalysisPlan 中给出一个 sql 步骤的修复目的；禁止直接生成 SQL。",
+    ].join("\n");
+    const callDiagnostic = async (candidate: typeof decision, repairErrors?: string[]) => {
+      const current = this.agentProgressStore.get(input.runId)!;
+      const budget = candidate.request.thinkingBudget ?? 0;
+      this.agentProgressStore.update(input.runId, {
+        kimiCallCount: current.kimiCallCount + 1,
+        cumulativeThinkingBudget: current.cumulativeThinkingBudget + budget,
+      });
+      const planner = new AnalysisPlanningAdapter({
+        providerName: "siliconflow",
+        baseURL: "https://api.siliconflow.cn/v1",
+        apiKey: input.apiKey,
+        model: run.reasoningModelName,
+        timeoutMs: config.planningTimeoutMs,
+        firstEventTimeoutMs: config.firstEventTimeoutMs,
+        requestOptions: candidate.request,
+        profileName: candidate.profile,
+      });
+      return this.withAgentHeartbeat(
+        input.runId,
+        "planning",
+        "正在诊断 SQL 执行失败原因",
+        planner.plan({
+          conversationId: input.conversation.id,
+          messageId: input.messageId,
+          messages: analysisPlanMessages(input.context, prompt, repairErrors),
+          signal: input.signal,
+          timeoutMs: config.planningTimeoutMs,
+          onEvent: (event) => {
+            if (event.type === "model-observation") {
+              this.appendModelObservationLog(input.input, input.conversation.id, input.messageId, event);
+              if (event.payload.phase === "reasoning-progress") {
+                this.agentTurnOrchestrator.planningProgress(input.runId, "正在诊断 Schema 与数据库错误");
+              }
+            }
+          },
+        }),
+      );
+    };
+    let output = await callDiagnostic(decision);
+    let validation = parseAnalysisPlanContent(output.content);
+    if (!validation.valid) {
+      const upgraded = upgradeThinkingDecision(decision, config, {
+        firstDiagnosisUnresolved: true,
+        toolCallCount: 3,
+      });
+      if ((upgraded.request.thinkingBudget ?? 0) > (decision.request.thinkingBudget ?? 0) && canCall(upgraded)) {
+        this.agentTurnOrchestrator.fallback(input.runId, "首次异常诊断未形成合法结构，已按受控策略将诊断 Budget 升级至 2048。", {
+          fallbackReason: "sql_diagnostic_plan_invalid",
+          previousThinkingBudget: decision.request.thinkingBudget,
+          thinkingBudget: upgraded.request.thinkingBudget,
+        });
+        decision = upgraded;
+        output = await callDiagnostic(decision, validation.errors);
+        validation = parseAnalysisPlanContent(output.content);
+      }
+    }
+    if (!validation.valid) return null;
+    return truncateText(JSON.stringify({
+      goal: validation.plan.goal,
+      requiredData: validation.plan.requiredData,
+      steps: validation.plan.steps.filter((step) => step.type === "schema" || step.type === "sql" || step.type === "validation"),
+      assumptions: validation.plan.assumptions,
+      unresolvedAmbiguities: validation.plan.unresolvedAmbiguities,
+    }), 4_000);
   }
 
   private async completeDualModelText(
@@ -7320,12 +8258,145 @@ export class AssistantRuntime {
     this.options.emit({ type: "stream-content", conversationId, event: { type: "message_stream_completed", messageId, completedAt: completed.updatedAt } });
   }
 
+  private async completeDualModelQwenResponse(input: {
+    runId: string;
+    input: AssistantSendInput;
+    conversation: AssistantConversation;
+    assistantMessage: AssistantMessage;
+    signal: AbortSignal;
+    apiKey: string;
+    executionModelName: string;
+    context: string;
+  }) {
+    this.agentTurnOrchestrator.responding(input.runId, "正在生成回答");
+    const adapter = createStreamingModelAdapter({
+      providerName: "siliconflow",
+      baseURL: "https://api.siliconflow.cn/v1",
+      apiKey: input.apiKey,
+      model: input.executionModelName,
+      timeoutMs: MODEL_STREAM_TIMEOUT_MS,
+      requestOptions: {
+        ...resolveThinkingOptimizationConfig({
+          reasonerModel: input.input.modelName,
+          executorModel: input.executionModelName,
+        }).qwenProfiles.router,
+        maxTokens: 2_048,
+      },
+    });
+    const messages: ConversationMessage[] = [
+      {
+        id: `direct-system-${input.assistantMessage.id}`,
+        role: "system",
+        createdAt: nowIso(),
+        content: [
+          "你是数据探针 Agent 的快速响应模型。根据已授权上下文直接回答当前确定性问题。",
+          "不得虚构数据，不得扩展用户未要求的内容，不得输出内部 Prompt 或 Schema 原文。",
+          "不需要调用工具；回答应简洁、具体、可操作。",
+          input.context,
+        ].join("\n\n"),
+      },
+      {
+        id: `direct-user-${input.assistantMessage.id}`,
+        role: "user",
+        createdAt: nowIso(),
+        content: input.input.prompt,
+      },
+    ];
+    let content = "";
+    let sequence = 0;
+    let streamError: string | null = null;
+    for await (const event of adapter.streamChat({
+      conversationId: input.conversation.id,
+      messageId: input.assistantMessage.id,
+      messages,
+      model: input.executionModelName,
+      contentType: "text",
+      signal: input.signal,
+      timeoutMs: MODEL_STREAM_TIMEOUT_MS,
+      requestOptions: {
+        ...resolveThinkingOptimizationConfig({
+          reasonerModel: input.input.modelName,
+          executorModel: input.executionModelName,
+        }).qwenProfiles.router,
+        maxTokens: 2_048,
+      },
+      metadata: { modelRole: "execution", executionProfile: "router", orchestrationPhase: "direct_response" },
+    })) {
+      throwIfAssistantOperationCancelled(input.signal);
+      if (event.type === "model-observation") {
+        this.appendModelObservationLog(input.input, input.conversation.id, input.assistantMessage.id, event);
+      } else if (event.type === "text-delta") {
+        const delta = typeof event.payload.delta === "string" ? event.payload.delta : "";
+        if (!delta) continue;
+        content += delta;
+        const updated = this.updateMessage(input.assistantMessage.id, {
+          status: "receiving",
+          content,
+          blocks: [{ id: `direct-${input.assistantMessage.id}`, type: "text", content }],
+        });
+        this.options.emit({
+          type: "stream-content",
+          conversationId: input.conversation.id,
+          event: {
+            type: "text_delta",
+            messageId: input.assistantMessage.id,
+            segmentId: generalTextStreamSegmentId(input.assistantMessage.id),
+            sequence: ++sequence,
+            delta,
+            contentRole: "general",
+          },
+        });
+        this.options.emit({
+          type: "message-delta",
+          conversationId: input.conversation.id,
+          messageId: updated.id,
+          content: updated.content,
+          blocks: updated.blocks,
+          status: updated.status,
+        });
+      } else if (event.type === "stream-error") {
+        streamError = (event.payload.error as { message?: string } | undefined)?.message ?? "模型响应失败。";
+      }
+    }
+    if (streamError && !content) {
+      throw agentRunError({ code: "QWEN_DIRECT_RESPONSE_FAILED", phase: "responding", message: streamError, recoverable: true });
+    }
+    const finalContent = content.trim() || "当前没有可返回的内容。";
+    const completed = this.updateMessage(input.assistantMessage.id, {
+      status: "completed",
+      content: finalContent,
+      blocks: [{ id: `direct-${input.assistantMessage.id}`, type: "text", content: finalContent }],
+    });
+    this.options.emit({ type: "message", conversationId: input.conversation.id, message: completed });
+    this.agentTurnOrchestrator.finish(input.runId, "回答已完成。");
+    this.options.emit({
+      type: "stream-content",
+      conversationId: input.conversation.id,
+      event: { type: "message_stream_completed", messageId: completed.id, completedAt: completed.updatedAt },
+    });
+  }
+
+  private async resolvePreferredDataSourceLabel(input: AssistantSendInput, conversationId: string) {
+    const explicitLabel = input.dataSourceLabel?.trim() || input.dataSourceId?.trim();
+    if (explicitLabel) return explicitLabel;
+
+    const latestTempSource = [...this.activeTempSources(input.userId, conversationId, input.selectedTempDataSourceIds)]
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0];
+    if (latestTempSource?.fileName.trim()) return latestTempSource.fileName.trim();
+
+    const latestWorkflowDataset = await this.datasetStateManager.getActiveDataset(conversationId);
+    return latestWorkflowDataset?.name?.trim() || latestWorkflowDataset?.datasetId?.trim() || null;
+  }
+
   private async buildDualModelContext(
     input: AssistantSendInput,
     conversation: AssistantConversation,
     modelRole: "reasoning" | "execution",
     step?: PlannerStep,
+    reasoningContextTokenBudget = 8_000,
+    messageId?: string,
   ) {
+    const preferredDataSourceLabel = await this.resolvePreferredDataSourceLabel(input, conversation.id);
     const completedHistory = this.getConversationMessages(input.userId, conversation.id)
       .filter((message) => (message.role === "user" || message.role === "assistant") && message.status === "completed" && message.content.trim())
       .filter((message, index, messages) => !(
@@ -7353,7 +8424,7 @@ export class AssistantRuntime {
             `- latestSqlDataset: ${workflow.latestSqlDataset?.datasetId ?? "--"}`,
             `- latestPythonAnalysis: ${workflow.latestPythonAnalysis ? `${workflow.latestPythonAnalysis.pythonExecutionId ?? "--"} / ${truncateText(workflow.latestPythonAnalysis.summary ?? "--", 300)}` : "--"}`,
             `- latestReport: ${workflow.latestReport ? `${workflow.latestReport.reportVersionId ?? "--"} / ${truncateText(workflow.latestReport.summary ?? "--", 300)}` : "--"}`,
-            ...workflow.datasets.slice(-6).map((dataset) =>
+            ...workflow.datasets.slice(0, 6).map((dataset) =>
               `- dataset: ${dataset.datasetId}; name=${dataset.name}; rows=${dataset.rowCount ?? "--"}; columns=${dataset.columnCount ?? "--"}`
             ),
           ].join("\n");
@@ -7361,15 +8432,48 @@ export class AssistantRuntime {
         .slice(-4)
         .map((message) => `${message.role === "user" ? "用户" : "助手"}：${message.content.slice(0, 600)}`)
         .join("\n");
-      return [
-        `当前数据源：${input.dataSourceLabel || "未选择"}`,
-        `当前 Skill：${input.skill || "未选择"}`,
-        fields ? `本轮真实字段引用：\n${fields}` : undefined,
-        workflowSummary || undefined,
-        recentToolArtifactContext || undefined,
-        history ? `最近对话摘要：\n${history}` : undefined,
-        "只规划用户明确要求的目标；禁止使用模拟数据或扩展指标、图表和报告章节。",
-      ].filter(Boolean).join("\n\n");
+      const compressed = compressReasoningContext([
+        {
+          name: "task_constraints",
+          priority: 100,
+          content: [
+            `用户目标：${input.prompt}`,
+            `当前数据源：${preferredDataSourceLabel || "未选择"}`,
+            preferredDataSourceLabel
+              ? "数据源选择策略：当前已解析数据源；存在多个候选数据集且用户未指定时，默认使用最近更新的数据集，不再要求确认。"
+              : "数据源选择策略：当前没有可用数据源。",
+            `当前 Skill：${input.skill || "未选择"}`,
+            "约束：只读；敏感字段已由数据层处理；只规划用户明确要求的目标；禁止模拟数据和扩展指标。",
+          ].join("\n"),
+        },
+        { name: "selected_fields", priority: 90, content: fields ? `本轮真实字段引用：\n${fields}` : "" },
+        { name: "workflow_summary", priority: 70, content: workflowSummary || "" },
+        { name: "artifact_pointers", priority: 60, content: recentToolArtifactContext || "" },
+        { name: "conversation_history", priority: 20, content: history ? `最近对话摘要：\n${history}` : "" },
+      ], reasoningContextTokenBudget);
+      if (compressed.truncated) {
+        this.appendModelObservationLog(input, conversation.id, messageId ?? input.clientRequestId, {
+          eventId: randomUUID(),
+          type: "model-observation",
+          conversationId: conversation.id,
+          messageId: messageId ?? input.clientRequestId,
+          createdAt: nowIso(),
+          payload: {
+            phase: "reasoning-context-compressed",
+            status: "info",
+            message: "推理上下文已按 Token 预算裁剪。",
+            detail: {
+              modelRole: "reasoning",
+              orchestrationPhase: "context_preparation",
+              tokenBudget: reasoningContextTokenBudget,
+              estimatedTokens: compressed.estimatedTokens,
+              includedSections: compressed.includedSections,
+              omittedSections: compressed.omittedSections,
+            },
+          },
+        });
+      }
+      return compressed.content;
     }
 
     const toolKind = step?.toolKind;
@@ -7387,7 +8491,10 @@ export class AssistantRuntime {
       .join("\n");
     return [
       `模型角色：${modelRole}`,
-      `当前数据源：${input.dataSourceLabel || "未选择"}`,
+      `当前数据源：${preferredDataSourceLabel || "未选择"}`,
+      preferredDataSourceLabel
+        ? "数据源选择策略：当前已解析数据源；存在多个候选数据集且用户未指定时，默认使用最近更新的数据集。"
+        : undefined,
       `当前 Skill：${input.skill || "未选择"}`,
       `审批权限：${input.approvalMode}`,
       step ? `当前步骤输入策略：${step.inputResolution}` : undefined,
@@ -7439,7 +8546,7 @@ export class AssistantRuntime {
 
   private executionParameterIssues(execution: { invoked: boolean; output?: unknown; error?: string; content?: string }) {
     if (execution.error) return [execution.error];
-    if (!execution.invoked) return [execution.content?.trim() || "执行模型未调用指定工具。"];
+    if (!execution.invoked) return [execution.content?.trim() || "参数生成未调用指定工具。"];
     if (!isPlainRecordValue(execution.output)) return [];
     if (execution.output.status !== "parameter_issue" && execution.output.status !== "waiting_input") return [];
     const invalid = Array.isArray(execution.output.invalidParameters) ? execution.output.invalidParameters : [];
@@ -7464,7 +8571,10 @@ export class AssistantRuntime {
 
   private normalizeAgentRunError(error: unknown, phase: AgentProgressEvent["phase"]) {
     if (isPlainRecordValue(error) && typeof error.code === "string" && typeof error.message === "string") {
-      return agentRunError({ ...(error as ReturnType<typeof agentRunError>), phase });
+      const errorPhase = typeof error.phase === "string"
+        ? error.phase as AgentProgressEvent["phase"]
+        : phase;
+      return agentRunError({ ...(error as ReturnType<typeof agentRunError>), phase: errorPhase });
     }
     return agentRunError({
       code: "AGENT_RUN_FAILED",
@@ -7871,8 +8981,55 @@ export class AssistantRuntime {
     ].join("\n");
   }
 
-  private async handleModelSqlTool(
+  private injectAgentToolRequestContext(
     request: Record<string, unknown>,
+    input: AssistantSendInput,
+    toolKind: ToolKind,
+    toolState?: ConversationToolState | null,
+  ) {
+    if (!input.agentRunId || !input.agentStepId) return request;
+    const run = this.agentProgressStore.get(input.agentRunId);
+    const step = run?.plan?.steps.find((candidate) => candidate.stepId === input.agentStepId);
+    const next: Record<string, unknown> = {
+      ...request,
+      userRequest: stringValue(request.userRequest) || input.prompt,
+      purpose: stringValue(request.purpose) || step?.purpose || input.prompt,
+    };
+    if (!toolState || stringArrayValue(request.inputArtifactIds).length > 0) return next;
+
+    if (toolKind === "python_analysis") {
+      const artifactIds = toolState.latestSuccessfulSqlArtifactIds ?? [];
+      if (artifactIds.length > 0) next.inputArtifactIds = artifactIds;
+      if (toolState.latestSuccessfulSqlToolCallId) next.sourceSqlToolCallId = toolState.latestSuccessfulSqlToolCallId;
+    } else if (toolKind === "chart_rendering") {
+      const pythonArtifacts = toolState.latestSuccessfulPythonArtifactIds ?? [];
+      const sqlArtifacts = toolState.latestSuccessfulSqlArtifactIds ?? [];
+      next.inputArtifactIds = pythonArtifacts.length > 0 ? pythonArtifacts : sqlArtifacts;
+      if (pythonArtifacts.length > 0 && toolState.latestSuccessfulPythonToolCallId) {
+        next.sourcePythonToolCallId = toolState.latestSuccessfulPythonToolCallId;
+      } else if (toolState.latestSuccessfulSqlToolCallId) {
+        next.sourceSqlToolCallId = toolState.latestSuccessfulSqlToolCallId;
+      }
+    } else if (toolKind === "report_generation") {
+      const artifactIds = uniqueValues([
+        ...(toolState.latestSuccessfulPythonArtifactIds ?? []),
+        ...(toolState.latestSuccessfulChartArtifactIds ?? []),
+        ...(toolState.latestSuccessfulSqlArtifactIds ?? []),
+      ]);
+      if (artifactIds.length > 0) next.inputArtifactIds = artifactIds;
+      if (toolState.latestSuccessfulChartArtifactIds?.length) {
+        next.visualizationArtifactIds = toolState.latestSuccessfulChartArtifactIds;
+        next.includeVisualizations = true;
+      }
+      if (toolState.latestSuccessfulSqlToolCallId) next.sourceSqlToolCallId = toolState.latestSuccessfulSqlToolCallId;
+      if (toolState.latestSuccessfulPythonToolCallId) next.sourcePythonToolCallId = toolState.latestSuccessfulPythonToolCallId;
+      if (toolState.latestSuccessfulChartToolCallId) next.sourceChartToolCallIds = [toolState.latestSuccessfulChartToolCallId];
+    }
+    return next;
+  }
+
+  private async handleModelSqlTool(
+    rawRequest: Record<string, unknown>,
     input: AssistantSendInput,
     conversation: AssistantConversation,
     assistantMessage: AssistantMessage,
@@ -7880,6 +9037,7 @@ export class AssistantRuntime {
     signal?: AbortSignal,
   ) {
     throwIfAssistantOperationCancelled(signal);
+    const request = this.injectAgentToolRequestContext(rawRequest, input, "sql_query");
     if (shouldAnalyzePriorSqlResult(input.prompt)) {
       const { latestSqlToolCall, rows } = await this.latestSqlRowsForConversation(input.userId, conversation.id);
       if (latestSqlToolCall) {
@@ -7970,7 +9128,7 @@ export class AssistantRuntime {
   }
 
   private async handleModelPythonTool(
-    request: Record<string, unknown>,
+    rawRequest: Record<string, unknown>,
     input: AssistantSendInput,
     conversation: AssistantConversation,
     assistantMessage: AssistantMessage,
@@ -7979,6 +9137,7 @@ export class AssistantRuntime {
   ) {
     throwIfAssistantOperationCancelled(signal);
     const toolState = await this.toolResultRegistry.getConversationState(conversation.id);
+    const request = this.injectAgentToolRequestContext(rawRequest, input, "python_analysis", toolState);
     const repair = this.agentGuidance.validateToolRequest({ toolKind: "python_analysis", request, toolState });
     const scriptParameterMissing = typeof request.script !== "string" || !request.script.trim();
     const invalidParameters = [
@@ -8031,12 +9190,14 @@ export class AssistantRuntime {
   }
 
   private async handleModelChartTool(
-    request: Record<string, unknown>,
+    rawRequest: Record<string, unknown>,
     input: AssistantSendInput,
     assistantMessage: AssistantMessage,
     modelToolCallId: string,
   ) {
+    const startedAtMs = Date.now();
     const toolState = await this.toolResultRegistry.getConversationState(assistantMessage.conversationId);
+    const request = this.injectAgentToolRequestContext(rawRequest, input, "chart_rendering", toolState);
     const repair = this.agentGuidance.validateToolRequest({ toolKind: "chart_rendering", request, toolState });
     if (!repair.valid) {
       if (shouldDeferChartUntilUpstreamTools({ request, prompt: input.prompt, invalidParameters: repair.invalidParameters, toolState })) {
@@ -8101,10 +9262,11 @@ export class AssistantRuntime {
           warnings: parsed.warnings,
         },
       },
-	      parentKinds: ["python_analysis", "sql_query"],
-	    });
-	    await this.emitToolState(assistantMessage.conversationId);
-	    return {
+      parentKinds: ["python_analysis", "sql_query"],
+      startedAtMs,
+    });
+    await this.emitToolState(assistantMessage.conversationId);
+    return {
       status: "completed",
       toolCallId: modelToolCallId,
       artifactIds: record?.outputArtifactIds ?? [],
@@ -8113,12 +9275,14 @@ export class AssistantRuntime {
   }
 
   private async handleModelReportTool(
-    request: Record<string, unknown>,
+    rawRequest: Record<string, unknown>,
     input: AssistantSendInput,
     assistantMessage: AssistantMessage,
     modelToolCallId: string,
   ) {
+    const startedAtMs = Date.now();
     const toolState = await this.toolResultRegistry.getConversationState(assistantMessage.conversationId);
+    const request = this.injectAgentToolRequestContext(rawRequest, input, "report_generation", toolState);
     if (shouldDeferReportUntilChartTool({ request, prompt: input.prompt, toolState })) {
       const hasPythonInput = Boolean(toolState.latestSuccessfulPythonToolCallId && toolState.latestSuccessfulPythonArtifactIds?.length);
       const hasSqlInput = Boolean(toolState.latestSuccessfulSqlToolCallId && toolState.latestSuccessfulSqlArtifactIds?.length);
@@ -8176,6 +9340,7 @@ export class AssistantRuntime {
       chartToolCallId: toolState.latestSuccessfulChartToolCallId,
       chartArtifactIds: toolState.latestSuccessfulChartArtifactIds ?? [],
     });
+    markdown = mergeReportChartSections(markdown);
     const visualizationArtifactIds = reportVisualizationArtifactIds(markdown);
     const title = typeof request.title === "string" && request.title.trim() ? request.title.trim().slice(0, 120) : inferReportTitle(markdown) ?? "分析报告";
     const currentMessage = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(assistantMessage.id));
@@ -8199,6 +9364,7 @@ export class AssistantRuntime {
         },
       },
       parentKinds: ["chart_rendering", "python_analysis", "sql_query"],
+      startedAtMs,
     });
     if (record) {
       const artifactId = record.result?.primaryArtifactId ?? record.outputArtifactIds?.[0] ?? generatedReportArtifactId(currentMessage.id);

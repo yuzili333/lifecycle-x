@@ -61,15 +61,48 @@ describe("dual-model agent orchestration", () => {
       requestedOutputs: ["query" as const],
       steps: [{ stepId: "query", toolKind: "sql_query" as const, purpose: "查询", dependencies: [], inputResolution: "selected_data_source" as const, expectedOutput: "数据集" }],
     };
+    orchestrator.routing("run-1");
+    orchestrator.routeCompleted("run-1", {
+      taskType: "single_query",
+      complexity: "L1",
+      requiresKimi: false,
+      requiresSql: true,
+      requiresPython: false,
+      requiresChart: false,
+      requiresReport: false,
+      ambiguities: [],
+      userVisibleSummary: "执行只读查询",
+      confidence: 0.99,
+    }, {
+      useKimi: false,
+      complexity: "L1",
+      profile: "fast",
+      request: { enableThinking: false, stream: true, temperature: 0, maxTokens: 2_048 },
+      maxAutoUpgradeBudget: 0,
+      reason: "test",
+    });
     orchestrator.planReady("run-1", plan);
     orchestrator.preparingStep("run-1", plan.steps[0]);
     orchestrator.waitingApproval("run-1", plan.steps[0], "tool-1");
     expect(store.get("run-1")?.status).toBe("waiting_approval");
     orchestrator.resumeAfterApproval("run-1", plan.steps[0], "tool-1");
+    orchestrator.validationCompleted("run-1", plan.steps[0], true, [], "tool-1");
     orchestrator.stepCompleted("run-1", plan.steps[0], "tool-1");
     orchestrator.finish("run-1", "完成");
     const completed = store.get("run-1")!;
     expect(completed.status).toBe("completed");
+    expect(emitted[0]).toBe("accepted");
+    expect(completed.events[0]?.businessEventType).toBe("task.accepted");
+    expect(completed.events.find((event) => event.phase === "routing_completed")?.detail?.routerLatencyMs).toEqual(expect.any(Number));
+    expect(completed.events.find((event) => event.phase === "preparing_step")?.detail?.firstToolStartLatencyMs).toEqual(expect.any(Number));
+    expect(completed.events.find((event) => event.phase === "step_completed")?.detail?.firstResultPreviewLatencyMs).toEqual(expect.any(Number));
+    expect(completed.events.at(-1)?.detail?.totalTaskLatencyMs).toEqual(expect.any(Number));
+    expect(completed.events.at(-1)?.detail?.qualityMetrics).toMatchObject({
+      sqlFirstPassSuccess: true,
+      sqlAutoRepairCount: 0,
+      validationPassRate: 1,
+      kimiInvocationCount: 0,
+    });
     expect(completed.completedStepIds).toEqual(["query"]);
     expect(completed.events.map((event) => event.phase)).toEqual(emitted);
     expect(completed.waitingDurationMs).toBeGreaterThanOrEqual(0);
@@ -84,5 +117,34 @@ describe("dual-model agent orchestration", () => {
       waitingStartedAt: undefined,
     } as Parameters<typeof currentDurations>[0];
     expect(currentDurations(run, 2_500)).toEqual({ activeDurationMs: 2_000, waitingDurationMs: 700 });
+  });
+
+  it("emits a distinct planning.started business event before planning progress", () => {
+    const db = new Database(":memory:");
+    const store = new SQLiteAgentProgressStore(db);
+    store.migrate();
+    const orchestrator = new AgentTurnOrchestrator(store, () => undefined);
+    orchestrator.start({
+      runId: "run-planning",
+      conversationId: "conversation-1",
+      messageId: "message-1",
+      userId: "user-1",
+      attempt: 1,
+      reasoningModelName: "kimi",
+      executionModelName: "qwen",
+    });
+    orchestrator.planning("run-planning", {
+      useKimi: true,
+      complexity: "L2",
+      profile: "standard",
+      request: { enableThinking: true, thinkingBudget: 512, stream: true, temperature: 0, maxTokens: 4_096 },
+      maxAutoUpgradeBudget: 1_024,
+      reason: "test",
+    });
+    orchestrator.planningProgress("run-planning", "正在规划数据查询");
+
+    const planningEvents = store.get("run-planning")?.events.filter((event) => event.phase === "planning") ?? [];
+    expect(planningEvents.map((event) => event.businessEventType)).toEqual(["planning.started", "planning.progress"]);
+    db.close();
   });
 });

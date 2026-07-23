@@ -19,6 +19,11 @@ export class SQLiteAgentProgressStore {
         status text not null,
         reasoning_model_name text not null,
         execution_model_name text not null,
+        route_json text,
+        analysis_plan_json text,
+        thinking_decision_json text,
+        kimi_call_count integer not null default 0,
+        cumulative_thinking_budget integer not null default 0,
         plan_json text,
         current_step_id text,
         completed_step_ids_json text not null,
@@ -44,6 +49,7 @@ export class SQLiteAgentProgressStore {
         step_id text,
         tool_call_id text,
         model_role text,
+        business_event_type text,
         active_duration_ms integer,
         waiting_duration_ms integer,
         detail_json text,
@@ -53,6 +59,12 @@ export class SQLiteAgentProgressStore {
       create index if not exists idx_agent_runs_conversation_started on agent_runs(conversation_id, started_at);
       create index if not exists idx_agent_progress_run_created on agent_progress_events(run_id, created_at);
     `);
+    this.ensureColumn("agent_runs", "route_json", "text");
+    this.ensureColumn("agent_runs", "analysis_plan_json", "text");
+    this.ensureColumn("agent_runs", "thinking_decision_json", "text");
+    this.ensureColumn("agent_runs", "kimi_call_count", "integer not null default 0");
+    this.ensureColumn("agent_runs", "cumulative_thinking_budget", "integer not null default 0");
+    this.ensureColumn("agent_progress_events", "business_event_type", "text");
   }
 
   create(input: CreateAgentRunInput): AgentRunRecord {
@@ -92,6 +104,11 @@ export class SQLiteAgentProgressStore {
   update(runId: string, patch: {
     status?: AgentRunStatus;
     plan?: PlannerDecision;
+    route?: AgentRunRecord["route"];
+    analysisPlan?: AgentRunRecord["analysisPlan"];
+    thinkingDecision?: AgentRunRecord["thinkingDecision"];
+    kimiCallCount?: number;
+    cumulativeThinkingBudget?: number;
     currentStepId?: string | null;
     completedStepIds?: string[];
     failedStepIds?: string[];
@@ -105,10 +122,17 @@ export class SQLiteAgentProgressStore {
     const current = this.get(runId);
     if (!current) throw new Error(`Agent Run 不存在：${runId}`);
     const next = { ...current, ...patch, updatedAt: new Date().toISOString() };
-    this.db.prepare(`update agent_runs set status = ?, plan_json = ?, current_step_id = ?, completed_step_ids_json = ?,
+    this.db.prepare(`update agent_runs set status = ?, route_json = ?, analysis_plan_json = ?, thinking_decision_json = ?,
+      kimi_call_count = ?, cumulative_thinking_budget = ?,
+      plan_json = ?, current_step_id = ?, completed_step_ids_json = ?,
       failed_step_ids_json = ?, active_duration_ms = ?, waiting_duration_ms = ?, active_started_at = ?, waiting_started_at = ?,
       error_json = ?, updated_at = ?, completed_at = ? where run_id = ?`).run(
       next.status,
+      next.route ? JSON.stringify(next.route) : null,
+      next.analysisPlan ? JSON.stringify(next.analysisPlan) : null,
+      next.thinkingDecision ? JSON.stringify(next.thinkingDecision) : null,
+      next.kimiCallCount,
+      next.cumulativeThinkingBudget,
       next.plan ? JSON.stringify(next.plan) : null,
       next.currentStepId ?? null,
       JSON.stringify(next.completedStepIds),
@@ -128,10 +152,10 @@ export class SQLiteAgentProgressStore {
   append(event: AgentProgressEvent) {
     this.db.prepare(`insert into agent_progress_events
       (event_id, run_id, conversation_id, message_id, phase, status, summary, step_id, tool_call_id, model_role,
-       active_duration_ms, waiting_duration_ms, detail_json, created_at)
-      values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+       business_event_type, active_duration_ms, waiting_duration_ms, detail_json, created_at)
+      values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       event.eventId, event.runId, event.conversationId, event.messageId, event.phase, event.status, event.summary,
-      event.stepId ?? null, event.toolCallId ?? null, event.modelRole ?? null, event.activeDurationMs ?? null,
+      event.stepId ?? null, event.toolCallId ?? null, event.modelRole ?? null, event.businessEventType ?? null, event.activeDurationMs ?? null,
       event.waitingDurationMs ?? null, event.detail ? JSON.stringify(event.detail) : null, event.createdAt,
     );
   }
@@ -148,6 +172,7 @@ export class SQLiteAgentProgressStore {
       stepId: row.step_id ?? undefined,
       toolCallId: row.tool_call_id ?? undefined,
       modelRole: row.model_role ?? undefined,
+      businessEventType: row.business_event_type ?? undefined,
       activeDurationMs: row.active_duration_ms ?? undefined,
       waitingDurationMs: row.waiting_duration_ms ?? undefined,
       detail: parseJson(row.detail_json, undefined),
@@ -158,7 +183,7 @@ export class SQLiteAgentProgressStore {
   stopOrphanedRuns() {
     const now = new Date().toISOString();
     this.db.prepare(`update agent_runs set status = 'cancelled', active_started_at = null, waiting_started_at = null,
-      completed_at = ?, updated_at = ? where status in ('planning', 'responding', 'executing')`).run(now, now);
+      completed_at = ?, updated_at = ? where status in ('routing', 'planning', 'responding', 'executing')`).run(now, now);
   }
 
   private fromRow(row: any): AgentRunRecord {
@@ -171,6 +196,11 @@ export class SQLiteAgentProgressStore {
       status: row.status,
       reasoningModelName: row.reasoning_model_name,
       executionModelName: row.execution_model_name,
+      route: parseJson(row.route_json, undefined),
+      analysisPlan: parseJson(row.analysis_plan_json, undefined),
+      thinkingDecision: parseJson(row.thinking_decision_json, undefined),
+      kimiCallCount: Number(row.kimi_call_count ?? 0),
+      cumulativeThinkingBudget: Number(row.cumulative_thinking_budget ?? 0),
       plan: parseJson(row.plan_json, undefined),
       currentStepId: row.current_step_id ?? undefined,
       completedStepIds: parseJson(row.completed_step_ids_json, []),
@@ -188,6 +218,13 @@ export class SQLiteAgentProgressStore {
     };
     run.events = this.events(run.runId);
     return run;
+  }
+
+  private ensureColumn(table: string, column: string, type: string) {
+    const columns = this.db.prepare(`pragma table_info(${table})`).all() as Array<{ name?: string }>;
+    if (!columns.some((item) => item.name === column)) {
+      this.db.exec(`alter table ${table} add column ${column} ${type}`);
+    }
   }
 }
 

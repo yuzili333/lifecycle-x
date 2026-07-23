@@ -12,6 +12,7 @@ export type {
   JsonSchema,
   MarkdownBlockType,
   ModelAdapterErrorCode,
+  ModelRequestOptions,
   ModelStreamEvent,
   ModelStreamEventType,
   ModelVisualizationStreamEvent,

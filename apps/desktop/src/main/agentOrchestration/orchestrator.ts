@@ -11,6 +11,10 @@ import type {
   PlannerDecision,
   PlannerStep,
 } from "./types";
+import { progressPhaseToBusinessEventType, toAgentBusinessEvent, validateAgentBusinessEvent } from "./agentStreamProtocol";
+import type { AnalysisPlan } from "./analysisPlan";
+import type { ThinkingDecision } from "./modelRuntimeConfig";
+import type { TaskRoute } from "./taskRouter";
 
 type ProgressEmitter = (event: AgentProgressEvent, run: AgentRunRecord) => void;
 
@@ -20,15 +24,68 @@ export class AgentTurnOrchestrator {
   start(input: CreateAgentRunInput) {
     const run = this.store.create(input);
     return this.progress(run.runId, {
+      phase: "accepted",
+      status: "success",
+      summary: "已接收分析任务",
+      detail: { taskAckLatencyMs: 0, firstVisibleContentLatencyMs: 0 },
+    });
+  }
+
+  routing(runId: string) {
+    this.transition(runId, "routing");
+    return this.progress(runId, {
+      phase: "routing",
+      status: "running",
+      summary: "正在理解分析目标",
+      modelRole: "execution",
+    });
+  }
+
+  routeCompleted(runId: string, route: TaskRoute, thinkingDecision: ThinkingDecision) {
+    this.store.update(runId, { route, thinkingDecision });
+    const run = this.requiredRun(runId);
+    return this.progress(runId, {
+      phase: "routing_completed",
+      status: "success",
+      summary: route.userVisibleSummary,
+      modelRole: "execution",
+      detail: {
+        taskType: route.taskType,
+        complexity: route.complexity,
+        requiresKimi: thinkingDecision.useKimi,
+        confidence: route.confidence,
+        routerLatencyMs: elapsedSinceRunStart(run),
+      },
+    });
+  }
+
+  planning(runId: string, thinkingDecision: ThinkingDecision) {
+    this.transition(runId, "planning", { thinkingDecision });
+    return this.progress(runId, {
       phase: "planning",
       status: "running",
-      summary: "思考中",
+      summary: "正在规划分析路径",
+      modelRole: "reasoning",
+      detail: {
+        profile: thinkingDecision.profile,
+        thinkingBudget: thinkingDecision.request.thinkingBudget,
+      },
+      businessEventType: "planning.started",
+    });
+  }
+
+  planningProgress(runId: string, summary: string) {
+    return this.progress(runId, {
+      phase: "planning",
+      status: "running",
+      summary,
       modelRole: "reasoning",
     });
   }
 
-  planReady(runId: string, plan: PlannerDecision) {
-    this.store.update(runId, { plan, status: "executing" });
+  planReady(runId: string, plan: PlannerDecision, analysisPlan?: AnalysisPlan) {
+    this.store.update(runId, { plan, analysisPlan, status: "executing" });
+    const run = this.requiredRun(runId);
     return this.progress(runId, {
       phase: "plan_ready",
       status: "success",
@@ -37,6 +94,8 @@ export class AgentTurnOrchestrator {
       detail: {
         requestedOutputs: plan.requestedOutputs,
         steps: plan.steps.map((step) => ({ stepId: step.stepId, toolKind: step.toolKind, purpose: step.purpose, dependencies: step.dependencies })),
+        analysisPlanRecorded: Boolean(analysisPlan),
+        planLatencyMs: elapsedSinceRunStart(run),
       },
     });
   }
@@ -53,13 +112,19 @@ export class AgentTurnOrchestrator {
 
   preparingStep(runId: string, step: PlannerStep) {
     this.transition(runId, "executing", { currentStepId: step.stepId });
+    const run = this.requiredRun(runId);
+    const isFirstToolStart = !run.events.some((event) => event.phase === "preparing_step");
     return this.progress(runId, {
       phase: "preparing_step",
       status: "running",
       summary: `${toolLabel(step.toolKind)}：正在生成受控工具参数。`,
       stepId: step.stepId,
       modelRole: "execution",
-      detail: { purpose: step.purpose, expectedOutput: step.expectedOutput },
+      detail: {
+        purpose: step.purpose,
+        expectedOutput: step.expectedOutput,
+        ...(isFirstToolStart ? { firstToolStartLatencyMs: elapsedSinceRunStart(run) } : {}),
+      },
     });
   }
 
@@ -111,6 +176,7 @@ export class AgentTurnOrchestrator {
 
   stepCompleted(runId: string, step: PlannerStep, toolCallId?: string, summary?: string) {
     const run = this.requiredRun(runId);
+    const isFirstResult = !run.events.some((event) => event.phase === "step_completed");
     this.store.update(runId, {
       completedStepIds: unique([...run.completedStepIds, step.stepId]),
       currentStepId: null,
@@ -122,6 +188,19 @@ export class AgentTurnOrchestrator {
       stepId: step.stepId,
       toolCallId,
       modelRole: "execution",
+      detail: isFirstResult ? { firstResultPreviewLatencyMs: elapsedSinceRunStart(run) } : undefined,
+    });
+  }
+
+  validationCompleted(runId: string, step: PlannerStep, passed: boolean, issues: string[] = [], toolCallId?: string) {
+    return this.progress(runId, {
+      phase: "validation_completed",
+      status: passed ? "success" : "error",
+      summary: passed ? `${toolLabel(step.toolKind)}结果校验通过。` : `${toolLabel(step.toolKind)}结果校验发现问题。`,
+      stepId: step.stepId,
+      toolCallId,
+      modelRole: "execution",
+      detail: { passed, issueCount: issues.length },
     });
   }
 
@@ -149,6 +228,8 @@ export class AgentTurnOrchestrator {
 
   finish(runId: string, summary: string) {
     const current = this.requiredRun(runId);
+    const durations = currentDurations(current);
+    const quality = qualityMetrics(current);
     const status: AgentRunStatus = current.failedStepIds.length > 0 && current.completedStepIds.length > 0
       ? "partial"
       : current.failedStepIds.length > 0
@@ -159,10 +240,20 @@ export class AgentTurnOrchestrator {
       phase: status === "failed" ? "failed" : "completed",
       status: status === "failed" ? "error" : "success",
       summary,
+      detail: {
+        planExecutionCompletionRate: current.plan?.steps.length
+          ? current.completedStepIds.length / current.plan.steps.length
+          : 1,
+        totalTaskLatencyMs: elapsedSinceRunStart(current),
+        activeDurationMs: durations.activeDurationMs,
+        waitingDurationMs: durations.waitingDurationMs,
+        qualityMetrics: quality,
+      },
     });
   }
 
   fail(runId: string, error: AgentRunError) {
+    const current = this.requiredRun(runId);
     this.transition(runId, "failed", { error, completedAt: new Date().toISOString(), currentStepId: null });
     return this.progress(runId, {
       phase: "failed",
@@ -170,7 +261,13 @@ export class AgentTurnOrchestrator {
       summary: error.message,
       stepId: error.stepId,
       toolCallId: error.toolCallId,
-      detail: { code: error.code, traceId: error.traceId, recoverable: error.recoverable },
+      detail: {
+        code: error.code,
+        traceId: error.traceId,
+        recoverable: error.recoverable,
+        totalTaskLatencyMs: elapsedSinceRunStart(current),
+        qualityMetrics: qualityMetrics(current),
+      },
     });
   }
 
@@ -178,7 +275,12 @@ export class AgentTurnOrchestrator {
     const run = this.store.get(runId);
     if (!run || isTerminal(run.status)) return run;
     this.transition(runId, "cancelled", { completedAt: new Date().toISOString(), currentStepId: null });
-    return this.progress(runId, { phase: "cancelled", status: "cancelled", summary });
+    return this.progress(runId, {
+      phase: "cancelled",
+      status: "cancelled",
+      summary,
+      detail: { userCancelled: true, totalTaskLatencyMs: elapsedSinceRunStart(run) },
+    });
   }
 
   progress(runId: string, input: {
@@ -189,6 +291,7 @@ export class AgentTurnOrchestrator {
     toolCallId?: string;
     modelRole?: AgentModelRole;
     detail?: Record<string, unknown>;
+    businessEventType?: AgentProgressEvent["businessEventType"];
   }) {
     const run = this.requiredRun(runId);
     const durations = currentDurations(run);
@@ -207,7 +310,11 @@ export class AgentTurnOrchestrator {
       activeDurationMs: durations.activeDurationMs,
       waitingDurationMs: durations.waitingDurationMs,
       detail: sanitizeDetail(input.detail),
+      businessEventType: input.businessEventType ?? progressPhaseToBusinessEventType(input.phase),
     };
+    if (!validateAgentBusinessEvent(toAgentBusinessEvent(event))) {
+      throw new Error(`Agent 业务事件不合法：${input.phase}`);
+    }
     this.store.append(event);
     const next = this.requiredRun(runId);
     this.emit(event, next);
@@ -266,7 +373,7 @@ function currentSegment(startedAt?: string) {
 }
 
 function isActive(status: AgentRunStatus) {
-  return status === "planning" || status === "responding" || status === "executing";
+  return status === "routing" || status === "planning" || status === "responding" || status === "executing";
 }
 
 function isTerminal(status: AgentRunStatus) {
@@ -288,4 +395,38 @@ function sanitizeDetail(detail?: Record<string, unknown>) {
 
 function unique(values: string[]) {
   return Array.from(new Set(values));
+}
+
+function elapsedSinceRunStart(run: AgentRunRecord, nowMs = Date.now()) {
+  return Math.max(0, nowMs - Date.parse(run.startedAt));
+}
+
+function qualityMetrics(run: AgentRunRecord) {
+  const validationEvents = run.events.filter((event) => event.phase === "validation_completed");
+  const validationPassed = validationEvents.filter((event) => event.status === "success").length;
+  const sqlRepairEvents = run.events.filter((event) =>
+    event.phase === "fallback" && event.detail?.fallbackReason === "sql_first_execution_failure"
+  );
+  const sqlSteps = run.plan?.steps.filter((step) => step.toolKind === "sql_query") ?? [];
+  const completedReportSteps = (run.plan?.steps ?? []).filter((step) =>
+    step.toolKind === "report_generation" && run.completedStepIds.includes(step.stepId)
+  ).length;
+  const budgetUpgradeEvents = run.events.filter((event) =>
+    event.phase === "fallback" &&
+    typeof event.detail?.previousThinkingBudget === "number" &&
+    typeof event.detail?.thinkingBudget === "number"
+  );
+  return {
+    sqlFirstPassSuccess: sqlSteps.length > 0 ? sqlRepairEvents.length === 0 : undefined,
+    sqlAutoRepairCount: sqlRepairEvents.length,
+    validationPassRate: validationEvents.length > 0 ? validationPassed / validationEvents.length : undefined,
+    kimiInvocationCount: run.kimiCallCount,
+    kimiBudgetUpgradeCount: budgetUpgradeEvents.length,
+    simpleTaskFalsePositiveKimi: run.route && (run.route.complexity === "L0" || run.route.complexity === "L1")
+      ? run.kimiCallCount > 0
+      : undefined,
+    reportGenerationCount: completedReportSteps,
+    reportRegenerationCount: Math.max(0, completedReportSteps - 1),
+    fallbackCount: run.events.filter((event) => event.phase === "fallback").length,
+  };
 }

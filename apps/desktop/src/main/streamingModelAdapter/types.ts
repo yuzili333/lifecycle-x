@@ -39,6 +39,7 @@ export type MarkdownBlockType =
 
 export type ModelAdapterErrorCode =
   | "PROVIDER_REQUEST_FAILED"
+  | "PROVIDER_FIRST_EVENT_TIMEOUT"
   | "PROVIDER_STREAM_PARSE_FAILED"
   | "PROVIDER_TIMEOUT"
   | "USER_ABORTED"
@@ -93,6 +94,8 @@ export type JsonSchema = {
   anyOf?: JsonSchema[];
   minLength?: number;
   minItems?: number;
+  minimum?: number;
+  maximum?: number;
   additionalProperties?: boolean | JsonSchema;
   description?: string;
 };
@@ -184,7 +187,18 @@ export type StreamChatInput = {
   stopAfterToolExecution?: boolean;
   signal?: AbortSignal;
   timeoutMs?: number;
+  firstEventTimeoutMs?: number;
+  requestOptions?: ModelRequestOptions;
   metadata?: Record<string, unknown>;
+};
+
+export type ModelRequestOptions = {
+  enableThinking?: boolean;
+  thinkingBudget?: number;
+  stream?: boolean;
+  temperature?: number;
+  maxTokens?: number;
+  responseFormat?: Record<string, unknown>;
 };
 
 export type StreamingModelAdapterConfig = {
@@ -197,6 +211,7 @@ export type StreamingModelAdapterConfig = {
   fetch?: typeof fetch;
   toolExecutionMode?: ToolExecutionMode;
   maxToolRounds?: number;
+  requestOptions?: ModelRequestOptions;
 };
 
 export type CreateVersionInput = Omit<ContentVersion, "versionId" | "createdAt" | "updatedAt" | "status"> & {

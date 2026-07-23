@@ -201,6 +201,86 @@ describe("InMemoryVersionManager", () => {
 });
 
 describe("StreamingModelAdapter", () => {
+  it("maps SiliconFlow Thinking options, hides reasoning content and records usage", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(sseResponse([
+      'data: {"choices":[{"delta":{"reasoning_content":"内部推理一"}}]}\n\n',
+      'data: {"choices":[{"delta":{"reasoning_content":"内部推理二"}}]}\n\n',
+      'data: {"choices":[{"delta":{"content":"{\\"goal\\":\\"分析风险\\"}"},"finish_reason":"stop"}]}\n\n',
+      'data: {"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":30,"total_tokens":130,"completion_tokens_details":{"reasoning_tokens":20}}}\n\n',
+      "data: [DONE]\n\n",
+    ]));
+    const adapter = createStreamingModelAdapter({
+      baseURL: "https://example.local/v1",
+      apiKey: "secret",
+      model: "kimi-model",
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+
+    const events = await collect(adapter.streamChat({
+      ...baseInput(),
+      contentType: "text",
+      requestOptions: {
+        enableThinking: true,
+        thinkingBudget: 512,
+        stream: true,
+        temperature: 0,
+        maxTokens: 4_096,
+      },
+    }));
+    const request = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as Record<string, unknown>;
+    const visibleText = events
+      .filter((event) => event.type === "text-delta")
+      .map((event) => event.payload.delta)
+      .join("");
+    const completed = events.find((event) => event.type === "model-observation" && event.payload.phase === "provider-round-complete");
+
+    expect(request).toMatchObject({
+      enable_thinking: true,
+      thinking_budget: 512,
+      max_tokens: 4_096,
+      temperature: 0,
+      stream: true,
+    });
+    expect(visibleText).toBe('{"goal":"分析风险"}');
+    expect(JSON.stringify(events)).not.toContain("内部推理一");
+    expect(events.some((event) => event.type === "model-observation" && event.payload.phase === "reasoning-progress")).toBe(true);
+    expect(completed?.payload.detail).toMatchObject({
+      reasoningDeltaChars: 10,
+      usage: { promptTokens: 100, completionTokens: 30, totalTokens: 130, reasoningTokens: 20 },
+    });
+  });
+
+  it("supports non-stream Qwen execution requests without sending a thinking budget", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      choices: [{ message: { content: "完成" }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 },
+    }), { status: 200, headers: { "content-type": "application/json" } }));
+    const adapter = createStreamingModelAdapter({
+      baseURL: "https://example.local/v1",
+      apiKey: "secret",
+      model: "qwen-model",
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+
+    const events = await collect(adapter.streamChat({
+      ...baseInput(),
+      contentType: "text",
+      requestOptions: {
+        enableThinking: false,
+        thinkingBudget: 4_096,
+        stream: false,
+        temperature: 0,
+        maxTokens: 800,
+      },
+    }));
+    const request = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as Record<string, unknown>;
+
+    expect(request.enable_thinking).toBe(false);
+    expect(request).not.toHaveProperty("thinking_budget");
+    expect(request.stream).toBe(false);
+    expect(events.some((event) => event.type === "text-delta" && event.payload.delta === "完成")).toBe(true);
+  });
+
   it("executes the sole allowed tool when the provider omits the streamed function name", async () => {
     const fetchMock = vi.fn().mockResolvedValue(sseResponse([
       'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_unnamed","function":{"arguments":"{\\"customerId\\":\\"A\\"}"}}]},"finish_reason":"tool_calls"}]}\n\n',
@@ -476,6 +556,46 @@ describe("StreamingModelAdapter", () => {
     const events = await collect(adapter.streamChat(baseInput()));
 
     expect(events.some((event) => event.type === "stream-error" && (event.payload.error as { code: string }).code === "PROVIDER_TIMEOUT")).toBe(true);
+  });
+
+  it("distinguishes reasoner first-event timeout from total provider timeout", async () => {
+    const adapter = createStreamingModelAdapter({
+      baseURL: "https://example.local/v1",
+      apiKey: "secret",
+      model: "kimi-model",
+      timeoutMs: 1_000,
+      fetch: abortAwareFetch() as unknown as typeof fetch,
+    });
+
+    const events = await collect(adapter.streamChat({ ...baseInput(), firstEventTimeoutMs: 1 }));
+
+    expect(events.some((event) =>
+      event.type === "stream-error" &&
+      (event.payload.error as { code: string }).code === "PROVIDER_FIRST_EVENT_TIMEOUT"
+    )).toBe(true);
+  });
+
+  it("retries one recoverable provider failure with observable backoff", async () => {
+    const random = vi.spyOn(Math, "random").mockReturnValue(0);
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response("temporarily unavailable", { status: 503 }))
+      .mockResolvedValueOnce(sseResponse([
+        'data: {"choices":[{"delta":{"content":"恢复成功"},"finish_reason":"stop"}]}\n\n',
+        "data: [DONE]\n\n",
+      ]));
+    const adapter = createStreamingModelAdapter({
+      baseURL: "https://example.local/v1",
+      apiKey: "secret",
+      model: "test-model",
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+
+    const events = await collect(adapter.streamChat(baseInput()));
+    random.mockRestore();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(events.some((event) => event.type === "model-observation" && event.payload.phase === "provider-retry")).toBe(true);
+    expect(events.some((event) => event.type === "markdown-delta" && event.payload.delta === "恢复成功")).toBe(true);
   });
 });
 

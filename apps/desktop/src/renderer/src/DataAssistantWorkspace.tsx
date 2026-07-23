@@ -30,7 +30,7 @@ import { Text } from "@astryxdesign/core/Text";
 import { Token } from "@astryxdesign/core/Token";
 import { Toolbar } from "@astryxdesign/core/Toolbar";
 import { Tooltip } from "@astryxdesign/core/Tooltip";
-import { BrainCircuit, CheckCircle2, ChevronDown, ChevronRight, CircleAlert, Clock, Copy, FileSpreadsheet, FileText, LoaderCircle, Maximize2, Minimize2, Pencil, Plus, RotateCcw, Sparkles, Trash2, X, type LucideIcon } from "lucide-react";
+import { BadgeInfo, BrainCircuit, CheckCircle2, ChevronDown, ChevronRight, CircleAlert, Clock, Copy, FileSpreadsheet, FileText, LoaderCircle, Maximize2, Minimize2, Pencil, Plus, RotateCcw, Sparkles, Trash2, X, type LucideIcon } from "lucide-react";
 import type { AuthFailure, AuthUser } from "./auth";
 import { useAppToast } from "./useAppToast";
 import { workbenchApi, type ApiResult, type DataSourceSummary } from "./workbenchApi";
@@ -104,6 +104,7 @@ type DataAssistantWorkspaceProps = {
   modelName: string;
   executionModelName: string;
   dualModelOrchestrationEnabled: boolean;
+  thinkingOptimizationEnabled: boolean;
   isModelConfigured: boolean;
   canReadDataSources: boolean;
   requestWithRefresh: RequestWithRefresh;
@@ -638,7 +639,7 @@ function formatMessageDuration(message: AssistantMessage, nowMs: number) {
 }
 
 export function isActiveAgentRun(run: AgentRunRecord) {
-  return run.status === "planning" || run.status === "responding" || run.status === "executing" || run.status === "waiting_approval";
+  return run.status === "routing" || run.status === "planning" || run.status === "responding" || run.status === "executing" || run.status === "waiting_approval";
 }
 
 export function shouldShowMessageMetadataStatus(showStatus: boolean, run?: AgentRunRecord) {
@@ -667,8 +668,14 @@ function compactAgentProgressEvents(events: AgentProgressEvent[]) {
 }
 
 function progressEventDisplayKey(event: AgentProgressEvent) {
-  if (event.phase === "accepted" || event.phase === "planning" || event.phase === "plan_ready") {
-    return "planning";
+  if (event.phase === "accepted") {
+    return "thinking";
+  }
+  if (event.phase === "routing" || event.phase === "routing_completed") {
+    return "thinking";
+  }
+  if (event.phase === "planning" || event.phase === "plan_ready") {
+    return "thinking";
   }
   if (
     event.phase === "preparing_step" ||
@@ -703,11 +710,15 @@ export function AgentProgressPanel({ run }: { run: AgentRunRecord }) {
                 <Icon icon={CheckCircle2} size="xsm" color="inherit" />
               ) : event.status === "error" || event.status === "cancelled" ? (
                 <Icon icon={CircleAlert} size="xsm" color="inherit" />
+              ) : event.status === "waiting" ? (
+                <Icon icon={Clock} size="xsm" color="inherit" />
+              ) : event.status === "info" ? (
+                <Icon icon={BadgeInfo} size="xsm" color="inherit" />
               ) : (
-                <Icon icon={LoaderCircle} size="xsm" color="inherit" className={event.status === "running" ? "assistant-message-status-spinner" : undefined} />
+                <Icon icon={LoaderCircle} size="xsm" color="inherit" className="assistant-message-status-spinner" />
               )}
             </span>
-            <span>{event.summary}</span>
+            <span>{progressEventDisplayKey(event) === "thinking" && event.status === "running" ? "思考中" : event.summary}</span>
           </div>
         ))}
       </div>
@@ -1171,6 +1182,27 @@ function formatToolDuration(durationMs?: number) {
   return `${(durationMs / 1000).toFixed(1)}s`;
 }
 
+export function toolRecordDurationMs(record: ToolCallRecord) {
+  const duration = record.metadata?.toolDurationMs;
+  return typeof duration === "number" && Number.isFinite(duration) ? Math.max(0, duration) : undefined;
+}
+
+export function sortToolRecordsByExecutionOrder(records: ToolCallRecord[]) {
+  const executionTime = (record: ToolCallRecord) =>
+    Date.parse(record.completedAt ?? record.updatedAt ?? record.createdAt);
+  return [...records].sort((left, right) => {
+    const timeDifference = executionTime(left) - executionTime(right);
+    if (Number.isFinite(timeDifference) && timeDifference !== 0) {
+      return timeDifference;
+    }
+    const creationDifference = Date.parse(left.createdAt) - Date.parse(right.createdAt);
+    if (Number.isFinite(creationDifference) && creationDifference !== 0) {
+      return creationDifference;
+    }
+    return left.toolCallId.localeCompare(right.toolCallId);
+  });
+}
+
 function toolFileStats(block: AssistantBlock) {
   if (!block.toolFiles?.length) {
     return undefined;
@@ -1230,8 +1262,9 @@ function toolCallsFromToolState(
   toolState: ConversationToolState | null | undefined,
   onApprove: (toolCallId: string, approved: boolean) => void,
 ): ChatToolCallItem[] {
-  return (toolState?.toolCalls ?? [])
-    .filter((record) => record.messageId === message.id)
+  return sortToolRecordsByExecutionOrder(
+    (toolState?.toolCalls ?? []).filter((record) => record.messageId === message.id),
+  )
     .map((record) => {
       const artifactIds = record.outputArtifactIds ?? record.result?.artifactIds ?? [];
       const requestPreview = JSON.stringify(record.request ?? {}, null, 2);
@@ -1240,8 +1273,11 @@ function toolCallsFromToolState(
       return {
         key: record.toolCallId,
         name: toolKindLabel(record.toolKind),
-        target: typeof record.request.purpose === "string" ? record.request.purpose : record.toolName,
+        target: typeof record.request.purpose === "string" && record.request.purpose.trim()
+          ? record.request.purpose.trim()
+          : undefined,
         status: orchestrationToolStatus(record.status),
+        duration: formatToolDuration(toolRecordDurationMs(record)),
         node: "agent-workflow",
         stats: record.status === "waiting_approval" ? (
           <HStack gap={1} vAlign="center" wrap="wrap" onClick={(event) => event.stopPropagation()}>
@@ -1299,6 +1335,7 @@ export function DataAssistantWorkspace({
   modelName,
   executionModelName,
   dualModelOrchestrationEnabled,
+  thinkingOptimizationEnabled,
   isModelConfigured,
   canReadDataSources,
   requestWithRefresh,
@@ -2980,6 +3017,7 @@ export function DataAssistantWorkspace({
           modelName,
           executionModelName,
           dualModelOrchestrationEnabled,
+          thinkingOptimizationEnabled,
           dataSourceLabel: selectedDataSource ? dataSourceLabel(selectedDataSource) : null,
           selectedTempDataSourceIds: messageTempDataSourceIds,
           selectedFieldRefs: message.context?.selectedFieldRefs,
@@ -3008,7 +3046,7 @@ export function DataAssistantWorkspace({
         });
       }
     },
-    [approvalMode, dualModelOrchestrationEnabled, executionModelName, loadSchemaContextMarkdown, messageTempDataSourceIds, modelName, patchMessage, selectedDataSource, selectedSkill, toast, upsertMessage, user?.id],
+    [approvalMode, dualModelOrchestrationEnabled, executionModelName, loadSchemaContextMarkdown, messageTempDataSourceIds, modelName, patchMessage, selectedDataSource, selectedSkill, thinkingOptimizationEnabled, toast, upsertMessage, user?.id],
   );
 
   const renderMessageMetadata = useCallback(
@@ -3296,6 +3334,7 @@ export function DataAssistantWorkspace({
           modelName,
           executionModelName,
           dualModelOrchestrationEnabled,
+          thinkingOptimizationEnabled,
           dataSourceId: submitDataSource?.id ?? null,
           dataSourceLabel: submitDataSource ? dataSourceLabel(submitDataSource) : null,
           selectedTempDataSourceIds: submitTempDataSourceIds,
@@ -3356,6 +3395,7 @@ export function DataAssistantWorkspace({
       modelName,
       executionModelName,
       dualModelOrchestrationEnabled,
+      thinkingOptimizationEnabled,
       onRequireModelConfig,
       readyChatCsvAttachments,
       resolveDataSourceSchemaColumnLimit,

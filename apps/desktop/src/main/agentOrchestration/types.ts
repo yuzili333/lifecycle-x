@@ -1,7 +1,12 @@
 import type { ToolKind } from "../toolOrchestration";
+import type { AgentBusinessEventType } from "./agentStreamProtocol";
+import type { AnalysisPlan } from "./analysisPlan";
+import type { ThinkingDecision } from "./modelRuntimeConfig";
+import type { TaskRoute } from "./taskRouter";
 
 export type AgentModelRole = "reasoning" | "execution";
 export type AgentRunStatus =
+  | "routing"
   | "planning"
   | "responding"
   | "clarifying"
@@ -14,6 +19,8 @@ export type AgentRunStatus =
 
 export type AgentProgressPhase =
   | "accepted"
+  | "routing"
+  | "routing_completed"
   | "planning"
   | "plan_ready"
   | "responding"
@@ -22,6 +29,8 @@ export type AgentProgressPhase =
   | "validating_parameters"
   | "waiting_approval"
   | "tool_executing"
+  | "validation_completed"
+  | "reporting"
   | "step_completed"
   | "step_failed"
   | "fallback"
@@ -64,6 +73,7 @@ export type AgentProgressEvent = {
   activeDurationMs?: number;
   waitingDurationMs?: number;
   detail?: Record<string, unknown>;
+  businessEventType?: AgentBusinessEventType;
 };
 
 export type AgentRunError = {
@@ -88,6 +98,11 @@ export type AgentRunRecord = {
   status: AgentRunStatus;
   reasoningModelName: string;
   executionModelName: string;
+  route?: TaskRoute;
+  analysisPlan?: AnalysisPlan;
+  thinkingDecision?: ThinkingDecision;
+  kimiCallCount: number;
+  cumulativeThinkingBudget: number;
   plan?: PlannerDecision;
   currentStepId?: string;
   completedStepIds: string[];

@@ -9,6 +9,7 @@
     "desktop:build": "cd apps/desktop && node ./node_modules/electron-vite/bin/electron-vite.js build",
     "desktop:dev": "cd apps/desktop && ELECTRON_EXEC_PATH=./.electron/dist/electron node ./node_modules/electron-vite/bin/electron-vite.js dev",
     "desktop:typecheck": "node ./node_modules/typescript/bin/tsc --noEmit -p ./apps/desktop/tsconfig.json",
+    "lint": "eslint apps",
     "server:build": "pnpm --filter @lifecycle-x/server build",
     "server:dev": "pnpm --filter @lifecycle-x/server dev",
     "server:test": "pnpm --filter @lifecycle-x/server test",
@@ -19,7 +20,10 @@
   "devDependencies": {
     "@types/node": "^22.10.2",
     "beautiful-mermaid": "^1.1.3",
+    "eslint": "^10.7.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
     "typescript": "^5.7.2",
+    "typescript-eslint": "^8.65.0",
     "vitest": "^2.1.8"
   },
   "packageManager": "pnpm@11.7.0"
