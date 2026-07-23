@@ -7,16 +7,29 @@
 ```bash
 pnpm install
 pnpm dev
-pnpm desktop:typecheck
-pnpm desktop:build
+pnpm verify:fast
 ```
 
 ## 当前工程结构
 
 - `apps/desktop`: Electron + React + Vite 桌面客户端。
-- `docs`: MVP、BRD、PRD 等业务确认文档。
-- `plan`: 系统分析和方案设计输入。
-- `reference`: 存续期业务背景资料。
+- `apps/server`: 认证、数据管理、SQL、Python、Schema 与 Memory 服务。
+- `docs`: 仓库地图、稳定架构、决策、任务记录和质量检查点。
+- `goal`、`plan`: 需求和方案输入，不作为当前任务状态。
+- `skill`: 本地领域 Skill 和报告模板。
+- `reports`、`reference`、`prototype`: 报告模板、业务资料和产品文档。
+
+## Harness 工作方式
+
+本仓库采用轻量 Harness Engineering 流程：
+
+1. 从 [`AGENTS.md`](AGENTS.md) 和[仓库地图](docs/repo-map.md)定位模块。
+2. 非平凡任务在 [`docs/work/active/`](docs/work/active/) 建立简短任务记录。
+3. 使用 `pnpm harness:check` 检查 Harness 文件、链接和 active task 结构。
+4. 使用 `pnpm verify:fast` 做快速机械校验，必要时使用 `pnpm verify` 完整验证。
+5. 机械校验通过后仍需完成[人工设计审查](docs/quality/design-review.md)；测试通过不代表设计正确。
+
+完整文档入口见 [`docs/README.md`](docs/README.md)。
 
 双模型职责、L0-L4 路由、Thinking Budget、统一事件协议、配置、监控、灰度与回滚说明见
 [双模型 Thinking 配置与流式架构](docs/architecture/thinking-optimization.md)。

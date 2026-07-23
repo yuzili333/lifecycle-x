@@ -10,8 +10,9 @@ const requireFromDesktop = createRequire(join(packageDir, "package.json"));
 const electronPackageJsonPath = join(packageDir, "node_modules", "electron", "package.json");
 const electronVersion = JSON.parse(readFileSync(electronPackageJsonPath, "utf8")).version;
 const betterSqlitePackageDir = dirname(requireFromDesktop.resolve("better-sqlite3/package.json"));
+const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
 
-const result = spawnSync("npm", ["run", "build-release"], {
+const result = spawnSync(npmCommand, ["run", "build-release"], {
   cwd: betterSqlitePackageDir,
   stdio: "inherit",
   env: {
@@ -20,6 +21,7 @@ const result = spawnSync("npm", ["run", "build-release"], {
     npm_config_target: electronVersion,
     npm_config_disturl: "https://electronjs.org/headers",
     npm_config_build_from_source: "true",
+    npm_config_devdir: join(packageDir, ".electron", "node-gyp"),
   },
 });
 

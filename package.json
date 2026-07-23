@@ -9,13 +9,17 @@
     "desktop:build": "cd apps/desktop && node ./node_modules/electron-vite/bin/electron-vite.js build",
     "desktop:dev": "cd apps/desktop && ELECTRON_EXEC_PATH=./.electron/dist/electron node ./node_modules/electron-vite/bin/electron-vite.js dev",
     "desktop:typecheck": "node ./node_modules/typescript/bin/tsc --noEmit -p ./apps/desktop/tsconfig.json",
+    "harness:check": "node scripts/verify-harness.mjs",
+    "harness:test": "node --test scripts/verify-harness.test.mjs",
     "lint": "eslint apps",
     "server:build": "pnpm --filter @lifecycle-x/server build",
     "server:dev": "pnpm --filter @lifecycle-x/server dev",
     "server:test": "pnpm --filter @lifecycle-x/server test",
     "server:typecheck": "pnpm --filter @lifecycle-x/server typecheck",
     "test": "pnpm -r test",
-    "typecheck": "pnpm -r typecheck"
+    "typecheck": "pnpm -r typecheck",
+    "verify:fast": "pnpm harness:check && pnpm harness:test && pnpm lint && pnpm typecheck && git diff --check",
+    "verify": "node scripts/verify-project.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
