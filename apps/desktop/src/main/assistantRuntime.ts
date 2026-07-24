@@ -19,8 +19,10 @@ import {
   type WorkflowStateStore,
 } from "./workflowRuntime";
 import { rewriteCompoundOrderByForSqlite } from "./sqliteSqlRewrite";
-import { businessVisualizationSemantics, parseVisualizationSpecJson, reportVisualizationArtifactIds, visualizationTypes, type VisualizationRenderError, type VisualizationSpec } from "../shared/visualization";
+import { businessVisualizationSemantics, parseVisualizationSpecJson, reportVisualizationArtifactIds, stripReportMarkdownImages, visualizationTypes, type VisualizationRenderError, type VisualizationSpec } from "../shared/visualization";
+import { appendEvidenceCardToReport, type EvidenceCard } from "../shared/evidence";
 import { ReportVisualizationArtifactResolver } from "./reportVisualizationArtifactResolver";
+import { EvidenceCardBuilder, ReportEvidenceArtifactResolver } from "./evidence";
 import {
   SQLiteArtifactManager,
   SQLiteToolResultRegistry,
@@ -951,14 +953,11 @@ function reportSectionEnd(heading: ReportMarkdownHeading, headings: ReportMarkdo
 
 export function sanitizeReportInternalReferences(markdown: string) {
   const artifactReference = String.raw`[（(]\s*Artifact\s*[：:]\s*[a-zA-Z0-9:._-]+\s*[）)]`;
-  return markdown
+  return stripReportMarkdownImages(markdown)
     .split(/\r?\n/)
     .filter((line) => !new RegExp(String.raw`^\s*(?:[-*_]+\s*)?Artifact\s*[：:]\s*[a-zA-Z0-9:._-]+\s*$`, "i").test(line))
     .map((line) =>
       line
-        .replace(/<img\b[^>]*\/?>/gi, "")
-        .replace(/!\[[^\]\r\n]*\]\(\s*(?:<[^>\r\n]+>|[^)\r\n]+)\s*\)/g, "")
-        .replace(/!\[[^\]\r\n]*\]\[[^\]\r\n]*\]/g, "")
         .replace(new RegExp(String.raw`根据上游\s*Python\s*分析结果\s*${artifactReference}`, "gi"), "根据分析结果")
         .replace(new RegExp(String.raw`结合生成的([^，。；;\n]{0,24}(?:图|图表))\s*${artifactReference}`, "gi"), "结合可视化图表")
         .replace(new RegExp(artifactReference, "gi"), "")
@@ -967,6 +966,13 @@ export function sanitizeReportInternalReferences(markdown: string) {
         .trimEnd(),
     )
     .join("\n");
+}
+
+function sanitizeReportEvidenceError(message: string) {
+  return message
+    .replace(/(?:file:\/\/\/|[a-zA-Z]:[\\/]|\/(?:Users|home|private|tmp|var|opt)\/)\S+/g, "[本地路径已隐藏]")
+    .replace(/\b(?:password|passwd|pwd|token|api[_-]?key|secret)\s*[:=]\s*\S+/gi, "$1=[REDACTED]")
+    .slice(0, 240);
 }
 
 export function mergeReportChartSections(markdown: string) {
@@ -2292,6 +2298,8 @@ export class AssistantRuntime {
   private readonly tempSourceManager: ConversationTempSourceManager;
   private readonly agentGuidance: ReturnType<typeof createAgentGuidanceModule>;
   private readonly reportVisualizationArtifactResolver: ReportVisualizationArtifactResolver;
+  private readonly evidenceCardBuilder: EvidenceCardBuilder;
+  private readonly reportEvidenceArtifactResolver: ReportEvidenceArtifactResolver;
   private readonly agentProgressStore: SQLiteAgentProgressStore;
   private readonly agentTurnOrchestrator: AgentTurnOrchestrator;
 
@@ -2325,6 +2333,8 @@ export class AssistantRuntime {
       this.toolResultRegistry,
       this.datasetStateManager,
     );
+    this.evidenceCardBuilder = new EvidenceCardBuilder(this.toolResultRegistry, this.toolArtifactManager);
+    this.reportEvidenceArtifactResolver = new ReportEvidenceArtifactResolver(this.toolArtifactManager, this.toolResultRegistry);
     this.sqliteMaterializer = new SQLiteMaterializer(this.db, {
       sqliteDatabasePath: options.dbPath,
       batchSize: 500,
@@ -3290,7 +3300,21 @@ export class AssistantRuntime {
     if (!isConversationArtifact) {
       return null;
     }
-    const artifact = await this.toolArtifactManager.getArtifact(normalizedArtifactId);
+    let artifact = await this.toolArtifactManager.getArtifact(normalizedArtifactId);
+    if (
+      artifact?.artifactType === "report_markdown"
+      && typeof artifact.content === "string"
+      && typeof artifact.metadata?.evidenceCardId !== "string"
+    ) {
+      const owner = toolCalls.find((toolCall) =>
+        toolCall.toolKind === "report_generation"
+        && toolCall.status === "completed"
+        && [...(toolCall.outputArtifactIds ?? []), ...(toolCall.result?.artifactIds ?? [])].includes(normalizedArtifactId));
+      if (owner) {
+        await this.attachEvidenceCardToReport(owner);
+        artifact = await this.toolArtifactManager.getArtifact(normalizedArtifactId);
+      }
+    }
     if (artifact?.artifactType === "report_markdown" && artifact.contentType === "markdown" && typeof artifact.content === "string") {
       return {
         ...artifact,
@@ -3316,6 +3340,25 @@ export class AssistantRuntime {
       reportArtifactId: reportArtifactId.trim(),
       reportVersion,
       visualizationArtifactId: visualizationArtifactId.trim(),
+    });
+  }
+
+  async resolveConversationReportEvidence(
+    userId: string,
+    conversationId: string,
+    reportArtifactId: string,
+    reportVersion: number,
+    evidenceCardId: string,
+  ) {
+    const conversation = this.findConversation(userId, conversationId);
+    if (!conversation) {
+      throw new Error("对话不存在或已失效。");
+    }
+    return this.reportEvidenceArtifactResolver.resolve({
+      conversationId: conversation.id,
+      reportArtifactId: reportArtifactId.trim(),
+      reportVersion,
+      evidenceCardId: evidenceCardId.trim(),
     });
   }
 
@@ -4340,6 +4383,9 @@ export class AssistantRuntime {
 
     await this.toolResultRegistry.register(reportRecord);
     await this.toolResultRegistry.markLatestSuccessful(conversation.id, reportToolCallId);
+    const reportWithEvidence = await this.attachEvidenceCardToReport(
+      (await this.toolResultRegistry.get(reportToolCallId)) ?? reportRecord,
+    );
     await this.workflowMemoryBridge.writeWorkflowMemory({
       conversationId: conversation.id,
       userId: input.userId,
@@ -4349,7 +4395,7 @@ export class AssistantRuntime {
         toolCallId: reportToolCallId,
         toolKind: "report_generation",
         version,
-        artifactIds: [artifact.artifactId],
+        artifactIds: reportWithEvidence.outputArtifactIds ?? [artifact.artifactId],
         parentToolCallIds: reportRecord.parentToolCallIds,
         sourceArtifactIds: reportRecord.sourceArtifactIds,
       },
@@ -5892,14 +5938,19 @@ export class AssistantRuntime {
       outputArtifactIds: [artifact.artifactId],
       completedAt: nowIso(),
     });
+    const completedWithEvidence = await this.attachEvidenceCardToReport(completed);
     await this.workflowMemoryBridge.writeWorkflowMemory({
       conversationId: executing.conversationId,
       userId: executing.userId,
       type: "report_generation_completed",
-      summary: completed.result?.summary ?? "报告已生成。",
-      payload: { toolCallId: completed.toolCallId, artifactIds: [artifact.artifactId], version: completed.version },
+      summary: completedWithEvidence.result?.summary ?? "报告已生成。",
+      payload: {
+        toolCallId: completedWithEvidence.toolCallId,
+        artifactIds: completedWithEvidence.outputArtifactIds ?? [artifact.artifactId],
+        version: completedWithEvidence.version,
+      },
     });
-    await this.createCompletedToolCheckpoint(completed);
+    await this.createCompletedToolCheckpoint(completedWithEvidence);
     const message = executing.messageId
       ? this.updateMessage(executing.messageId, {
           status: "completed",
@@ -5911,10 +5962,10 @@ export class AssistantRuntime {
     this.emitReportContentReady({
       conversationId: executing.conversationId,
       messageId: message.id,
-      toolCallId: completed.toolCallId,
-      version: completed.version,
+      toolCallId: completedWithEvidence.toolCallId,
+      version: completedWithEvidence.version,
       artifactId: artifact.artifactId,
-      title: artifact.title ?? `整体风险分类分布报告 v${completed.version}`,
+      title: artifact.title ?? `整体风险分类分布报告 v${completedWithEvidence.version}`,
       createdAt: artifact.createdAt,
       completedAt: message.updatedAt,
       markdown,
@@ -6505,6 +6556,9 @@ export class AssistantRuntime {
     };
     await this.toolResultRegistry.register(reportRecord);
     await this.toolResultRegistry.markLatestSuccessful(toolCall.conversationId, toolCallId);
+    const reportWithEvidence = await this.attachEvidenceCardToReport(
+      (await this.toolResultRegistry.get(toolCallId)) ?? reportRecord,
+    );
     await this.workflowMemoryBridge.writeWorkflowMemory({
       conversationId: toolCall.conversationId,
       userId: toolCall.userId,
@@ -6514,7 +6568,7 @@ export class AssistantRuntime {
         toolCallId,
         toolKind: "report_generation",
         version,
-        artifactIds: [artifact.artifactId],
+        artifactIds: reportWithEvidence.outputArtifactIds ?? [artifact.artifactId],
         parentToolCallIds: reportRecord.parentToolCallIds,
         sourceArtifactIds: reportRecord.sourceArtifactIds,
       },
@@ -6652,6 +6706,166 @@ export class AssistantRuntime {
     }
   }
 
+  private async attachEvidenceCardToReport(record: ToolCallRecord) {
+    if (record.toolKind !== "report_generation" || record.status !== "completed") {
+      return record;
+    }
+    const reportArtifactId = record.result?.primaryArtifactId
+      ?? record.outputArtifactIds?.find((artifactId) => artifactId.startsWith("assistant-report-markdown:"));
+    if (!reportArtifactId) {
+      return record;
+    }
+    const reportArtifact = await this.toolArtifactManager.getArtifact(reportArtifactId);
+    if (!reportArtifact || reportArtifact.artifactType !== "report_markdown" || typeof reportArtifact.content !== "string") {
+      return record;
+    }
+    const evidenceCardId = typeof reportArtifact.metadata?.evidenceCardId === "string"
+      ? reportArtifact.metadata.evidenceCardId
+      : `evidence-card:${sha256(`${reportArtifactId}:v${record.version}`).slice(0, 32)}`;
+    let evidenceCard: EvidenceCard;
+    try {
+      evidenceCard = await this.evidenceCardBuilder.build({
+        evidenceCardId,
+        reportArtifactId,
+        reportVersion: record.version,
+        conversationId: record.conversationId,
+        sourceToolCallIds: uniqueValues([record.toolCallId, ...(record.parentToolCallIds ?? [])]),
+        sourceArtifactIds: record.sourceArtifactIds ?? [],
+        reportRequest: {
+          analysisGoal: typeof record.request.userRequest === "string" ? record.request.userRequest : undefined,
+        },
+      });
+    } catch (error) {
+      evidenceCard = this.unavailableEvidenceCard({
+        evidenceCardId,
+        reportArtifactId,
+        reportVersion: record.version,
+        message: error instanceof Error ? error.message : "证据构建失败。",
+      });
+    }
+    try {
+      await this.toolArtifactManager.createArtifact({
+        artifactId: evidenceCardId,
+        artifactType: "evidence_card",
+        title: "溯据卡",
+        contentType: "json",
+        content: evidenceCard,
+        metadata: {
+          reportArtifactId,
+          reportVersion: record.version,
+          evidenceStatus: evidenceCard.status,
+          generatedBy: "system",
+        },
+      });
+      const reportWithEvidence = appendEvidenceCardToReport(reportArtifact.content, evidenceCardId);
+      await this.toolArtifactManager.createArtifact({
+        artifactId: reportArtifact.artifactId,
+        artifactType: "report_markdown",
+        title: reportArtifact.title,
+        contentType: "markdown",
+        content: reportWithEvidence,
+        metadata: {
+          ...(reportArtifact.metadata ?? {}),
+          evidenceCardId,
+          evidenceStatus: evidenceCard.status,
+          reportVersion: record.version,
+        },
+      });
+      const outputArtifactIds = uniqueValues([reportArtifactId, evidenceCardId]);
+      return this.toolResultRegistry.update(record.toolCallId, {
+        outputArtifactIds,
+        result: record.result
+          ? {
+              ...record.result,
+              artifactIds: outputArtifactIds,
+              primaryArtifactId: reportArtifactId,
+              metadata: {
+                ...(record.result.metadata ?? {}),
+                evidenceCardId,
+                evidenceStatus: evidenceCard.status,
+              },
+            }
+          : record.result,
+        metadata: {
+          ...(record.metadata ?? {}),
+          evidenceCardId,
+          evidenceStatus: evidenceCard.status,
+        },
+      });
+    } catch (error) {
+      try {
+        return await this.toolResultRegistry.update(record.toolCallId, {
+          metadata: {
+            ...(record.metadata ?? {}),
+            evidenceStatus: "invalid",
+            evidenceError: sanitizeReportEvidenceError(error instanceof Error ? error.message : "溯据卡保存失败。"),
+          },
+        });
+      } catch {
+        return record;
+      }
+    }
+  }
+
+  private unavailableEvidenceCard(input: {
+    evidenceCardId: string;
+    reportArtifactId: string;
+    reportVersion: number;
+    message: string;
+  }): EvidenceCard {
+    const safeMessage = sanitizeReportEvidenceError(input.message);
+    return {
+      evidenceCardId: input.evidenceCardId,
+      reportArtifactId: input.reportArtifactId,
+      reportVersion: input.reportVersion,
+      title: "溯据卡",
+      statement: "本报告中的指标、图表和数据结论来源于受控工具的实际执行结果。溯据卡用于证明分析过程，不构成授信审批、风险分类调整或风险处置决定。",
+      status: "invalid",
+      dataSources: [],
+      analysisScope: {
+        description: "当前版本的结构化证据未能完整构建。",
+        tables: [],
+        selectedFields: [],
+      },
+      filters: [],
+      formulas: [],
+      sqlExecutions: [],
+      pythonExecutions: [],
+      upstreamArtifacts: [],
+      downstreamArtifacts: [{
+        artifactId: input.reportArtifactId,
+        type: "markdown_report",
+        title: "当前 Markdown 报告",
+        version: input.reportVersion,
+        status: "ready",
+        sourceArtifactIds: [],
+        downstreamArtifactIds: [],
+      }],
+      lineage: {
+        nodes: [{
+          nodeId: `report:${sha256(input.reportArtifactId).slice(0, 16)}`,
+          nodeType: "report_artifact",
+          label: "当前 Markdown 报告",
+          status: "ready",
+          referenceId: input.reportArtifactId,
+        }],
+        edges: [],
+        rootDataSourceIds: [],
+        reportArtifactId: input.reportArtifactId,
+        complete: false,
+      },
+      limitations: [{ code: "EVIDENCE_VALIDATION_FAILED", message: safeMessage, severity: "error" }],
+      validation: {
+        valid: false,
+        completenessScore: 0,
+        checks: [{ code: "EVIDENCE_BUILD", label: "结构化证据构建", status: "failed", message: safeMessage }],
+        missingEvidence: ["结构化证据当前不可用。"],
+      },
+      generatedAt: nowIso(),
+      generatedBy: "system",
+    };
+  }
+
   private async registerGeneratedToolRecord(input: {
     toolKind: ToolKind;
     toolCallId: string;
@@ -6744,7 +6958,9 @@ export class AssistantRuntime {
         },
       });
       await this.toolResultRegistry.markLatestSuccessful(input.message.conversationId, input.toolCallId);
-      const saved = (await this.toolResultRegistry.get(input.toolCallId)) ?? updated;
+      const saved = input.toolKind === "report_generation"
+        ? await this.attachEvidenceCardToReport((await this.toolResultRegistry.get(input.toolCallId)) ?? updated)
+        : (await this.toolResultRegistry.get(input.toolCallId)) ?? updated;
       await this.createCompletedToolCheckpoint(saved);
       return saved;
     }
@@ -6820,7 +7036,10 @@ export class AssistantRuntime {
         sourceArtifactIds,
       },
     });
-    const saved = (await this.toolResultRegistry.get(input.toolCallId)) ?? record;
+    const registered = (await this.toolResultRegistry.get(input.toolCallId)) ?? record;
+    const saved = input.toolKind === "report_generation"
+      ? await this.attachEvidenceCardToReport(registered)
+      : registered;
     await this.createCompletedToolCheckpoint(saved);
     return saved;
   }
@@ -8949,7 +9168,7 @@ export class AssistantRuntime {
       },
       {
         name: TOOL_NAMES.report_generation,
-        description: "请求登记 Markdown 报告 Artifact。报告必须基于真实 SQL、Python 和图表 Artifact；用户同时要求图表和报告时，必须引用 visualizationArtifactIds 并在正文嵌入 visualization 节点。不得伪造数据或扩展用户未要求的字段、章节和指标。",
+        description: "请求登记 Markdown 报告 Artifact。报告必须基于真实 SQL、Python 和图表 Artifact；用户同时要求图表和报告时，必须引用 visualizationArtifactIds 并在正文嵌入 visualization 节点。不得伪造数据、扩展用户未要求的字段、章节和指标，也不得生成 evidenceCardId、证据 JSON 或工具血缘；溯据卡由系统依据真实记录构建。",
         inputSchema: TOOL_SCHEMAS.report_generation,
         riskLevel: "low",
         handler: async (request, context) => {

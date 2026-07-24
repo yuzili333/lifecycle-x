@@ -3,8 +3,16 @@ import type { ParsedReportVisualizationNode, ReportMarkdownSegment } from "./typ
 
 const VISUALIZATION_FENCE_LANGUAGES = new Set(["visualization", "visualization-json", "viz", "chart-spec"]);
 
+export function stripReportMarkdownImages(markdown: string) {
+  return stripMarkdownImageSyntax(
+    markdown
+      .replace(/<img\b(?:[^>"']|"[^"]*"|'[^']*')*>/gis, "")
+      .replace(/&lt;img\b[\s\S]*?&gt;/gi, ""),
+  );
+}
+
 export function parseReportMarkdownVisualizations(markdown: string, reportVersion = 1): ReportMarkdownSegment[] {
-  const lines = splitLinesPreservingEndings(markdown);
+  const lines = splitLinesPreservingEndings(stripReportMarkdownImages(markdown));
   const segments: ReportMarkdownSegment[] = [];
   const seenArtifactIds = new Set<string>();
   let markdownBuffer = "";
@@ -175,4 +183,79 @@ function isFenceClosing(value: string, fence: { marker: "`" | "~"; markerLength:
     markerLength += 1;
   }
   return markerLength >= fence.markerLength && value.slice(markerLength).trim().length === 0;
+}
+
+function stripMarkdownImageSyntax(value: string) {
+  let output = "";
+  let cursor = 0;
+  while (cursor < value.length) {
+    const imageStart = value.indexOf("![", cursor);
+    if (imageStart < 0) {
+      output += value.slice(cursor);
+      break;
+    }
+    output += value.slice(cursor, imageStart);
+    const altEnd = findUnescaped(value, "]", imageStart + 2);
+    if (altEnd < 0) {
+      output += value.slice(imageStart);
+      break;
+    }
+    const targetStart = altEnd + 1;
+    if (value[targetStart] === "(") {
+      const targetEnd = findBalancedParenthesisEnd(value, targetStart);
+      if (targetEnd >= 0) {
+        cursor = targetEnd + 1;
+        continue;
+      }
+    } else if (value[targetStart] === "[") {
+      const referenceEnd = findUnescaped(value, "]", targetStart + 1);
+      if (referenceEnd >= 0) {
+        cursor = referenceEnd + 1;
+        continue;
+      }
+    }
+    output += value.slice(imageStart, altEnd + 1);
+    cursor = targetStart;
+  }
+  return output;
+}
+
+function findUnescaped(value: string, character: string, start: number) {
+  for (let index = start; index < value.length; index += 1) {
+    if (value[index] === character && value[index - 1] !== "\\") {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function findBalancedParenthesisEnd(value: string, start: number) {
+  let depth = 0;
+  let quote: "'" | "\"" | null = null;
+  for (let index = start; index < value.length; index += 1) {
+    const character = value[index];
+    if (character === "\\" && index + 1 < value.length) {
+      index += 1;
+      continue;
+    }
+    if (quote) {
+      if (character === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (character === "'" || character === "\"") {
+      quote = character;
+      continue;
+    }
+    if (character === "(") {
+      depth += 1;
+    } else if (character === ")") {
+      depth -= 1;
+      if (depth === 0) {
+        return index;
+      }
+    }
+  }
+  return -1;
 }

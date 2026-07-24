@@ -70,13 +70,15 @@
 
 {{riskRecommendations}}
 
-## 七、数据质量与分析限制
+## 七、溯据卡
+
+## 八、数据质量与分析限制
 
 {{dataQualityWarnings}}
 
 {{analysisLimitations}}
 
-## 八、计算口径
+## 九、计算口径
 
 - 不良类包括次级、可疑和损失；
 - 关注加不良包括关注、次级、可疑和损失；
@@ -85,13 +87,3 @@
 - 风险边界默认定义为正常3和全部关注类；
 - 比率差异可能来自四舍五入；
 - 本报告仅基于已授权数据源和工具执行结果，不替代人工风险判断。
-
-## 九、数据血缘
-
-- SQL 工具调用：{{sqlToolCallId}}
-- Python 工具调用：{{pythonToolCallId}}
-- 图表工具调用：{{chartToolCallIds}}
-- 源数据集 Artifact：{{sourceDatasetArtifactId}}
-- 分析结果 Artifact：{{analysisArtifactId}}
-- 图表 Artifact：{{chartArtifactIds}}
-- 报告生成时间：{{generatedAt}}

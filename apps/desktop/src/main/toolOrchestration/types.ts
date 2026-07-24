@@ -318,6 +318,9 @@ export type ReportGenerationToolInput = {
   inputArtifactIds?: string[];
   visualizationArtifactIds?: string[];
   includeVisualizations?: boolean;
+  includeEvidenceCard?: boolean;
+  evidenceSourceToolCallIds?: string[];
+  evidenceSourceArtifactIds?: string[];
   sourceSqlToolCallId?: string;
   sourcePythonToolCallId?: string;
   sourceChartToolCallIds?: string[];
@@ -380,7 +383,7 @@ export type ConversationToolStateStore = ToolResultRegistry;
 
 export type ArtifactRecord = {
   artifactId: string;
-  artifactType: "dataset" | "dataset_profile" | "analysis" | "chart_data" | "chart" | "visualization_spec" | "report_markdown" | "report_summary";
+  artifactType: "dataset" | "dataset_profile" | "analysis" | "chart_data" | "chart" | "visualization_spec" | "report_markdown" | "report_summary" | "evidence_card";
   title?: string;
   contentType: "json" | "markdown" | "text" | "visualization";
   content?: unknown;
@@ -615,7 +618,7 @@ export const TOOL_SCHEMAS: Record<ToolKind, JsonSchema> = {
   report_generation: {
     type: "object",
     required: ["userRequest", "purpose", "markdown"],
-    description: "基于真实 SQL、Python 和图表 Artifact 生成 Markdown 报告。用户同时要求图表和报告时，必须引用 visualizationArtifactIds 并在正文嵌入 visualization 节点。",
+    description: "基于真实 SQL、Python 和图表 Artifact 生成 Markdown 报告。用户同时要求图表和报告时，必须引用 visualizationArtifactIds 并在正文嵌入 visualization 节点。不得生成 evidenceCardId 或证据内容，溯据卡由系统依据真实执行记录构建。",
     properties: {
       userRequest: { type: "string", minLength: 1 },
       purpose: { type: "string", minLength: 1 },
@@ -623,6 +626,7 @@ export const TOOL_SCHEMAS: Record<ToolKind, JsonSchema> = {
       inputArtifactIds: { type: "array", items: { type: "string" } },
       visualizationArtifactIds: { type: "array", items: { type: "string" }, description: "报告正文需要引用的图表 Artifact IDs。" },
       includeVisualizations: { type: "boolean", description: "用户同时要求图表和报告时必须为 true，并在报告正文嵌入 visualization 节点。" },
+      includeEvidenceCard: { type: "boolean", description: "正式分析报告默认 true。溯据卡内容与 ID 由系统构建，模型不得自行生成。" },
       sourceSqlToolCallId: { type: "string" },
       sourcePythonToolCallId: { type: "string" },
       sourceChartToolCallIds: { type: "array", items: { type: "string" } },

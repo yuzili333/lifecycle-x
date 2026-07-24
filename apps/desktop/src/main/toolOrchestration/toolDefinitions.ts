@@ -41,7 +41,7 @@ function toolDescription(toolKind: ToolKind) {
       "规则：不输出完整 ECharts option，不用 Markdown 表格代替图表，图表 Artifact 可以被报告工具引用。",
     ].join(" ");
   }
-  return "用途：基于真实 SQL、Python 和图表 Artifact 生成 Markdown 报告。输入包括 SQL Artifact、可选 Python Artifact、可选图表 Artifact、报告目标和结构要求。规则：不编造数据；用户同时要求图表和报告时，必须把 visualizationArtifactIds 嵌入报告正文；不重新计算上游指标，不重新生成已有图表，输出 Markdown Artifact 和报告卡片。";
+  return "用途：基于真实 SQL、Python 和图表 Artifact 生成 Markdown 报告。输入包括 SQL Artifact、可选 Python Artifact、可选图表 Artifact、报告目标和结构要求。规则：不编造数据；用户同时要求图表和报告时，必须把 visualizationArtifactIds 嵌入报告正文；不重新计算上游指标，不重新生成已有图表；不得生成 evidenceCardId 或证据内容，受控溯据卡由系统落库时构建；输出 Markdown Artifact 和报告卡片。";
 }
 
 function riskLevel(toolKind: ToolKind): ToolDefinition["riskLevel"] {

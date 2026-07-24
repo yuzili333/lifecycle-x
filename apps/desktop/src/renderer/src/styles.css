@@ -1388,6 +1388,12 @@ button {
   overflow: hidden;
 }
 
+.assistant-report-evidence-card {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+
 .assistant-report-visualization-node.loading,
 .assistant-report-visualization-node.notice {
   display: grid;

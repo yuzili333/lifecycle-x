@@ -49,7 +49,8 @@ and events rather than raw provider reasoning.
 4. Python consumes that dataset when analysis or derived metrics are required.
 5. Chart generation consumes a SQL/Python Artifact and creates a visualization Artifact.
 6. Report generation consumes existing analysis and chart Artifacts and creates Markdown.
-7. The renderer reads messages, `tool_calls`, and Artifact content through IPC.
+7. The main process builds a version-bound `evidence_card` Artifact from persisted tool calls and lineage, then inserts only an inert evidence reference into report Markdown.
+8. The renderer reads messages, `tool_calls`, report content, and permission-checked evidence through preload IPC.
 
 Full source datasets are not placed in model context. Models receive required
 schemas, selected fields, compact summaries, and Artifact references.
@@ -60,6 +61,11 @@ schemas, selected fields, compact summaries, and Artifact references.
 identifiers preserve the origin and dependency chain of results. Downstream
 tools refer to registered upstream results; a report or chart is not an
 independent source of truth.
+
+Formal report evidence is system-built rather than model-authored. Each report
+version binds one `evidence_card` Artifact through report metadata and a custom
+Markdown node. The renderer resolves that card only after validating the
+conversation, report Artifact, report version, and declared evidence ID.
 
 ## CSV Modes
 

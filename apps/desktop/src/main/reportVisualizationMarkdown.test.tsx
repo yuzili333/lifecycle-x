@@ -83,6 +83,32 @@ describe("report visualization markdown", () => {
     expect(reportVisualizationArtifactIds(markdown)).toEqual([]);
   });
 
+  it("removes temporary image tags and markdown images while preserving the controlled visualization node", () => {
+    const artifactId = "assistant-chart-spec:chart-1";
+    const markdown = [
+      "# 风险报告",
+      "",
+      "## 可视化分析",
+      '<img src="file:///private/tmp/risk chart.png" alt="临时图表">',
+      "![临时图表](/private/tmp/risk-chart(1).png)",
+      `![错误的 Artifact 图片](${artifactId})`,
+      "",
+      visualizationFence(artifactId),
+    ].join("\n");
+    const segments = parseReportMarkdownVisualizations(markdown, 2);
+    const visibleMarkdown = segments
+      .filter((segment) => segment.type === "markdown")
+      .map((segment) => segment.markdown)
+      .join("");
+
+    expect(segments.filter((segment) => segment.type === "visualization")).toHaveLength(1);
+    expect(visibleMarkdown).toContain("## 可视化分析");
+    expect(visibleMarkdown).not.toContain("<img");
+    expect(visibleMarkdown).not.toContain("![");
+    expect(visibleMarkdown).not.toContain("/private/tmp");
+    expect(visibleMarkdown).not.toContain(`](${artifactId})`);
+  });
+
   it("renders a stable loading node without showing the visualization protocol or artifact id", () => {
     const artifactId = "assistant-chart-spec:private-chart-1";
     const html = renderToString(
@@ -100,6 +126,27 @@ describe("report visualization markdown", () => {
     expect(html).toContain("data-visualization-state=\"loading\"");
     expect(html).not.toContain("```visualization");
     expect(html).not.toContain(artifactId);
+  });
+
+  it("never renders raw report image elements for temporary chart references", () => {
+    const artifactId = "assistant-chart-spec:private-chart-1";
+    const html = renderToString(
+      <ReportMarkdownViewer
+        markdown={[
+          "## 可视化分析",
+          '<img src="file:///private/tmp/risk-chart.png">',
+          "![临时图表](file:///private/tmp/risk-chart.png)",
+          visualizationFence(artifactId),
+        ].join("\n\n")}
+        userId="user-1"
+        conversationId="conversation-1"
+        reportArtifactId="assistant-report-markdown:report-1"
+      />,
+    );
+
+    expect(html).not.toContain("<img");
+    expect(html).not.toContain("file:///private/tmp");
+    expect(html).toContain('data-visualization-state="loading"');
   });
 
   it.each([

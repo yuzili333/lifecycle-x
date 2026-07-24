@@ -306,6 +306,9 @@ ipcMain.handle("assistant:tools:artifact", (_event, userId: string, conversation
 ipcMain.handle("assistant:reports:visualization", (_event, userId: string, conversationId: string, reportArtifactId: string, reportVersion: number, visualizationArtifactId: string) =>
   getAssistantRuntime().resolveConversationReportVisualization(userId, conversationId, reportArtifactId, reportVersion, visualizationArtifactId),
 );
+ipcMain.handle("assistant:reports:evidence", (_event, userId: string, conversationId: string, reportArtifactId: string, reportVersion: number, evidenceCardId: string) =>
+  getAssistantRuntime().resolveConversationReportEvidence(userId, conversationId, reportArtifactId, reportVersion, evidenceCardId),
+);
 ipcMain.handle("assistant:workflow:confirm-dataset", (_event, userId: string, conversationId: string, datasetId?: string) =>
   getAssistantRuntime().confirmWorkflowDataset(userId, conversationId, datasetId),
 );

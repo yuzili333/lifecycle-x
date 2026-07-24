@@ -408,7 +408,7 @@ const EXECUTION_PARAMETER_SCHEMAS: Record<ToolKind, JsonSchema> = {
       markdown: {
         type: "string",
         minLength: 1,
-        description: "仅依据当前步骤已注入 Artifact 摘要生成的完整 Markdown 报告正文。",
+        description: "仅依据当前步骤已注入 Artifact 摘要生成的完整 Markdown 报告正文。不得生成 evidenceCardId、证据 JSON 或工具血缘；系统会在落库时插入真实溯据卡。",
       },
     },
   },

@@ -12,6 +12,7 @@ import type { ChatCsvAttachment, ImportConversationCsvInput } from "../main/chat
 import type { ArtifactRecord, ConversationToolState, ToolCallRecord, ToolKind } from "../main/toolOrchestration";
 import type { WorkflowContextSummary, WorkflowDatasetRef } from "../main/workflowRuntime";
 import type { ResolvedReportVisualizationArtifact } from "../shared/visualization";
+import type { ResolvedReportEvidenceCard } from "../shared/evidence";
 import type { AgentRunRecord } from "../main/agentOrchestration";
 
 export type DataSourceMenuAction = "open-database" | "open-csv" | "create-connection" | "import-csv";
@@ -77,6 +78,8 @@ const lifecycleXApi = {
       ipcRenderer.invoke("assistant:tools:artifact", userId, conversationId, artifactId) as Promise<ArtifactRecord | null>,
     resolveReportVisualization: (userId: string, conversationId: string, reportArtifactId: string, reportVersion: number, visualizationArtifactId: string) =>
       ipcRenderer.invoke("assistant:reports:visualization", userId, conversationId, reportArtifactId, reportVersion, visualizationArtifactId) as Promise<ResolvedReportVisualizationArtifact>,
+    resolveReportEvidence: (userId: string, conversationId: string, reportArtifactId: string, reportVersion: number, evidenceCardId: string) =>
+      ipcRenderer.invoke("assistant:reports:evidence", userId, conversationId, reportArtifactId, reportVersion, evidenceCardId) as Promise<ResolvedReportEvidenceCard>,
     confirmWorkflowDataset: (userId: string, conversationId: string, datasetId?: string) =>
       ipcRenderer.invoke("assistant:workflow:confirm-dataset", userId, conversationId, datasetId) as Promise<{
         success: true;
