@@ -1,0 +1,31 @@
+{
+  "skillId": "overall-risk-distribution-report",
+  "requiredTools": [
+    "request_sql_query_execution",
+    "request_python_analysis_execution",
+    "request_chart_rendering",
+    "request_markdown_report_generation"
+  ],
+  "allowedTools": [
+    "request_sql_query_execution",
+    "request_python_analysis_execution",
+    "request_chart_rendering",
+    "request_markdown_report_generation"
+  ],
+  "security": {
+    "clientOnly": true,
+    "allowNetworkAccess": false,
+    "allowDatabaseCredentials": false,
+    "allowArbitraryLocalFileAccess": false,
+    "allowExecutableSkillCode": false,
+    "allowMutatingSql": false,
+    "allowFullSourceDataInPrompt": false
+  },
+  "executionOrder": [
+    "request_sql_query_execution",
+    "request_python_analysis_execution",
+    "request_chart_rendering",
+    "request_chart_rendering",
+    "request_markdown_report_generation"
+  ]
+}

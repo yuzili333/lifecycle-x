@@ -1,11 +1,88 @@
 import { describe, expect, it } from "vitest";
-import { appendVisualizationReferencesToReport, buildFallbackTempCsvSqlForAnalysisRequest, buildGenericSqlResultAnalysisPythonScript, buildModelToolParameterIssueFeedback, buildOverallRiskDistributionMarkdown, detectToolFromAssistantOutput, formatStoppedGenerationMessage, generalStreamSegmentId, generalTextStreamSegmentId, generatedReportArtifactId, generatedReportToolCallId, inferReportTitle, isPreToolTextGuidanceRequiredInputs, isPythonReportCardContent, isReportGenerationContent, mergeReportChartSections, normalizeAnalysisReportMarkdown, normalizeAnalysisReportTitle, normalizeChartVisualizationSpec, providerToolFallbackText, renderLocalToolPlanContext, reportStreamSegmentId, selectedFieldReferencesMarkdown, shouldAnalyzePriorSqlResult, shouldAutoStartPythonReport, shouldDeferChartUntilUpstreamTools, shouldDeferReportUntilChartTool, shouldEagerStartToolFromAssistantStream, shouldForceGenericSqlResultAnalysisScript, shouldGenerateReportFromAnalysisResult, shouldKeepProviderToolActivityMessage, shouldRegisterAssistantGeneratedArtifacts, shouldRequireDetailSqlForCompositeAnalysis, shouldRouteDeterministicTempCsvToolPlan, shouldRouteSkillThroughModel, shouldStartOverallRiskWorkflowAfterModelText, shouldUseModelForPriorResultVisualization, shouldUseModelForUnclearTaskGoal, summarizeToolArguments } from "./assistantRuntime";
+import { appendVisualizationReferencesToReport, buildFallbackTempCsvSqlForAnalysisRequest, buildGenericSqlResultAnalysisPythonScript, buildModelToolParameterIssueFeedback, completedChartLineageForMessage, detectToolFromAssistantOutput, filterReportVisualizationsToArtifacts, formatStoppedGenerationMessage, generalStreamSegmentId, generalTextStreamSegmentId, generatedReportArtifactId, generatedReportToolCallId, inferReportTitle, isPreToolTextGuidanceRequiredInputs, isPythonReportCardContent, isRepairablePythonRuntimeError, isReportGenerationContent, mergeReportChartSections, normalizeAnalysisReportMarkdown, normalizeAnalysisReportTitle, normalizeChartVisualizationSpec, normalizePythonScriptParameter, providerToolFallbackText, pythonScriptReadsStdin, renderLocalToolPlanContext, reportStreamSegmentId, selectedFieldReferencesMarkdown, shouldAnalyzePriorSqlResult, shouldAutoStartPythonReport, shouldBypassBlockingGuidanceForModelIntent, shouldDeferChartUntilUpstreamTools, shouldDeferReportUntilChartTool, shouldEagerStartToolFromAssistantStream, shouldForceGenericSqlResultAnalysisScript, shouldGenerateReportFromAnalysisResult, shouldKeepProviderToolActivityMessage, shouldRegisterAssistantGeneratedArtifacts, shouldRequireDetailSqlForCompositeAnalysis, shouldRouteDeterministicTempCsvToolPlan, shouldUseModelForPriorResultVisualization, shouldUseModelForUnclearTaskGoal, summarizeToolArguments, validatePythonScriptSyntax } from "./assistantRuntime";
 import { TOOL_NAMES, type ToolExecutionPlan } from "./toolOrchestration";
 import { MissingInputDetector } from "./agentGuidance";
+import { buildTaskRouterSystemPrompt, executionToolSchema } from "./agentOrchestration/modelAdapters";
 import type { ChatCsvSelectedFieldRef, ConversationTempCsvTable } from "./chatCsvTempSource";
 import { validateVisualizationSpec } from "../shared/visualization";
 
 describe("AssistantRuntime workflow intent", () => {
+  it("normalizes model Python wrappers before approval and detects stdin consumers", () => {
+    expect(normalizePythonScriptParameter("print('ok')\n</script>")).toBe("print('ok')");
+    expect(normalizePythonScriptParameter("<script>\nprint('ok')\n</script>")).toBe("print('ok')");
+    expect(normalizePythonScriptParameter("```python\nprint('ok')\n```")).toBe("print('ok')");
+    expect(pythonScriptReadsStdin("import json, sys\nrows = json.load(sys.stdin)")).toBe(true);
+    expect(pythonScriptReadsStdin("print('ok')")).toBe(false);
+  });
+
+  it("rejects model Python with a field-name parenthesis outside the string literal", async () => {
+    await expect(validatePythonScriptSyntax(
+      "contract_amount_field = '合同金额(万元')\nprint(contract_amount_field)",
+    )).resolves.toMatchObject({
+      valid: false,
+      message: expect.stringContaining("unmatched ')'"),
+    });
+    await expect(validatePythonScriptSyntax(
+      "contract_amount_field = '合同金额(万元)'\nprint(contract_amount_field)",
+    )).resolves.toEqual({ valid: true });
+  });
+
+  it("classifies Python calculation errors as recoverable without retrying infrastructure failures", () => {
+    expect(isRepairablePythonRuntimeError(
+      "TypeError: unsupported operand type(s) for /: 'float' and 'decimal.Decimal'",
+    )).toBe(true);
+    expect(isRepairablePythonRuntimeError("ZeroDivisionError: division by zero")).toBe(true);
+    expect(isRepairablePythonRuntimeError("Python 执行超时，已终止。")).toBe(false);
+  });
+
+  it("routes explicit follow-up tasks around stale blocking guidance", () => {
+    expect(shouldBypassBlockingGuidanceForModelIntent("重新生成报告")).toBe(true);
+    expect(shouldBypassBlockingGuidanceForModelIntent("根据上一轮分析结果再次绘图")).toBe(true);
+    expect(shouldBypassBlockingGuidanceForModelIntent("继续分析各分类占比")).toBe(true);
+    expect(shouldBypassBlockingGuidanceForModelIntent("上海分行")).toBe(false);
+    expect(shouldBypassBlockingGuidanceForModelIntent("合同流水号")).toBe(false);
+  });
+
+  it("instructs the task router to treat report regeneration as an executable follow-up", () => {
+    const prompt = buildTaskRouterSystemPrompt();
+    expect(prompt).toContain("“重新生成报告”");
+    expect(prompt).toContain("requiresReport 必须为 true");
+    expect(prompt).toContain("优先复用");
+  });
+
+  it("keeps the execution chart type schema aligned with the shared visualization protocol", () => {
+    const chartTypes = executionToolSchema("chart_rendering").properties?.chartType?.enum;
+    expect(chartTypes).toEqual(expect.arrayContaining(["pie", "donut", "bar", "horizontal_bar"]));
+  });
+
+  it("removes failed or stale visualization content from agent reports", () => {
+    const markdown = [
+      "# 风险分析报告",
+      "",
+      "## 可视化图表",
+      "",
+      "```visualization",
+      JSON.stringify({ data: { mode: "artifact", artifactId: "chart-success" } }),
+      "```",
+      "",
+      "```visualization",
+      JSON.stringify({ data: { mode: "artifact", artifactId: "chart-failed" } }),
+      "```",
+      "",
+      "## 分析结论",
+      "",
+      "结论内容。",
+    ].join("\n");
+    const filtered = filterReportVisualizationsToArtifacts(markdown, ["chart-success"]);
+    expect(filtered).toContain("chart-success");
+    expect(filtered).not.toContain("chart-failed");
+
+    const withoutCharts = filterReportVisualizationsToArtifacts(markdown, []);
+    expect(withoutCharts).not.toContain("可视化图表");
+    expect(withoutCharts).not.toContain("```visualization");
+    expect(withoutCharts).toContain("## 分析结论");
+  });
+
   it("logs parameter shape without persisting raw model arguments", () => {
     const summary = summarizeToolArguments(JSON.stringify({
       sql: "select secret_value from private_table",
@@ -39,6 +116,33 @@ describe("AssistantRuntime workflow intent", () => {
 
     expect(validateVisualizationSpec(spec).success).toBe(true);
     expect(spec).toMatchObject({ type: "horizontal_bar", data: { mode: "artifact", artifactId: "analysis-1" } });
+  });
+
+  it("normalizes declarative pie charts with controlled display labels", () => {
+    const spec = normalizeChartVisualizationSpec({
+      userRequest: "绘制最新风险五级分类笔数分布饼图",
+      purpose: "展示分类笔数和占比",
+      title: "最新风险五级分类笔数分布",
+      chartType: "pie",
+      dimensionFields: ["category"],
+      measureFields: ["count"],
+      dimensionLabels: { category: "最新风险五级分类", ignored: "不应注入" },
+      measureLabels: { count: "笔数" },
+    }, {
+      conversationId: "conversation-1",
+      latestSuccessfulPythonToolCallId: "python-1",
+      latestSuccessfulPythonArtifactIds: ["analysis-1"],
+      toolCalls: [],
+      updatedAt: "2026-07-23T00:00:00.000Z",
+    }, "chart-call-pie");
+
+    expect(validateVisualizationSpec(spec).success).toBe(true);
+    expect(spec).toMatchObject({
+      type: "pie",
+      dimensions: [{ field: "category", label: "最新风险五级分类" }],
+      measures: [{ field: "count", label: "笔数" }],
+    });
+    expect(JSON.stringify(spec)).not.toContain("不应注入");
   });
 
   it("starts Python report flow for one-shot SQL, chart, and report requests", () => {
@@ -173,6 +277,82 @@ describe("AssistantRuntime workflow intent", () => {
     }).match(/```visualization/g)).toHaveLength(1);
   });
 
+  it("embeds all current-run charts in execution order when a Skill requires visualizations", () => {
+    const lineage = completedChartLineageForMessage([
+      {
+        toolCallId: "chart-2",
+        conversationId: "conversation-1",
+        messageId: "message-1",
+        userId: "user-1",
+        toolKind: "chart_rendering",
+        toolName: "request_chart_rendering",
+        status: "completed",
+        request: {},
+        result: {
+          resultId: "result-chart-2",
+          toolKind: "chart_rendering",
+          artifactIds: ["chart-artifact-2"],
+          createdAt: "2026-07-24T00:00:02.000Z",
+        },
+        outputArtifactIds: ["chart-artifact-2"],
+        version: 2,
+        isLatestSuccessful: true,
+        createdAt: "2026-07-24T00:00:02.000Z",
+        updatedAt: "2026-07-24T00:00:02.000Z",
+      },
+      {
+        toolCallId: "chart-1",
+        conversationId: "conversation-1",
+        messageId: "message-1",
+        userId: "user-1",
+        toolKind: "chart_rendering",
+        toolName: "request_chart_rendering",
+        status: "completed",
+        request: {},
+        result: {
+          resultId: "result-chart-1",
+          toolKind: "chart_rendering",
+          artifactIds: ["chart-artifact-1"],
+          createdAt: "2026-07-24T00:00:01.000Z",
+        },
+        outputArtifactIds: ["chart-artifact-1"],
+        version: 1,
+        isLatestSuccessful: false,
+        createdAt: "2026-07-24T00:00:01.000Z",
+        updatedAt: "2026-07-24T00:00:01.000Z",
+      },
+    ], "message-1");
+    const markdown = appendVisualizationReferencesToReport("# 风险分析报告\n\n已完成分析。", {
+      userRequest: "生成整体风险分类分布报告",
+      chartToolCallIds: lineage.toolCallIds,
+      chartArtifactIds: lineage.artifactIds,
+      includeVisualizations: true,
+    });
+
+    expect(lineage.toolCallIds).toEqual(["chart-1", "chart-2"]);
+    expect(lineage.artifactIds).toEqual(["chart-artifact-1", "chart-artifact-2"]);
+    expect(markdown.match(/```visualization/g)).toHaveLength(2);
+    expect(markdown.indexOf("chart-artifact-1")).toBeLessThan(markdown.indexOf("chart-artifact-2"));
+    expect(markdown).toContain('"sourceRequestId": "chart-1"');
+    expect(markdown).toContain('"sourceRequestId": "chart-2"');
+
+    const firstChartOnly = appendVisualizationReferencesToReport("# 风险分析报告", {
+      userRequest: "生成整体风险分类分布报告",
+      chartToolCallIds: ["chart-1"],
+      chartArtifactIds: ["chart-artifact-1"],
+      includeVisualizations: true,
+    });
+    const completedMarkdown = appendVisualizationReferencesToReport(firstChartOnly, {
+      userRequest: "生成整体风险分类分布报告",
+      chartToolCallIds: lineage.toolCallIds,
+      chartArtifactIds: lineage.artifactIds,
+      includeVisualizations: true,
+    });
+    expect(completedMarkdown.match(/```visualization/g)).toHaveLength(2);
+    expect(completedMarkdown.match(/chart-artifact-1/g)).toHaveLength(2);
+    expect(completedMarkdown).toContain('"artifactId": "chart-artifact-2"');
+  });
+
   it("merges chart conclusions and embedded visualizations into one report section", () => {
     const historicalMarkdown = [
       "# 信贷风险分析报告",
@@ -215,7 +395,7 @@ describe("AssistantRuntime workflow intent", () => {
     expect(sanitized).not.toContain("/private/tmp");
 
     const appended = appendVisualizationReferencesToReport(
-      "# 风险分析报告\n\n### 图表分析\n已有分析结论。\n\n### 结论\n总体结论。",
+      "# 风险分析报告\n\n### 图表分析\n{{controlled_visualization_nodes}}\n已有分析结论。\n\n### 结论\n总体结论。",
       {
         userRequest: "绘制条形图并生成报告",
         chartToolCallId: "chart-1",
@@ -225,6 +405,7 @@ describe("AssistantRuntime workflow intent", () => {
     expect(appended.match(/^#{1,6}\s+.*(?:图表|可视化).*$/gm)).toHaveLength(1);
     expect(appended.indexOf("```visualization")).toBeLessThan(appended.indexOf("### 结论"));
     expect(appended).not.toContain("图表引用");
+    expect(appended).not.toContain("controlled_visualization_nodes");
   });
 
   it("renders compact local tool planning context without full prompt content", () => {
@@ -368,8 +549,8 @@ describe("AssistantRuntime workflow intent", () => {
       validation: { valid: true, errors: [], warnings: [] },
       tempSourceCount: 1,
       hasExplicitTool: false,
-      skill: "overall-risk-classification-distribution",
-    })).toBe(false);
+      skill: "personal-generic-analysis",
+    })).toBe(true);
   });
 
   it("returns tool parameter issues to the model without guidance interruption fields", () => {
@@ -523,71 +704,6 @@ describe("AssistantRuntime workflow intent", () => {
     expect(shouldGenerateReportFromAnalysisResult("请基于上一轮分析整理成 Markdown 报告")).toBe(true);
   });
 
-  it("routes selected overall risk skill through model orchestration instead of local history fallback", () => {
-    expect(shouldRouteSkillThroughModel("overall-risk-classification-distribution")).toBe(true);
-    expect(shouldRouteSkillThroughModel(null)).toBe(false);
-  });
-
-  it("starts governed overall risk workflow when the model only acknowledges a new selected-data report request", () => {
-    expect(
-      shouldStartOverallRiskWorkflowAfterModelText(
-        {
-          skill: "overall-risk-classification-distribution",
-          prompt: "据选择的数据源生成一份整体风险分类分布报告",
-        },
-        "我将基于当前已确认的数据集为您重新生成“整体风险分类分布”报告。首先查询所需的明细字段，交由 Python 统一计算。",
-      ),
-    ).toBe(true);
-  });
-
-  it("keeps selected overall risk report requests on the governed workflow even if model text contains SQL", () => {
-    expect(
-      shouldStartOverallRiskWorkflowAfterModelText(
-        {
-          skill: "overall-risk-classification-distribution",
-          prompt: "据选择的数据源生成一份整体风险分类分布报告",
-        },
-        "```sql\nselect loan_balance_10k, contract_amount_10k from selected_source\n```",
-      ),
-    ).toBe(true);
-  });
-
-  it("does not start overall risk workflow for explicit historical report reuse", () => {
-    expect(
-      shouldStartOverallRiskWorkflowAfterModelText(
-        {
-          skill: "overall-risk-classification-distribution",
-          prompt: "查看上一轮整体风险分类分布报告版本",
-        },
-        "我将打开已有报告版本。",
-      ),
-    ).toBe(false);
-  });
-
-  it("does not hijack ad-hoc branch and term analysis into the overall risk skill workflow", () => {
-    expect(
-      shouldStartOverallRiskWorkflowAfterModelText(
-        {
-          skill: "overall-risk-classification-distribution",
-          prompt: "查询各个分行 #一级分行名称 的 #短中长期贷款标识 中“中期”和“长期”的数据汇总和分析。",
-        },
-        "我将基于当前数据源生成整体风险分类分布报告。",
-      ),
-    ).toBe(false);
-  });
-
-  it("does not start local skill workflow when no skill is selected", () => {
-    expect(
-      shouldStartOverallRiskWorkflowAfterModelText(
-        {
-          skill: null,
-          prompt: "查询各分行数据并分析占比。",
-        },
-        "我将基于当前数据源生成整体风险分类分布报告。",
-      ),
-    ).toBe(false);
-  });
-
   it("builds generic Python analysis without business-field hardcoding or fallback skill templates", () => {
     const script = buildGenericSqlResultAnalysisPythonScript(
       "请根据查询结果分析 #一级分行名称 和 #短中长期贷款标识 的占比。",
@@ -616,7 +732,7 @@ describe("AssistantRuntime workflow intent", () => {
     expect(script).not.toContain("latest_risk_result");
     expect(script).not.toContain("loan_balance_10k");
     expect(script).not.toContain("contract_amount_10k");
-    expect(script).not.toContain("整体风险分类分布");
+    expect(script).not.toContain("固定业务报告模板");
     expect(script).not.toContain("核心风险指标");
     expect(script).not.toContain("数据质量与口径说明");
   });
@@ -808,7 +924,7 @@ describe("AssistantRuntime workflow intent", () => {
     expect(sql).not.toContain("group by");
     expect(sql).not.toContain("sum(");
     expect(sql).not.toContain("limit");
-    expect(sql).not.toContain("整体风险分类分布");
+    expect(sql).not.toContain("固定业务报告模板");
   });
 
   it("builds fallback CSV SQL for count-by-branch requests with field-is-value filters", () => {
@@ -1090,58 +1206,5 @@ describe("AssistantRuntime report artifact helpers", () => {
     })).toBe(true);
   });
 
-  it("builds overall risk distribution report with count and amount metrics", () => {
-    const markdown = buildOverallRiskDistributionMarkdown(
-      [
-        { contract_id: "c1", 五级分类: "正常3", 十二级分类: "正常3", 贷款余额: 100 },
-        { contract_id: "c2", 五级分类: "关注", 十二级分类: "关注1", 贷款余额: 50 },
-        { contract_id: "c3", 五级分类: "次级", 十二级分类: "次级", 贷款余额: 25 },
-      ],
-      { dataSourceLabel: "测试数据源 / CSV", version: 1, generatedAt: "2026-07-15 10:00:00" },
-    );
 
-    expect(markdown).toContain("整体风险分类分布报告 v1");
-    expect(markdown).toContain("- 数据源：测试数据源");
-    expect(markdown).toContain("- 生成时间：2026-07-15 10:00:00");
-    expect(markdown).not.toContain("用户选择数据源");
-    expect(markdown).toContain("| 风险分类 | 笔数 | 笔数占比 | 贷款余额(万元) | 金额占比 |");
-    expect(markdown).toContain("| 关注 | 1 | 33.33% | 50 | 28.57% |");
-    expect(markdown).toContain("贷款余额(万元)合计");
-    expect(markdown).toContain("不良率：33.33%（笔数），14.29%（金额）");
-    expect(markdown).toContain("正常3+关注风险边界：66.67%（笔数），85.71%（金额）");
-    expect(markdown).toContain("### 5.1 【笔数维度】");
-    expect(markdown).toContain("### 5.2 【金额维度】");
-    expect(markdown).toContain("### 5.3 【正常类维度】");
-  });
-
-  it("prefers latest_risk over risk classified date columns for risk distribution", () => {
-    const markdown = buildOverallRiskDistributionMarkdown(
-      [
-        { contract_id: "c1", latest_risk_classified_at: "2025-12-12 17:32:40", latest_risk: "正常", loan_balance_10k: 100 },
-        { contract_id: "c2", latest_risk_classified_at: "2025-12-13 09:10:11", latest_risk: "不良", loan_balance_10k: 50 },
-      ],
-      { dataSourceLabel: "测试数据源", version: 1 },
-    );
-
-    expect(markdown).toContain("| 正常 | 1 | 50.00% | 100 | 66.67% |");
-    expect(markdown).toContain("| 不良 | 1 | 50.00% | 50 | 33.33% |");
-    expect(markdown).not.toContain("| 2025-12-12");
-  });
-
-  it("recognizes latest_risk_result as the twelve-level classification field", () => {
-    const markdown = buildOverallRiskDistributionMarkdown(
-      [
-        { contract_serial: "c1", latest_risk: "正常", latest_risk_result: "0103--正常3", loan_balance_10k: 100 },
-        { contract_serial: "c2", latest_risk: "关注", latest_risk_result: "0201--关注1", loan_balance_10k: 50 },
-      ],
-      { dataSourceLabel: "测试数据源", version: 1 },
-    );
-
-    expect(markdown).toContain("十二级分类字段：latest_risk_result");
-    expect(markdown).toContain("| 正常3 | 1 | 50.00% | 100 | 66.67% |");
-    expect(markdown).toContain("| 关注1 | 1 | 50.00% | 50 | 33.33% |");
-    expect(markdown).toContain("正常类维度口径为十二级分类 latest_risk_result 中含“正常1”“正常2”“正常3”的数据");
-    expect(markdown).toContain("正常类总计 1 笔");
-    expect(markdown).not.toContain("未识别十二级分类字段");
-  });
 });

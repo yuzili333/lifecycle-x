@@ -7,6 +7,7 @@ import {
   type ToolDefinition,
 } from "../streamingModelAdapter";
 import { TOOL_NAMES, TOOL_SCHEMAS, type ToolKind } from "../toolOrchestration";
+import { visualizationTypes } from "../../shared/visualization";
 import type { PlannerDecision, PlannerStep } from "./types";
 import { taskRouteSchema } from "./taskRouter";
 
@@ -379,7 +380,7 @@ const EXECUTION_PARAMETER_SCHEMAS: Record<ToolKind, JsonSchema> = {
       title: { type: "string", minLength: 1, description: "图表标题。" },
       chartType: {
         type: "string",
-        enum: ["kpi", "line", "area", "bar", "horizontal_bar", "stacked_bar", "bar_line_combo", "scatter", "bubble", "heatmap", "histogram", "pareto", "funnel", "waterfall", "table"],
+        enum: [...visualizationTypes],
         description: "图表类型。横向条形图必须使用 horizontal_bar。",
       },
       dimensionFields: {
@@ -432,6 +433,8 @@ export function buildTaskRouterSystemPrompt() {
     "L0=元数据查看或确定性格式操作；L1=单表单步骤查询；L2=查询后分析、图表或报告等常规多步骤任务；L3=歧义、异常归因、多轮验证或复杂编排；L4=用户明确要求深度分析或高风险专题研究。",
     "L0/L1 的 requiresKimi 必须为 false；L2-L4 必须为 true。",
     "只标记用户明确要求或安全执行所必需的 SQL、Python、图表、报告能力，不得自行扩展任务。",
+    "“重新生成报告”“再次绘图”“继续分析”等短指令是明确的后续任务；必须结合当前 Skill、最近对话和 Artifact 摘要识别对应工具能力，不能因为本轮未重复字段或数据源名称而判定为无任务。",
+    "重新生成报告时 requiresReport 必须为 true；若已有可靠分析或图表 Artifact，应优先复用并只标记仍需执行的能力，若上游结果失败或缺失则标记完成报告所必需的前置能力。",
     "userVisibleSummary 使用一句面向用户的任务理解摘要，不包含内部 Prompt、Schema 全文、脚本或敏感字段。",
     "confidence 使用 0 到 1。存在歧义时写入 ambiguities，并准确标记是否阻塞。",
     "上下文已给出当前数据源或 activeDataset 时，不得把“存在多个数据集”标记为阻塞歧义；用户未指定具体数据集时默认使用最近更新的数据集。",
@@ -473,10 +476,10 @@ export function buildExecutionSystemPrompt(step: PlannerStep, tool: ToolDefiniti
   const canonicalParameterRule = step.toolKind === "sql_query"
     ? "只生成非空 sql；userRequest、purpose、数据源和血缘参数由客户端注入，不要输出这些字段。"
     : step.toolKind === "python_analysis"
-      ? "只生成非空 script，并仅使用上游结果摘要中存在的真实字段；Artifact 血缘由客户端注入。"
+      ? "只生成非空、简洁且语法完整的 script，并仅使用上游结果摘要中存在的真实字段；字段名称必须从上游结果字段清单逐字符复制，包含单位的中英文括号必须完整保留在字符串引号内，不得手工改写。金额一旦解析为 Decimal，累计、分子、分母、占比和单位换算必须始终使用 Decimal，只在最终 JSON 序列化时转换为 float；正确形式是 float(decimal_numerator / decimal_denominator)，禁止 float_value / Decimal_value。Artifact 血缘由客户端注入。运行时会把已授权 SQL Artifact 的完整数据行作为 JSON 数组写入 stdin，使用 `import json, sys` 和 `rows = json.load(sys.stdin)` 读取；不要输出推测性长注释，不要猜测 artifact_data、df_data 等全局变量，不要读取本地路径，也不要用 Markdown 围栏、<script> 或其他包装标签包裹脚本。"
       : step.toolKind === "chart_rendering"
-        ? "只提供 title、chartType、dimensionFields、measureFields 及可选排序/颜色字段；禁止生成 visualizationSpec、ECharts option 或内联数据。维度和指标必须来自上游结果摘要。"
-        : "只提供 title 和非空 markdown；正文只能使用上游分析摘要和 Artifact 中已经存在的结论，引用关系由客户端注入。正文不得显示 Artifact ID、toolCallId、内部工具名称或“上游 Python 分析结果”等内部血缘信息，直接陈述分析结果并嵌入可视化节点。禁止使用 Markdown 图片语法或 HTML img 标签表示图表，图表仅由客户端注入的受控可视化节点展示。";
+        ? "只提供 title、chartType、dimensionFields、measureFields 及可选 dimensionLabels、measureLabels、排序/颜色字段；禁止生成 visualizationSpec、ECharts option 或内联数据。维度和指标必须来自上游结果摘要，标签只用于展示且映射键必须是对应字段。"
+        : "只提供 title 和非空 markdown；正文只能使用上游分析摘要和 Artifact 中已经存在的结论，引用关系由客户端注入。只允许展示当前轮成功生成的图表；图表步骤失败或没有可用图表时继续生成文本报告并省略可视化章节，不得引用历史图表补位。正文不得显示 Artifact ID、toolCallId、内部工具名称或“上游 Python 分析结果”等内部血缘信息。禁止使用 Markdown 图片语法或 HTML img 标签表示图表，图表仅由客户端注入的受控可视化节点展示。";
   return [
     "你是数据探针 Agent 的执行模型，只为当前一个确定步骤生成工具参数。",
     `当前步骤：${step.purpose}`,

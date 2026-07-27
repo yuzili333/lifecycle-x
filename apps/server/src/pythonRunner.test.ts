@@ -126,6 +126,27 @@ describe("PythonScriptValidator", () => {
     expect(result.passed).toBe(true);
     expect(result.issues.map((issue) => issue.code)).toContain("UNBOUNDED_LOOP_RISK");
   });
+
+  it("blocks model wrapper markup that is not valid Python", () => {
+    for (const script of [
+      "print('ok')\n</script>",
+      "<python>\nprint('ok')\n</python>",
+      "```python\nprint('ok')\n```",
+    ]) {
+      const result = validator.validate(script);
+      expect(result.passed, script).toBe(false);
+      expect(result.issues.map((issue) => issue.code)).toContain("PARSE_FAILED");
+    }
+  });
+
+  it("blocks unmatched delimiters outside strings and ignores balanced field-name punctuation", () => {
+    const malformed = validator.validate("contract_amount_field = '合同金额(万元')\nprint(contract_amount_field)");
+    expect(malformed.passed).toBe(false);
+    expect(malformed.issues.map((issue) => issue.code)).toContain("PARSE_FAILED");
+
+    const valid = validator.validate("contract_amount_field = '合同金额(万元)'\nprint(contract_amount_field)");
+    expect(valid.passed).toBe(true);
+  });
 });
 
 describe("PythonRunnerModule", () => {

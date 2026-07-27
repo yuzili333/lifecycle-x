@@ -1478,6 +1478,20 @@ button {
   opacity: 0.82;
 }
 
+.assistant-visualization-circular .pie-label-line {
+  fill: none;
+  stroke: color-mix(in srgb, var(--viz-axis) 64%, transparent);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+
+.assistant-visualization-circular .pie-value-label {
+  fill: var(--viz-text);
+  font-family: var(--viz-font, var(--font-family-body));
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+}
+
 .assistant-visualization-circular-legend {
   display: grid;
   align-content: center;

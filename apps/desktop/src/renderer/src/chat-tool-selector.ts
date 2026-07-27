@@ -3,6 +3,8 @@ export type ChatToolSelectorSectionId = "add" | "skill" | "data_source";
 export type ChatToolSkillOption<SkillValue extends string = string> = {
   label: string;
   value: SkillValue;
+  description?: string;
+  keywords?: string[];
 };
 
 export type ChatToolDataSourceKind = "database" | "csv" | "temporary_csv";
@@ -156,7 +158,13 @@ export function buildChatToolSelectorSections<SkillValue extends string>({
   }
 
   const skillItems = skills
-    .filter((skill) => matchesToolQuery(query, skill.label, skill.value))
+    .filter((skill) => matchesToolQuery(
+      query,
+      skill.label,
+      skill.value,
+      skill.description,
+      ...(skill.keywords ?? []),
+    ))
     .map<ChatToolSelectorItem<SkillValue>>((skill) => ({
       type: "skill",
       id: skill.value,

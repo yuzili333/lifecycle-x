@@ -70,7 +70,7 @@ describe("ReportToolCallCard", () => {
   it("renders dynamic report metadata and creating status", () => {
     const html = renderToString(
       <ReportToolCallCard
-        title="整体风险分类分布报告"
+        title="贷款组合分析报告"
         version={2}
         generatedAt="2026/07/15 10:00"
         chartCount={1}

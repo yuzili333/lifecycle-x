@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cycle-probe.local/schemas/overall-risk-distribution-report-input.schema.json",
+  "title": "OverallRiskDistributionReportInput",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "dataSourceId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "当前会话选择的数据源 ID；未提供时从会话上下文解析。"
+    },
+    "fieldBindings": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "仅保存当前数据源中已经确认存在的实际字段名称。",
+      "properties": {
+        "contractSerial": {
+          "$ref": "#/$defs/actualField"
+        },
+        "fiveLevelClassification": {
+          "$ref": "#/$defs/actualField"
+        },
+        "riskClassificationResult": {
+          "$ref": "#/$defs/actualField"
+        },
+        "loanBalance": {
+          "$ref": "#/$defs/amountField"
+        },
+        "contractAmount": {
+          "$ref": "#/$defs/amountField"
+        }
+      }
+    },
+    "filters": {
+      "type": "object",
+      "description": "用户明确指定的筛选条件；默认分析全部日期范围。",
+      "additionalProperties": true
+    },
+    "outputOptions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "includeCountChart": {
+          "type": "boolean",
+          "default": true
+        },
+        "includeLoanBalanceChart": {
+          "type": "boolean",
+          "default": true
+        }
+      }
+    }
+  },
+  "$defs": {
+    "actualField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "actualName"
+      ],
+      "properties": {
+        "actualName": {
+          "type": "string",
+          "minLength": 1,
+          "description": "当前数据源 Schema 中真实存在的字段名称。"
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1
+        },
+        "selectedByUser": {
+          "type": "boolean"
+        }
+      }
+    },
+    "amountField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "actualName"
+      ],
+      "properties": {
+        "actualName": {
+          "type": "string",
+          "minLength": 1,
+          "description": "当前数据源 Schema 中真实存在的字段名称。"
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1
+        },
+        "selectedByUser": {
+          "type": "boolean"
+        },
+        "sourceUnit": {
+          "type": "string",
+          "description": "只保存从真实字段名称或 Schema 单位信息中识别出的原始单位。"
+        }
+      }
+    }
+  }
+}

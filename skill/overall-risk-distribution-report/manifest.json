@@ -1,0 +1,44 @@
+{
+  "skillId": "overall-risk-distribution-report",
+  "name": "overall-risk-distribution-report",
+  "displayName": "整体风险分类分布分析报告",
+  "description": "基于所选数据源的真实字段查询并分析整体风险分类笔数和贷款余额分布，生成五级分类、分类结果明细、笔数饼图、贷款余额柱状图及匹配模板的 Markdown 报告。",
+  "version": "1.0.7",
+  "category": "credit-risk-analysis",
+  "tags": [
+    "信贷资产",
+    "风险分类",
+    "五级分类",
+    "贷款余额",
+    "合同笔数",
+    "资产质量"
+  ],
+  "keywords": [
+    "整体风险分类分布",
+    "风险分类分布报告",
+    "最新风险五级分类",
+    "最新风险分类结果",
+    "关注率",
+    "不良率"
+  ],
+  "sourceType": "local_builtin",
+  "runtime": "cycle-probe-client",
+  "clientOnly": true,
+  "enabled": true,
+  "requiredTools": [
+    "request_sql_query_execution",
+    "request_python_analysis_execution",
+    "request_chart_rendering",
+    "request_markdown_report_generation"
+  ],
+  "entryFile": "SKILL.md",
+  "templateFile": "report-template.md",
+  "inputSchemaFile": "schemas/skill-input.schema.json",
+  "reportDataSchemaFile": "schemas/report-data.schema.json",
+  "toolPolicyFile": "tool-policy.json",
+  "aliases": [
+    "@整体风险分类分布",
+    "@风险分类分布报告",
+    "@资产质量分析"
+  ]
+}

@@ -121,7 +121,7 @@ describe("AuthStore", () => {
         modelProvider: "Siliconflow",
         modelName: "gpt-4.1",
         apiKeyStatus: "configured",
-        skillEnabled: true,
+        skillEnabled: false,
         mcpEnabled: false,
       },
       personalization: { defaultModule: "data-management", compactNavigation: true },
@@ -132,6 +132,7 @@ describe("AuthStore", () => {
     expect(settings?.appearance.codeFontFamily).toBe("Menlo, monospace");
     expect(settings?.configuration.modelName).toBe("gpt-4.1");
     expect(settings?.configuration.apiKeyStatus).toBe("configured");
+    expect(settings?.configuration.skillEnabled).toBe(true);
     expect(settings?.configuration.mcpEnabled).toBe(false);
   });
 });

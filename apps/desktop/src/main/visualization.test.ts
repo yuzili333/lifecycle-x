@@ -155,7 +155,10 @@ describe("Visualization renderer adapters", () => {
   });
 
   it("maps Astryx neutral tokens to light and dark chart options", () => {
-    const light = transformToControlledEChartsOption(baseSpec({ type: "bar" }), resolvedData, neutralLightVisualizationTheme);
+    const light = transformToControlledEChartsOption(baseSpec({
+      type: "bar",
+      measures: [{ field: "balance", label: "贷款余额（万元）", dataType: "currency", role: "y" }],
+    }), resolvedData, neutralLightVisualizationTheme);
     const dark = transformToControlledEChartsOption(baseSpec({ type: "donut" }), resolvedData, neutralDarkVisualizationTheme);
 
     expect(neutralLightVisualizationTheme.name).toBe("astryx-neutral");
@@ -167,7 +170,15 @@ describe("Visualization renderer adapters", () => {
       backgroundColor: neutralLightVisualizationTheme.colors.background,
       borderColor: neutralLightVisualizationTheme.colors.border,
     });
+    expect(light.yAxis).toMatchObject({
+      type: "value",
+      name: "贷款余额（万元）",
+      axisLabel: { color: neutralLightVisualizationTheme.colors.textSecondary },
+    });
     expect(dark.legend).toMatchObject({ textStyle: { color: neutralDarkVisualizationTheme.colors.textSecondary } });
+    expect(dark.series[0]).toMatchObject({
+      label: { show: true, formatter: "{c}（{d}%）" },
+    });
     expect(JSON.stringify(dark)).not.toContain("gradient");
   });
 

@@ -1,0 +1,259 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cycle-probe.local/schemas/overall-risk-distribution-report-data.schema.json",
+  "title": "OverallRiskDistributionReportData",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "dataSourceName",
+    "countBasis",
+    "countBasisField",
+    "fallbackReason",
+    "deduplicatedRecordCount",
+    "excludedRecordCount",
+    "sourceFields",
+    "totals",
+    "fiveLevelDistribution",
+    "conclusions"
+  ],
+  "properties": {
+    "dataSourceName": {
+      "type": "string",
+      "minLength": 1
+    },
+    "countBasis": {
+      "type": "string",
+      "enum": [
+        "contract_serial",
+        "valid_rows"
+      ]
+    },
+    "countBasisField": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "fallbackReason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "deduplicatedRecordCount": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "excludedRecordCount": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "sourceFields": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fiveLevelClassification",
+        "loanBalance"
+      ],
+      "properties": {
+        "contractSerial": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fiveLevelClassification": {
+          "type": "string",
+          "minLength": 1
+        },
+        "riskClassificationResult": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "loanBalance": {
+          "type": "string",
+          "minLength": 1
+        },
+        "contractAmount": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "loanBalanceSourceUnit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "contractAmountSourceUnit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "totals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "count",
+        "loanBalance",
+        "loanBalanceInYi",
+        "contractAmountInYi",
+        "loanBalanceDisplay",
+        "contractAmountDisplay",
+        "contractAmountClause"
+      ],
+      "properties": {
+        "count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "loanBalance": {
+          "type": "number"
+        },
+        "loanBalanceInYi": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "贷款余额换算为亿元后的数值；源单位无法确认时为 null。展示时不得直接使用 number，必须使用 loanBalanceDisplay。"
+        },
+        "contractAmount": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "contractAmountInYi": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "合同金额换算为亿元后的数值；字段缺失或源单位无法确认时为 null。展示时不得直接使用 number，必须使用 contractAmountDisplay。"
+        },
+        "loanBalanceDisplay": {
+          "type": "string",
+          "minLength": 1,
+          "description": "报告直接使用的贷款余额合计展示字符串。单位可确认时必须为 ROUND_HALF_UP 后固定三位小数的亿元值，例如 37.378亿元，不添加“约”。"
+        },
+        "contractAmountDisplay": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "报告直接使用的合同金额合计展示字符串。字段缺失时为 null；单位可确认时必须为 ROUND_HALF_UP 后固定三位小数的亿元值，例如 76.579亿元。"
+        },
+        "contractAmountClause": {
+          "type": "string",
+          "description": "摘要直接拼接的合同金额子句。存在合同金额时格式为“，`合同金额`合计 76.579亿元。”；不存在时为“。”。禁止只输出无业务标签的金额。"
+        }
+      }
+    },
+    "fiveLevelDistribution": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "items": {
+        "$ref": "#/$defs/distributionRow"
+      }
+    },
+    "riskResultDistribution": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/distributionRow"
+      }
+    },
+    "conclusions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "countDimension",
+        "amountDimension"
+      ],
+      "properties": {
+        "countDimension": {
+          "type": "string",
+          "minLength": 1
+        },
+        "amountDimension": {
+          "type": "string",
+          "minLength": 1,
+          "description": "金额维度结论。所有可确认单位的合计金额必须引用对应 loanBalanceDisplay，统一为固定三位小数的亿元值，不得展示万元原值。"
+        },
+        "normalClassDetail": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "正常类内部细分。每个明细金额必须引用 riskResultDistribution 对应项的 loanBalanceDisplay，不得展示万元原值。"
+        }
+      }
+    },
+    "dataQualityNotes": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  },
+  "$defs": {
+    "distributionRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "category",
+        "count",
+        "countRate",
+        "loanBalance",
+        "loanBalanceInYi",
+        "loanBalanceDisplay",
+        "amountRate"
+      ],
+      "properties": {
+        "category": {
+          "type": "string",
+          "minLength": 1
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "countRate": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "loanBalance": {
+          "type": "number",
+          "description": "保留源字段单位的表格金额。"
+        },
+        "loanBalanceInYi": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "该分类贷款余额换算为亿元后的数值；单位无法确认时为 null。"
+        },
+        "loanBalanceDisplay": {
+          "type": "string",
+          "minLength": 1,
+          "description": "报告文字直接使用的该分类金额。单位可确认时固定保留三位小数并标注亿元，例如 25.646亿元；不得添加“约”。"
+        },
+        "amountRate": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "remark": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

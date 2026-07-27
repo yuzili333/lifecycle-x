@@ -188,27 +188,203 @@ function recordArtifactIds(record: ToolCallRecord) {
 
 function structuredArtifactData(artifact: ArtifactRecord, spec: VisualizationSpec): ResolvedVisualizationData | null {
   const content = parseStructuredContent(artifact.content);
-  const rows = Array.isArray(content)
-    ? content
-    : isRecord(content) && Array.isArray(content.rows)
-      ? content.rows
-      : isRecord(content) && Array.isArray(content.previewRows)
-        ? content.previewRows
-        : null;
-  if (!rows || !rows.every(isRecord)) {
+  const selection = selectStructuredRows(content, spec);
+  if (!selection) {
     return null;
   }
-  const typedRows = rows as Record<string, unknown>[];
-  const rowCount = isRecord(content) && typeof content.rowCount === "number" ? content.rowCount : typedRows.length;
+  const typedRows = selection.rows.slice(0, 200).map((row) =>
+    Object.fromEntries(selection.fields.map(({ target, source }) => [target, row[source]])));
   return {
     artifactId: artifact.artifactId,
     columns: inferColumns(typedRows),
     rows: typedRows,
-    rowCount,
-    truncated: typedRows.length < rowCount,
+    rowCount: selection.rowCount,
+    truncated: typedRows.length < selection.rowCount,
     masked: spec.provenance.masked ?? false,
     warnings: spec.provenance.warnings ?? [],
   };
+}
+
+export function materializeStructuredVisualizationSpec(
+  spec: VisualizationSpec,
+  artifact: ArtifactRecord,
+): VisualizationSpec {
+  if (spec.data.mode !== "artifact") {
+    return spec;
+  }
+  const resolved = structuredArtifactData(artifact, spec);
+  const resolvedRows = resolved?.rows;
+  if (!resolved || !resolvedRows || resolved.rowCount > 200 || resolvedRows.length > 200) {
+    return spec;
+  }
+  const rows = resolvedRows.map(toInlineVisualizationRow);
+  if (rows.some((row) => row === null)) {
+    return spec;
+  }
+  return {
+    ...spec,
+    data: {
+      mode: "inline",
+      rows: rows as Array<Record<string, string | number | boolean | null>>,
+      rowCount: resolved.rowCount,
+      trusted: true,
+    },
+    metadata: {
+      ...spec.metadata,
+      materializedFromArtifactId: artifact.artifactId,
+    },
+  };
+}
+
+function toInlineVisualizationRow(row: Record<string, unknown>) {
+  const entries = Object.entries(row);
+  if (entries.some(([, value]) =>
+    value !== null &&
+    typeof value !== "string" &&
+    typeof value !== "number" &&
+    typeof value !== "boolean"
+  )) {
+    return null;
+  }
+  return Object.fromEntries(entries) as Record<string, string | number | boolean | null>;
+}
+
+type StructuredRowsCandidate = {
+  path: string;
+  rows: Record<string, unknown>[];
+  rowCount: number;
+};
+
+function selectStructuredRows(content: unknown, spec: VisualizationSpec) {
+  const expectedFields = spec.data.mode === "artifact"
+    ? Object.keys(spec.data.expectedSchema ?? {})
+    : [];
+  const requestedFields = expectedFields.length > 0
+    ? expectedFields
+    : visualizationDataFields(spec);
+  if (requestedFields.length === 0) {
+    return null;
+  }
+  const candidates = collectStructuredRows(content);
+  const ranked = candidates.flatMap((candidate) => {
+    const mapping = mapVisualizationFields(candidate.rows, requestedFields);
+    if (!mapping) {
+      return [];
+    }
+    const pathTokens = semanticTokens(candidate.path);
+    const requestedTokens = new Set(requestedFields.flatMap(semanticTokens));
+    const pathScore = pathTokens.filter((token) => requestedTokens.has(token)).length * 5;
+    return [{
+      ...candidate,
+      fields: mapping.fields,
+      score: mapping.score + pathScore,
+    }];
+  }).sort((left, right) => right.score - left.score);
+  if (ranked[0]) {
+    return ranked[0];
+  }
+  const conventional = candidates.find((candidate) =>
+    candidate.path === "root.rows" || candidate.path === "root.previewRows");
+  if (!conventional) {
+    return null;
+  }
+  return {
+    ...conventional,
+    fields: uniqueStrings(conventional.rows.flatMap((row) => Object.keys(row)))
+      .map((field) => ({ target: field, source: field })),
+    score: 0,
+  };
+}
+
+function collectStructuredRows(content: unknown, path = "root", depth = 0): StructuredRowsCandidate[] {
+  if (depth > 5) {
+    return [];
+  }
+  if (Array.isArray(content)) {
+    if (content.every(isRecord)) {
+      return [{ path, rows: content as Record<string, unknown>[], rowCount: content.length }];
+    }
+    return content.flatMap((item, index) => collectStructuredRows(item, `${path}[${index}]`, depth + 1));
+  }
+  if (!isRecord(content)) {
+    return [];
+  }
+  return Object.entries(content).flatMap(([key, value]) => {
+    if (Array.isArray(value) && value.every(isRecord)) {
+      const rowCount = (key === "rows" || key === "previewRows") && typeof content.rowCount === "number"
+        ? content.rowCount
+        : value.length;
+      return [{ path: `${path}.${key}`, rows: value as Record<string, unknown>[], rowCount }];
+    }
+    return collectStructuredRows(value, `${path}.${key}`, depth + 1);
+  });
+}
+
+function mapVisualizationFields(rows: Record<string, unknown>[], requestedFields: string[]) {
+  const sourceFields = uniqueStrings(rows.flatMap((row) => Object.keys(row)));
+  const used = new Set<string>();
+  const fields: Array<{ target: string; source: string }> = [];
+  let score = 0;
+  for (const target of requestedFields) {
+    const exact = sourceFields.find((source) => source === target && !used.has(source));
+    const normalized = exact
+      ? undefined
+      : sourceFields.find((source) =>
+          normalizeSemanticField(source) === normalizeSemanticField(target) && !used.has(source));
+    const targetKind = semanticFieldKind(target);
+    const semantic = exact || normalized || !targetKind
+      ? undefined
+      : sourceFields.find((source) => semanticFieldKind(source) === targetKind && !used.has(source));
+    const source = exact ?? normalized ?? semantic;
+    if (!source) {
+      return null;
+    }
+    used.add(source);
+    fields.push({ target, source });
+    score += exact ? 100 : normalized ? 80 : 40;
+  }
+  return { fields, score };
+}
+
+function normalizeSemanticField(value: string) {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[（(][^）)]*[）)]/g, "")
+    .replace(/[\s_\-—–/\\:：.]+/g, "");
+}
+
+function semanticFieldKind(value: string) {
+  const normalized = normalizeSemanticField(value);
+  if (/占比|比率|百分|率$|^(?:rate|ratio|share|percent|percentage|countrate|amountrate)$/.test(normalized)) {
+    return "rate";
+  }
+  if (/贷款余额|余额|^(?:loanbalance|outstandingbalance|balance)$/.test(normalized)) {
+    return "balance";
+  }
+  if (/合同金额|金额|^(?:contractamount|amount)$/.test(normalized)) {
+    return "amount";
+  }
+  if (/笔数|数量|总计数|合同数|^(?:count|totalcount|recordcount|rowcount|quantity)$/.test(normalized)) {
+    return "count";
+  }
+  if (/分类|类别|^(?:category|classification|class|group|label|name|dimension)$/.test(normalized)) {
+    return "category";
+  }
+  return null;
+}
+
+function semanticTokens(value: string) {
+  const expanded = value.replace(/([a-z0-9])([A-Z])/g, "$1 $2").toLowerCase();
+  const tokens: string[] = [...(expanded.match(/[a-z0-9]+/g) ?? [])];
+  if (/风险/.test(value)) tokens.push("risk");
+  if (/五级/.test(value)) tokens.push("five", "level");
+  if (/分类|类别/.test(value)) tokens.push("classification", "category");
+  if (/笔数|数量|合同数/.test(value)) tokens.push("count");
+  if (/贷款余额|余额/.test(value)) tokens.push("loan", "balance");
+  if (/合同金额|金额/.test(value)) tokens.push("amount");
+  if (/占比|比率|百分|率/.test(value)) tokens.push("rate");
+  return uniqueStrings(tokens);
 }
 
 function markdownArtifactData(artifact: ArtifactRecord, spec: VisualizationSpec): ResolvedVisualizationData | null {
@@ -312,12 +488,18 @@ function coerceMarkdownTableValue(value: string): string | number | boolean | nu
   return normalized;
 }
 
-function parseStructuredContent(content: unknown): unknown {
+function parseStructuredContent(content: unknown, depth = 0): unknown {
+  if (depth > 4) {
+    return content;
+  }
   if (typeof content !== "string") {
+    if (isRecord(content) && typeof content.stdout === "string") {
+      return parseStructuredContent(content.stdout, depth + 1);
+    }
     return content;
   }
   try {
-    return JSON.parse(content);
+    return parseStructuredContent(JSON.parse(content), depth + 1);
   } catch {
     return null;
   }

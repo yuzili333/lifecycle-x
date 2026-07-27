@@ -15,6 +15,7 @@ import { UserCog } from "lucide-react";
 import type { AuthFailure } from "./auth";
 import { DataAssistantWorkspace } from "./DataAssistantWorkspace";
 import { DataManagementWorkspace } from "./DataManagementWorkspace";
+import { SkillManagementPanel } from "./SkillManagementPanel";
 import { useAppToast } from "./useAppToast";
 import type { useAuthStore } from "./useAuthStore";
 import aiIcon from "./assets/ai.svg";
@@ -24,6 +25,7 @@ import csvIcon from "./assets/csv.svg";
 import databaseIcon from "./assets/database.svg";
 import { workbenchApi, type ApiResult, type UserProfile, type WorkbenchSettings } from "./workbenchApi";
 import type { DataSourceMenuAction } from "../../preload";
+import type { SkillSummary } from "../../shared/skills";
 
 type WorkbenchAuth = ReturnType<typeof useAuthStore>;
 
@@ -33,7 +35,7 @@ type WorkbenchShellProps = {
 };
 
 type WorkbenchModule = "data-assistant" | "data-management";
-type SettingsTab = "profile" | "appearance" | "agent" | "logout";
+type SettingsTab = "profile" | "appearance" | "skills" | "agent" | "logout";
 type SessionExpiredPromptPhase = "idle" | "prompting" | "logging-out" | "handled";
 
 const DEFAULT_WORKBENCH_MODULE: WorkbenchModule = "data-assistant";
@@ -89,7 +91,7 @@ const defaultSettings: WorkbenchSettings = {
     dualModelOrchestrationEnabled: true,
     thinkingOptimizationEnabled: true,
     apiKeyStatus: "not_configured",
-    skillEnabled: false,
+    skillEnabled: true,
     mcpEnabled: false,
   },
   personalization: {
@@ -238,7 +240,7 @@ function normalizeWorkbenchSettings(settings: WorkbenchSettings): WorkbenchSetti
       ...NEUTRAL_THEME_APPEARANCE_BY_MODE[themeMode],
       dockIcon: normalizeDockIconTheme(settings.appearance?.dockIcon),
     },
-    configuration: { ...defaultSettings.configuration, ...settings.configuration },
+    configuration: { ...defaultSettings.configuration, ...settings.configuration, skillEnabled: true },
     personalization: { ...defaultSettings.personalization, ...settings.personalization },
   };
 }
@@ -318,7 +320,8 @@ async function hasLocalModelApiKey(user: WorkbenchAuth["user"]) {
 const settingsTabs: Array<{ id: SettingsTab; label: string; description: string }> = [
   { id: "profile", label: "个人资料", description: "头像和企业主数据" },
   { id: "appearance", label: "外观", description: "主题、颜色和字体" },
-  { id: "agent", label: "模型配置", description: "大模型、API Key 和 Skill" },
+  { id: "skills", label: "技能", description: "系统与个人 Skill" },
+  { id: "agent", label: "模型配置", description: "大模型和 API Key" },
   { id: "logout", label: "退出登录", description: "结束当前登录态" },
 ];
 
@@ -364,6 +367,8 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
   const sessionExpiredPromptPhaseRef = useRef<SessionExpiredPromptPhase>("idle");
   const sessionIdleTimerRef = useRef<number | null>(null);
   const lastSessionActivityAtRef = useRef(0);
+  const skillCatalogUserIdRef = useRef<string | null>(null);
+  const skillLoadRequestIdRef = useRef(0);
   const [activeModule, setActiveModule] = useState<WorkbenchModule>(() => readCachedWorkbenchModule(auth.user, auth.permissions));
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isLogoutConfirmOpen, setIsLogoutConfirmOpen] = useState(false);
@@ -377,6 +382,40 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
   const [apiKeyDraft, setApiKeyDraft] = useState("");
   const [settings, setSettings] = useState<WorkbenchSettings>(() => readCachedWorkbenchSettings(auth.user) ?? defaultSettings);
   const [isSavingSettings, setIsSavingSettings] = useState(false);
+  const [skills, setSkills] = useState<SkillSummary[]>([]);
+  const [isLoadingSkills, setIsLoadingSkills] = useState(false);
+  const [isInstallingSkill, setIsInstallingSkill] = useState(false);
+  const [pendingSkillId, setPendingSkillId] = useState<string | null>(null);
+
+  const loadSkills = useCallback(async () => {
+    const userId = auth.user?.id ?? null;
+    const requestId = ++skillLoadRequestIdRef.current;
+    if (skillCatalogUserIdRef.current !== userId) {
+      skillCatalogUserIdRef.current = userId;
+      setSkills([]);
+    }
+    if (!userId || !window.lifecycleX?.skills) {
+      setIsLoadingSkills(false);
+      return;
+    }
+    setIsLoadingSkills(true);
+    const result = await window.lifecycleX.skills.list(userId);
+    if (requestId !== skillLoadRequestIdRef.current || skillCatalogUserIdRef.current !== userId) {
+      return;
+    }
+    setIsLoadingSkills(false);
+    if (!result.success) {
+      setSkills([]);
+      toast({
+        type: "error",
+        body: `${result.error.message} Trace: ${result.error.traceId}`,
+        uniqueID: "skill-list-error",
+        collisionBehavior: "overwrite",
+      });
+      return;
+    }
+    setSkills(result.data);
+  }, [auth.user?.id, toast]);
 
   const openSessionExpiredConfirm = useCallback(() => {
     if (auth.status !== "authenticated") {
@@ -593,6 +632,10 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
   }, [auth.user, requestWithRefresh, showError, toast]);
 
   useEffect(() => {
+    void loadSkills();
+  }, [loadSkills]);
+
+  useEffect(() => {
     const dispose = window.lifecycleX?.dataSource.onAction((action) => {
       setActiveModule("data-management");
       setPendingDataSourceAction(action);
@@ -616,6 +659,9 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
   const openSettings = (tab: SettingsTab) => {
     setActiveSettingsTab(tab);
     setIsSettingsOpen(true);
+    if (tab === "skills") {
+      void loadSkills();
+    }
   };
 
   const openAgentSettingsFromPrompt = () => {
@@ -639,6 +685,73 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
 
   const requestLogout = () => {
     setIsLogoutConfirmOpen(true);
+  };
+
+  const installSkill = async () => {
+    if (!auth.user?.id || !window.lifecycleX?.skills) return;
+    setIsInstallingSkill(true);
+    const result = await window.lifecycleX.skills.pickAndInstall(auth.user.id);
+    setIsInstallingSkill(false);
+    if (!result.success) {
+      toast({
+        type: "error",
+        body: `${result.error.message} Trace: ${result.error.traceId}`,
+        uniqueID: "skill-install-error",
+        collisionBehavior: "overwrite",
+      });
+      return;
+    }
+    if (result.data.status === "installed") {
+      await loadSkills();
+      toast({
+        type: "info",
+        body: `已安装并启用 ${result.data.skill.displayName}。`,
+        uniqueID: "skill-install-success",
+        collisionBehavior: "overwrite",
+      });
+    }
+  };
+
+  const setSkillEnabled = async (skill: SkillSummary, enabled: boolean) => {
+    if (!auth.user?.id || !window.lifecycleX?.skills) return;
+    setPendingSkillId(skill.skillId);
+    const result = await window.lifecycleX.skills.setEnabled(auth.user.id, skill.skillId, enabled);
+    setPendingSkillId(null);
+    if (!result.success) {
+      toast({
+        type: "error",
+        body: `${result.error.message} Trace: ${result.error.traceId}`,
+        uniqueID: "skill-toggle-error",
+        collisionBehavior: "overwrite",
+      });
+      return;
+    }
+    setSkills((current) => current.map((item) =>
+      item.origin === "personal" && item.skillId === result.data.skillId ? result.data : item));
+  };
+
+  const removeSkill = async (skill: SkillSummary) => {
+    if (!auth.user?.id || !window.lifecycleX?.skills) return;
+    setPendingSkillId(skill.skillId);
+    const result = await window.lifecycleX.skills.remove(auth.user.id, skill.skillId);
+    setPendingSkillId(null);
+    if (!result.success) {
+      toast({
+        type: "error",
+        body: `${result.error.message} Trace: ${result.error.traceId}`,
+        uniqueID: "skill-remove-error",
+        collisionBehavior: "overwrite",
+      });
+      return;
+    }
+    setSkills((current) => current.filter((item) =>
+      !(item.origin === "personal" && item.skillId === skill.skillId)));
+    toast({
+      type: "info",
+      body: `已删除 ${skill.displayName}。`,
+      uniqueID: "skill-remove-success",
+      collisionBehavior: "overwrite",
+    });
   };
 
   const dismissSessionExpiredPrompt = () => {
@@ -740,6 +853,7 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
               thinkingOptimizationEnabled={settings.configuration.thinkingOptimizationEnabled !== false}
               isModelConfigured={isModelConfigurationReady(settings)}
               canReadDataSources={auth.permissions.includes("datasource:read")}
+              skills={skills.filter((skill) => skill.enabled && skill.availability === "ready")}
               requestWithRefresh={requestWithRefresh}
               onRequireModelConfig={() => setIsModelConfigRequiredOpen(true)}
             />
@@ -1043,19 +1157,21 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
                       placeholder={settings.configuration.apiKeyStatus === "configured" ? "已本地保存，如需更新请输入新密钥" : "输入密钥后将加密保存到本地"}
                       onChange={setApiKeyDraft}
                     />
-                    <Switch
-                      label="启用 Skill"
-                      value={settings.configuration.skillEnabled}
-                      onChange={(skillEnabled) =>
-                        setSettings((current) => ({
-                          ...current,
-                          configuration: { ...current.configuration, skillEnabled },
-                        }))
-                      }
-                    />
                   </VStack>
                 </Section>
               </VStack>
+            )}
+
+            {activeSettingsTab === "skills" && (
+              <SkillManagementPanel
+                skills={skills}
+                isLoading={isLoadingSkills}
+                pendingSkillId={pendingSkillId}
+                isInstalling={isInstallingSkill}
+                onInstall={() => void installSkill()}
+                onSetEnabled={(skill, enabled) => void setSkillEnabled(skill, enabled)}
+                onRemove={(skill) => void removeSkill(skill)}
+              />
             )}
 
             {activeSettingsTab === "logout" && (
@@ -1076,7 +1192,7 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
 
             <div className="settings-footer">
               <Button label="关闭" variant="secondary" onClick={() => setIsSettingsOpen(false)} />
-              {activeSettingsTab !== "profile" && activeSettingsTab !== "logout" && (
+              {activeSettingsTab !== "profile" && activeSettingsTab !== "skills" && activeSettingsTab !== "logout" && (
                 <Button label="保存设置" variant="primary" isLoading={isSavingSettings} onClick={handleSettingsSave} />
               )}
             </div>

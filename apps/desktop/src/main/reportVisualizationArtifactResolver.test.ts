@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { InMemoryArtifactManager, InMemoryToolResultRegistry, type ArtifactRecord, type ToolCallRecord, type ToolKind } from "./toolOrchestration";
 import { InMemoryDatasetStateManager } from "./workflowRuntime";
-import { ReportVisualizationArtifactResolver } from "./reportVisualizationArtifactResolver";
+import { materializeStructuredVisualizationSpec, ReportVisualizationArtifactResolver } from "./reportVisualizationArtifactResolver";
+import type { VisualizationSpec } from "../shared/visualization";
 
 const conversationId = "conversation-1";
 const chartArtifactId = "assistant-chart-spec:chart-1";
@@ -274,5 +275,79 @@ describe("ReportVisualizationArtifactResolver", () => {
       ],
     });
     expect(result.data.columns.map((column) => column.name)).toEqual(["客户所属国标行业名称", "占比"]);
+  });
+
+  it("resolves nested distribution rows from a Python stdout JSON envelope", async () => {
+    const sourceArtifactId = "assistant-python-analysis:source-nested";
+    const { artifacts, resolver } = await fixture({
+      chartContent: {
+        ...visualizationSpec({
+          mode: "artifact",
+          artifactId: sourceArtifactId,
+          expectedSchema: {
+            "最新风险五级分类": "unknown",
+            "笔数": "unknown",
+            "贷款余额(万元)": "unknown",
+          },
+        }),
+        type: "horizontal_bar",
+        dimensions: [{ field: "最新风险五级分类", dataType: "category", role: "category" }],
+        measures: [{ field: "贷款余额(万元)", dataType: "number", role: "value" }],
+        encoding: { category: "最新风险五级分类", value: "贷款余额(万元)" },
+      },
+      sourceArtifactIds: [sourceArtifactId],
+    });
+    await artifacts.createArtifact({
+      artifactId: sourceArtifactId,
+      artifactType: "analysis",
+      contentType: "json",
+      content: JSON.stringify({
+        stdout: JSON.stringify({
+          totals: { count: 10, loanBalance: 25000 },
+          fiveLevelDistribution: [
+            { category: "正常", count: 8, countRate: 0.8, loanBalance: 20000, amountRate: 0.8 },
+            { category: "关注", count: 2, countRate: 0.2, loanBalance: 5000, amountRate: 0.2 },
+          ],
+          riskResultDistribution: [
+            { category: "0101--正常1", count: 8, countRate: 0.8, loanBalance: 20000, amountRate: 0.8 },
+          ],
+        }),
+        stderr: null,
+      }),
+    });
+
+    const result = await resolver.resolve({
+      conversationId,
+      reportArtifactId,
+      reportVersion,
+      visualizationArtifactId: chartArtifactId,
+    });
+
+    expect(result.data).toMatchObject({
+      rowCount: 2,
+      rows: [
+        { "最新风险五级分类": "正常", "笔数": 8, "贷款余额(万元)": 20000 },
+        { "最新风险五级分类": "关注", "笔数": 2, "贷款余额(万元)": 5000 },
+      ],
+    });
+
+    const sourceArtifact = await artifacts.getArtifact(sourceArtifactId);
+    const chartArtifact = await artifacts.getArtifact(chartArtifactId);
+    const materialized = materializeStructuredVisualizationSpec(
+      chartArtifact?.content as VisualizationSpec,
+      sourceArtifact as ArtifactRecord,
+    );
+    expect(materialized).toMatchObject({
+      data: {
+        mode: "inline",
+        trusted: true,
+        rowCount: 2,
+        rows: [
+          { "最新风险五级分类": "正常", "笔数": 8, "贷款余额(万元)": 20000 },
+          { "最新风险五级分类": "关注", "笔数": 2, "贷款余额(万元)": 5000 },
+        ],
+      },
+      metadata: { materializedFromArtifactId: sourceArtifactId },
+    });
   });
 });

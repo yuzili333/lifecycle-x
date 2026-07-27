@@ -168,14 +168,6 @@ export const BUILTIN_BUSINESS_FIELDS: BusinessFieldDefinition[] = [
   },
 ];
 
-export const OVERALL_RISK_REQUIRED_FIELDS = [
-  { semantic: "contract_id", businessFieldId: "bf.loan_contract.contract_serial", compatibleBusinessFieldIds: ["bf.loan_contract.contract_no", "credit.contract_id"], displayNameZh: "合同流水号", required: true },
-  { semantic: "five_level_classification", businessFieldId: "bf.loan_contract.latest_risk", compatibleBusinessFieldIds: ["bf.loan_contract.latest_five_level_risk", "credit.five_level_classification"], displayNameZh: "最新风险分类", required: true },
-  { semantic: "twelve_level_classification", businessFieldId: "bf.loan_contract.latest_risk_result", compatibleBusinessFieldIds: ["bf.loan_contract.year_start_risk_detail", "credit.twelve_level_classification"], displayNameZh: "最新风险分类结果", required: false },
-  { semantic: "loan_balance", businessFieldId: "bf.loan_contract.loan_balance_10k", compatibleBusinessFieldIds: ["credit.loan_balance"], displayNameZh: "贷款余额(万元)", required: true },
-  { semantic: "contract_amount", businessFieldId: "bf.loan_contract.contract_amount_10k", compatibleBusinessFieldIds: ["credit.contract_amount"], displayNameZh: "合同金额(万元)", required: false },
-] as const;
-
 const REQUIRED_DICTIONARY_COLUMNS = [
   "field_order",
   "field_name_zh",

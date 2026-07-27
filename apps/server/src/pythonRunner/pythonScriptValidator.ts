@@ -212,9 +212,71 @@ function detectOutputs(script: string) {
 }
 
 function hasObviousSyntaxFailure(script: string) {
-  const opens = (script.match(/\(/g) ?? []).length;
-  const closes = (script.match(/\)/g) ?? []).length;
-  return opens !== closes;
+  if (
+    /^\s*<(?:script|python|code)(?:\s[^>]*)?>/i.test(script) ||
+    /<\/(?:script|python|code)>\s*$/i.test(script) ||
+    /^\s*```(?:python|py)?\b/i.test(script) ||
+    /```\s*$/.test(script)
+  ) {
+    return true;
+  }
+  return hasUnbalancedPythonDelimiters(script);
+}
+
+function hasUnbalancedPythonDelimiters(script: string) {
+  const pairs: Record<string, string> = { ")": "(", "]": "[", "}": "{" };
+  const stack: string[] = [];
+  let quote: "'" | "\"" | "'''" | "\"\"\"" | null = null;
+  let escaped = false;
+
+  for (let index = 0; index < script.length; index += 1) {
+    const char = script[index];
+    if (quote) {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (char === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (quote.length === 3) {
+        if (script.slice(index, index + 3) === quote) {
+          index += 2;
+          quote = null;
+        }
+      } else if (char === quote) {
+        quote = null;
+      }
+      continue;
+    }
+
+    if (char === "#") {
+      const newline = script.indexOf("\n", index);
+      if (newline < 0) break;
+      index = newline;
+      continue;
+    }
+    if (char === "'" || char === "\"") {
+      const triple = script.slice(index, index + 3);
+      if (triple === "'''" || triple === "\"\"\"") {
+        quote = triple;
+        index += 2;
+      } else {
+        quote = char;
+      }
+      continue;
+    }
+    if (char === "(" || char === "[" || char === "{") {
+      stack.push(char);
+      continue;
+    }
+    const expected = pairs[char];
+    if (expected && stack.pop() !== expected) {
+      return true;
+    }
+  }
+  return quote !== null || stack.length > 0;
 }
 
 function result(

@@ -9,8 +9,8 @@ import {
   type ChatToolSkillOption,
 } from "../renderer/src/chat-tool-selector";
 
-const skills: Array<ChatToolSkillOption<"overall-risk-classification-distribution">> = [
-  { label: "整体风险分类分布（笔数+金额）", value: "overall-risk-classification-distribution" },
+const skills: Array<ChatToolSkillOption<"sample-analysis">> = [
+  { label: "样本分析", value: "sample-analysis", keywords: ["合同"] },
 ];
 
 const dataSources: ChatToolDataSourceOption[] = [
@@ -107,9 +107,10 @@ describe("chat tool selector sections", () => {
   });
 
   it("searches skills and data sources while preferring skill section ordering", () => {
-    const sections = buildChatToolSelectorSections({ query: "整体", skills, dataSources });
+    const sections = buildChatToolSelectorSections({ query: "样本", skills, dataSources });
     expect(sections.map((section) => section.id)).toEqual(["skill"]);
-    expect(sections[0].items[0]).toMatchObject({ type: "skill", value: "overall-risk-classification-distribution" });
+    expect(sections[0].items[0]).toMatchObject({ type: "skill", value: "sample-analysis" });
+    expect(buildChatToolSelectorSections({ query: "合同", skills, dataSources })[0].id).toBe("skill");
 
     const dataSourceSections = buildChatToolSelectorSections({ query: "loan_contracts", skills, dataSources });
     expect(dataSourceSections.map((section) => section.id)).toEqual(["data_source"]);
@@ -120,7 +121,7 @@ describe("chat tool selector sections", () => {
     const sections = buildChatToolSelectorSections({
       skills,
       dataSources: [{ ...dataSources[0], isSelected: true }],
-      selectedSkill: "overall-risk-classification-distribution",
+      selectedSkill: "sample-analysis",
     });
 
     expect(sections.find((section) => section.id === "skill")?.items[0]).toMatchObject({ isSelected: true });

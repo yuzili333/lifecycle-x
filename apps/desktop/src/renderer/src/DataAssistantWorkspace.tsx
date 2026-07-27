@@ -94,6 +94,7 @@ import type { AgentGuidance, AgentGuidanceAction } from "../../main/agentGuidanc
 import type { ArtifactRecord, ConversationToolState, ToolCallRecord } from "../../main/toolOrchestration";
 import type { WorkflowContextSummary } from "../../main/workflowRuntime";
 import type { AgentProgressEvent, AgentRunRecord } from "../../main/agentOrchestration";
+import type { SkillSummary } from "../../shared/skills";
 
 type RequestWithRefresh = <T extends { success: true }>(
   call: (accessToken: string) => Promise<ApiResult<T>>,
@@ -107,6 +108,7 @@ type DataAssistantWorkspaceProps = {
   thinkingOptimizationEnabled: boolean;
   isModelConfigured: boolean;
   canReadDataSources: boolean;
+  skills: SkillSummary[];
   requestWithRefresh: RequestWithRefresh;
   onRequireModelConfig: () => void;
 };
@@ -115,10 +117,6 @@ const approvalOptions: Array<{ label: string; value: AssistantApprovalMode }> = 
   { label: "请求批准", value: "request_approval" },
   { label: "完全访问权限", value: "full_access" },
   { label: "禁止访问权限", value: "no_access" },
-];
-
-const skillOptions: Array<{ label: string; value: AssistantSkill }> = [
-  { label: "整体风险分类分布（笔数+金额）", value: "overall-risk-classification-distribution" },
 ];
 
 const ARTIFACT_WINDOW_STATE_KEY = "cycle-probe:assistant:artifact-window";
@@ -158,6 +156,7 @@ type MessageDeltaStreamEvent = Extract<AssistantStreamEvent, { type: "message-de
 type ContextTokenInput = {
   files?: string[];
   skill?: AssistantSkill | null;
+  skills?: Array<{ label: string; value: AssistantSkill }>;
   dataSourceLabel?: string | null;
 };
 
@@ -254,11 +253,14 @@ function dataSourceLabel(dataSource?: DataSourceSummary) {
   return `${dataSource.name} / ${dataSource.database}`;
 }
 
-function skillLabel(skill?: AssistantSkill | null) {
+function skillLabel(
+  skill?: AssistantSkill | null,
+  skills: Array<{ label: string; value: AssistantSkill }> = [],
+) {
   if (!skill) {
     return "";
   }
-  return skillOptions.find((item) => item.value === skill)?.label ?? skill;
+  return skills.find((item) => item.value === skill)?.label ?? skill;
 }
 
 function contextTokenValue(kind: "file" | "skill" | "data_source", index: number) {
@@ -294,7 +296,7 @@ function buildContextTokenDisplay(input: ContextTokenInput): ContextTokenDisplay
     values.push(value);
     tokens.push({
       value,
-      label: `@${skillLabel(input.skill)}`,
+      label: `@${skillLabel(input.skill, input.skills)}`,
       variant: "purple",
     });
   }
@@ -1338,6 +1340,7 @@ export function DataAssistantWorkspace({
   thinkingOptimizationEnabled,
   isModelConfigured,
   canReadDataSources,
+  skills,
   requestWithRefresh,
   onRequireModelConfig,
 }: DataAssistantWorkspaceProps) {
@@ -1372,6 +1375,21 @@ export function DataAssistantWorkspace({
   const [isLoadingDataSources, setIsLoadingDataSources] = useState(false);
   const [isLoadingConversations, setIsLoadingConversations] = useState(false);
   const [metadataNow, setMetadataNow] = useState(() => Date.now());
+  const skillOptions = useMemo(
+    () => skills.map((skill) => ({
+      label: skill.displayName,
+      value: skill.skillId as AssistantSkill,
+      description: skill.description,
+      keywords: skill.keywords,
+    })),
+    [skills],
+  );
+
+  useEffect(() => {
+    if (selectedSkill && !skillOptions.some((skill) => skill.value === selectedSkill)) {
+      setSelectedSkill(null);
+    }
+  }, [selectedSkill, skillOptions]);
   const [editingConversation, setEditingConversation] = useState<AssistantConversation | null>(null);
   const [editTitleDraft, setEditTitleDraft] = useState("");
   const [deletingConversation, setDeletingConversation] = useState<AssistantConversation | null>(null);
@@ -1672,9 +1690,10 @@ export function DataAssistantWorkspace({
     () =>
       buildContextTokenDisplay({
         skill: selectedSkill,
+        skills: skillOptions,
         dataSourceLabel: selectedDataSource ? dataSourceLabel(selectedDataSource) : null,
       }),
-    [selectedDataSource, selectedSkill],
+    [selectedDataSource, selectedSkill, skillOptions],
   );
   const toolSelectorQuery = toolSelectorTrigger === "at_symbol" && toolMention ? toolMention.query : "";
   const toolDataSources = useMemo<ChatToolDataSourceOption[]>(
@@ -1704,7 +1723,7 @@ export function DataAssistantWorkspace({
         dataSources: toolDataSources,
         selectedSkill,
       }),
-    [selectedSkill, toolDataSources, toolSelectorQuery],
+    [selectedSkill, skillOptions, toolDataSources, toolSelectorQuery],
   );
 
   const upsertMessage = useCallback((conversationId: string, message: AssistantMessage) => {
@@ -2966,14 +2985,13 @@ export function DataAssistantWorkspace({
       if (!contextDataSource) {
         return null;
       }
-      const isOverallRiskSkill = contextSkill === "overall-risk-classification-distribution";
       const result = await requestWithRefresh((token) =>
         workbenchApi.schemaContext(token, {
           conversationId,
           question,
           dataSourceId: contextDataSource.id,
           skill: contextSkill,
-          purpose: isOverallRiskSkill ? "risk_analysis" : "data_exploration",
+          purpose: "data_exploration",
           maxChars: 120_000,
           maxColumnsPerTable: contextOverride?.maxColumnsPerTable ?? FULL_FIELD_CONTEXT_APPROVAL_THRESHOLD,
         }),
@@ -3203,7 +3221,7 @@ export function DataAssistantWorkspace({
           question,
           dataSourceId: dataSource.id,
           skill,
-          purpose: skill === "overall-risk-classification-distribution" ? "risk_analysis" : "data_exploration",
+          purpose: "data_exploration",
           maxChars: 120_000,
           maxColumnsPerTable: FULL_FIELD_CONTEXT_APPROVAL_THRESHOLD + 1,
         }),
@@ -3505,7 +3523,7 @@ export function DataAssistantWorkspace({
         {fileLabels.map((fileName) => (
           <Token key={`file:${fileName}`} label={`#${fileName}`} color="green" size="sm" />
         ))}
-        {skill && <Token label={`@${skillLabel(skill)}`} color="purple" size="sm" />}
+        {skill && <Token label={`@${skillLabel(skill, skillOptions)}`} color="purple" size="sm" />}
         {sourceLabel && <Token label={`#${sourceLabel}`} color="blue" size="sm" />}
       </HStack>
     );

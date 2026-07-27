@@ -172,7 +172,14 @@ export class AuthStore {
 
   settingsFor(userId: string) {
     const settings = this.settings.get(userId);
-    return settings ? structuredClone(settings) : null;
+    if (!settings) return null;
+    return structuredClone({
+      ...settings,
+      configuration: {
+        ...settings.configuration,
+        skillEnabled: true,
+      },
+    });
   }
 
   updateSettings(userId: string, patch: Partial<WorkbenchSettings>) {
@@ -184,7 +191,7 @@ export class AuthStore {
     const next: WorkbenchSettings = {
       general: { ...current.general, ...patch.general },
       appearance: { ...current.appearance, ...patch.appearance },
-      configuration: { ...current.configuration, ...patch.configuration },
+      configuration: { ...current.configuration, ...patch.configuration, skillEnabled: true },
       personalization: { ...current.personalization, ...patch.personalization },
     };
     this.settings.set(userId, next);
@@ -474,7 +481,7 @@ export class AuthStore {
           executionModelName: "",
           dualModelOrchestrationEnabled: true,
           apiKeyStatus: "not_configured",
-          skillEnabled: false,
+          skillEnabled: true,
           mcpEnabled: false,
         },
         personalization: {

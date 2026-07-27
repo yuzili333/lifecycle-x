@@ -373,26 +373,56 @@ function CircularChartView({ spec, data, theme }: { spec: VisualizationSpec; dat
   if (total <= 0) {
     return <div className="assistant-visualization-empty">当前图表没有可展示的数据。</div>;
   }
-  let angle = -90;
   const width = 680;
   const height = Math.max(260, spec.display?.height ?? 300);
   const centerX = 250;
   const centerY = height / 2;
   const radius = Math.min(108, height / 2 - 28);
   const innerRadius = spec.type === "donut" ? radius * 0.56 : 0;
+  let startAngle = -90;
+  const positionedSlices = slices.map((slice) => {
+    const ratio = slice.value / total;
+    const sweep = ratio * 360;
+    const start = startAngle;
+    const end = start + Math.min(sweep, 359.999);
+    const middle = start + sweep / 2;
+    startAngle += sweep;
+    return { ...slice, ratio, start, end, middle };
+  });
 
   return (
     <div className="assistant-visualization-circular" style={createChartStyle(theme)}>
       <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={spec.title}>
-        {slices.map((slice, index) => {
-          const sweep = (slice.value / total) * 360;
-          const end = angle + Math.min(sweep, 359.999);
-          const path = describeArc(centerX, centerY, radius, innerRadius, angle, end);
-          angle += sweep;
+        {positionedSlices.map((slice, index) => {
+          const path = describeArc(centerX, centerY, radius, innerRadius, slice.start, slice.end);
           return (
             <path key={`${slice.label}-${index}`} d={path} className="pie-slice" style={seriesStyle(index)}>
-              <title>{`${slice.label}: ${formatCell(slice.value)}（${formatPercentage(slice.value / total)}）`}</title>
+              <title>{`${slice.label}: ${formatCell(slice.value)}（${formatPercentage(slice.ratio)}）`}</title>
             </path>
+          );
+        })}
+        {positionedSlices.map((slice, index) => {
+          const connectorStart = polarPoint(centerX, centerY, radius * 0.86, slice.middle);
+          const connectorBend = polarPoint(centerX, centerY, radius + 9, slice.middle);
+          const labelPoint = polarPoint(centerX, centerY, radius + 32, slice.middle);
+          const onRight = Math.cos((slice.middle * Math.PI) / 180) >= 0;
+          const labelX = labelPoint.x + (onRight ? 5 : -5);
+          return (
+            <g key={`label-${slice.label}-${index}`} className="pie-slice-label">
+              <polyline
+                points={`${round(connectorStart.x)},${round(connectorStart.y)} ${round(connectorBend.x)},${round(connectorBend.y)} ${round(labelPoint.x)},${round(labelPoint.y)}`}
+                className="pie-label-line"
+              />
+              <text
+                x={round(labelX)}
+                y={round(labelPoint.y)}
+                textAnchor={onRight ? "start" : "end"}
+                dominantBaseline="middle"
+                className="pie-value-label"
+              >
+                {`${formatCell(slice.value)} · ${formatPercentage(slice.ratio)}`}
+              </text>
+            </g>
           );
         })}
         {spec.type === "donut" ? (
@@ -403,11 +433,11 @@ function CircularChartView({ spec, data, theme }: { spec: VisualizationSpec; dat
         ) : null}
       </svg>
       <ul className="assistant-visualization-circular-legend" aria-label="图例">
-        {slices.map((slice, index) => (
+        {positionedSlices.map((slice, index) => (
           <li key={`${slice.label}-${index}`} style={seriesStyle(index)}>
             <span className="assistant-visualization-legend-swatch" />
             <span>{slice.label}</span>
-            <strong>{formatPercentage(slice.value / total)}</strong>
+            <strong>{`${formatCell(slice.value)}（${formatPercentage(slice.ratio)}）`}</strong>
           </li>
         ))}
       </ul>

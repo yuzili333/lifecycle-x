@@ -45,7 +45,7 @@ describe("ChatTokenizedText context tokens", () => {
       <ChatTokenizedText
         tokens={[
           { value: "assistantfile0", label: "#loan_contracts.csv", variant: "green" },
-          { value: "assistantskill1", label: "@整体风险分类分布（笔数+金额）", variant: "purple" },
+          { value: "assistantskill1", label: "@样本分析", variant: "purple" },
           { value: "assistantdatasource2", label: "#loan_contracts", variant: "blue" },
         ]}
       >
@@ -54,7 +54,7 @@ describe("ChatTokenizedText context tokens", () => {
     );
 
     expect(html).toContain("#loan_contracts.csv");
-    expect(html).toContain("@整体风险分类分布（笔数+金额）");
+    expect(html).toContain("@样本分析");
     expect(html).toContain("#loan_contracts");
     expect(html).toContain("请生成报告");
     expect(html).not.toContain("assistantfile0");

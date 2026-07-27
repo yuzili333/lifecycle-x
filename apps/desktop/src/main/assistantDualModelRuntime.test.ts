@@ -48,6 +48,415 @@ describe("AssistantRuntime dual-model flow", () => {
     expect(resolveDefaultDataSourceAmbiguities(route, false)).toBe(route);
   });
 
+  it("sends an explicit report regeneration request to the model instead of stale guidance", async () => {
+    const temp = mkdtempSync(join(tmpdir(), "cycle-probe-report-regeneration-"));
+    const dbPath = join(temp, "assistant.sqlite");
+    const runtime = new AssistantRuntime({
+      dbPath,
+      csvSqlitePath: createCsvMetadataDatabase(temp),
+      toolLogPath: join(temp, "tools.jsonl"),
+      getModelApiKey: async () => "test-key",
+      emit: () => undefined,
+    });
+    const conversation = runtime.createConversation("user-1", "报告任务");
+    const now = new Date().toISOString();
+    const checkpoint = {
+      checkpointId: "checkpoint-stale-python-error",
+      workflowId: "workflow-stale-python-error",
+      conversationId: conversation.id,
+      status: "recoverable_error",
+      completedStepIds: [],
+      pendingStepIds: ["python_analysis"],
+      activeDatasetIds: [],
+      latestSuccessfulToolCallIds: { sql_query: "sql-previous" },
+      artifactIds: ["workflow-dataset:previous"],
+      pendingGuidance: {
+        guidanceId: "guidance-stale-python-error",
+        workflowId: "workflow-stale-python-error",
+        conversationId: conversation.id,
+        type: "tool_error",
+        title: "Python 分析执行失败",
+        message: "请补充信息后继续。",
+        requiredInputs: [],
+        actions: [],
+        blocking: true,
+        resumeToken: "resume-stale-python-error",
+        createdAt: now,
+      },
+      createdAt: now,
+      updatedAt: now,
+    };
+    const db = new Database(dbPath);
+    db.prepare(`
+      insert into agent_workflow_checkpoints
+        (checkpoint_id, workflow_id, conversation_id, status, checkpoint_json, created_at, updated_at)
+      values (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      checkpoint.checkpointId,
+      checkpoint.workflowId,
+      checkpoint.conversationId,
+      checkpoint.status,
+      JSON.stringify(checkpoint),
+      checkpoint.createdAt,
+      checkpoint.updatedAt,
+    );
+    db.close();
+
+    const requests: Array<Record<string, unknown>> = [];
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init?: RequestInit) => {
+      requests.push(JSON.parse(String(init?.body ?? "{}")));
+      return toolCallResponse("plan-report-regeneration", "submit_agent_execution_plan", {
+        outcome: "respond",
+        summary: "已识别重新生成报告请求。",
+        responseText: "已根据当前会话历史识别重新生成报告任务。",
+        requestedOutputs: [],
+        steps: [],
+      });
+    }));
+
+    const result = await runtime.sendMessage({
+      userId: "user-1",
+      conversationId: conversation.id,
+      clientRequestId: "report-regeneration",
+      prompt: "重新生成报告",
+      modelName: "reasoning-model",
+      executionModelName: "execution-model",
+      dualModelOrchestrationEnabled: true,
+      approvalMode: "full_access",
+    });
+    const run = await waitForRun(runtime, "user-1", result.assistantMessage.id, "completed");
+    const message = runtime.getConversationMessages("user-1", conversation.id).at(-1);
+
+    expect(requests).toHaveLength(1);
+    expect(run.status).toBe("completed");
+    expect(message?.content).toBe("已根据当前会话历史识别重新生成报告任务。");
+    expect(message?.content).not.toContain("我没有识别到可以直接执行");
+  });
+
+  it("registers failed and blocked model-planned steps in tool_calls", async () => {
+    const temp = mkdtempSync(join(tmpdir(), "cycle-probe-terminal-tool-records-"));
+    const runtime = runtimeFor(temp, createCsvMetadataDatabase(temp));
+    const rawModelExplanation = "当前步骤需要先确认很多内部条件。".repeat(200);
+    const responses = [
+      toolCallResponse("plan-terminal-records", "submit_agent_execution_plan", {
+        outcome: "execute",
+        summary: "分析数据并生成报告。",
+        requestedOutputs: ["analysis", "report"],
+        steps: [
+          {
+            stepId: "analysis",
+            toolKind: "python_analysis",
+            purpose: "分析分类分布",
+            dependencies: [],
+            inputResolution: "conversation_history",
+            expectedOutput: "分析 Artifact",
+          },
+          {
+            stepId: "report",
+            toolKind: "report_generation",
+            purpose: "根据分析结果生成报告",
+            dependencies: ["analysis"],
+            inputResolution: "current_run",
+            expectedOutput: "Markdown 报告 Artifact",
+          },
+        ],
+      }),
+      nonStreamTextResponse(rawModelExplanation),
+    ];
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      const response = responses.shift();
+      if (!response) throw new Error("unexpected model request");
+      return response;
+    }));
+
+    const result = await runtime.sendMessage({
+      userId: "user-1",
+      clientRequestId: "terminal-tool-records",
+      prompt: "根据已有结果分析并生成报告",
+      modelName: "reasoning-model",
+      executionModelName: "execution-model",
+      dualModelOrchestrationEnabled: true,
+      approvalMode: "full_access",
+    });
+    const run = await waitForTerminalRun(runtime, "user-1", result.assistantMessage.id);
+    const records = (await runtime.listConversationToolCalls("user-1", result.conversation.id))
+      .filter((record) => record.messageId === result.assistantMessage.id);
+
+    expect(run.status).toBe("failed");
+    expect(records.map((record) => [record.toolKind, record.status])).toEqual([
+      ["python_analysis", "failed"],
+      ["report_generation", "blocked"],
+    ]);
+    expect(records[0].error?.message).toBe("Python 分析未返回可执行参数，步骤执行失败。");
+    expect(records[0].error?.message).not.toContain(rawModelExplanation.slice(0, 100));
+    expect(records[1].error?.message).toBe("生成报告因上游步骤 analysis 失败而未执行。");
+    expect(records.every((record) => record.metadata?.plannedByModel === true)).toBe(true);
+    const repeatedRecords = (await runtime.listConversationToolCalls("user-1", result.conversation.id))
+      .filter((record) => record.messageId === result.assistantMessage.id);
+    expect(repeatedRecords).toHaveLength(2);
+    const toolState = await runtime.getConversationToolState("user-1", result.conversation.id);
+    expect(toolState.toolCalls.filter((record) => record.messageId === result.assistantMessage.id)).toHaveLength(2);
+  });
+
+  it("continues report generation with a successful sibling chart when one chart step fails", async () => {
+    const temp = mkdtempSync(join(tmpdir(), "cycle-probe-optional-chart-report-"));
+    const runtime = runtimeFor(temp, createCsvMetadataDatabase(temp));
+    const responses = [
+      toolCallResponse("plan-optional-chart", "submit_agent_execution_plan", {
+        outcome: "execute",
+        summary: "查询、分析、绘图并生成报告。",
+        requestedOutputs: ["query", "analysis", "chart", "report"],
+        steps: [
+          {
+            stepId: "query",
+            toolKind: "sql_query",
+            purpose: "查询分类明细",
+            dependencies: [],
+            inputResolution: "selected_data_source",
+            expectedOutput: "查询 Artifact",
+          },
+          {
+            stepId: "analysis",
+            toolKind: "python_analysis",
+            purpose: "计算分类笔数",
+            dependencies: ["query"],
+            inputResolution: "current_run",
+            expectedOutput: "分析 Artifact",
+          },
+          {
+            stepId: "chart_count",
+            toolKind: "chart_rendering",
+            purpose: "绘制分类饼图",
+            dependencies: ["analysis"],
+            inputResolution: "current_run",
+            expectedOutput: "图表 Artifact",
+          },
+          {
+            stepId: "chart_balance",
+            toolKind: "chart_rendering",
+            purpose: "绘制贷款余额柱状图",
+            dependencies: ["analysis"],
+            inputResolution: "current_run",
+            expectedOutput: "图表 Artifact",
+          },
+          {
+            stepId: "report",
+            toolKind: "report_generation",
+            purpose: "生成分类分析报告",
+            dependencies: ["analysis", "chart_count", "chart_balance"],
+            inputResolution: "current_run",
+            expectedOutput: "Markdown 报告 Artifact",
+          },
+        ],
+      }),
+      nonStreamToolCallResponse("sql-optional-chart", "request_sql_query_execution", {
+        sql: "select '正常' as category, 10 as count",
+      }),
+      nonStreamToolCallResponse("python-optional-chart", "request_python_analysis_execution", {
+        script: "import json, sys\nrows = json.load(sys.stdin)\nprint(json.dumps(rows, ensure_ascii=False))",
+      }),
+      nonStreamTextResponse("工具 Schema 与饼图类型冲突，未返回工具调用。"),
+      nonStreamToolCallResponse("chart-balance", "request_chart_rendering", {
+        title: "最新风险五级分类贷款余额分布",
+        chartType: "bar",
+        dimensionFields: ["category"],
+        measureFields: ["count"],
+      }),
+      toolCallResponse("report-after-chart-failure", "request_markdown_report_generation", {
+        title: "分类分析报告",
+        markdown: [
+          "# 分类分析报告",
+          "",
+          "## 分析结果",
+          "",
+          "正常类共 10 笔。",
+          "",
+          "## 可视化图表",
+          "",
+          "```visualization",
+          JSON.stringify({ data: { mode: "artifact", artifactId: "stale-chart-artifact" } }),
+          "```",
+          "",
+          "## 分析结论",
+          "",
+          "样本以正常类为主。",
+        ].join("\n"),
+      }),
+    ];
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      const response = responses.shift();
+      if (!response) throw new Error("unexpected model request");
+      return response;
+    }));
+
+    const result = await runtime.sendMessage({
+      userId: "user-1",
+      clientRequestId: "optional-chart-report",
+      prompt: "分析分类数据，绘制饼图并生成报告",
+      modelName: "reasoning-model",
+      executionModelName: "execution-model",
+      dualModelOrchestrationEnabled: true,
+      dataSourceLabel: "测试数据源",
+      schemaContextMarkdown: "table test(category text, count integer)",
+      approvalMode: "full_access",
+    });
+    const run = await waitForRun(runtime, "user-1", result.assistantMessage.id, "partial");
+    const records = (await runtime.listConversationToolCalls("user-1", result.conversation.id))
+      .filter((record) => record.messageId === result.assistantMessage.id);
+    const chartRecord = records.find((record) => record.toolKind === "chart_rendering");
+    const reportRecord = records.find((record) => record.toolKind === "report_generation");
+    const reportArtifactId = reportRecord?.result?.primaryArtifactId ?? reportRecord?.outputArtifactIds?.[0];
+    const reportArtifact = reportArtifactId
+      ? await runtime.getConversationToolArtifact("user-1", result.conversation.id, reportArtifactId)
+      : null;
+
+    expect(run.completedStepIds).toEqual(["query", "analysis", "chart_balance", "report"]);
+    expect(run.failedStepIds).toEqual(["chart_count"]);
+    expect(chartRecord?.status).toBe("failed");
+    expect(reportRecord?.status).toBe("completed");
+    expect(reportArtifact?.content).toContain("正常类共 10 笔");
+    expect(reportArtifact?.content).not.toContain("stale-chart-artifact");
+    expect(reportArtifact?.content).toContain("assistant-chart-spec:chart-balance");
+    expect(reportArtifact?.content).toContain("## 可视化图表");
+    expect(responses).toHaveLength(0);
+  });
+
+  it("retries report parameter generation once after a provider failure", async () => {
+    const temp = mkdtempSync(join(tmpdir(), "cycle-probe-report-provider-retry-"));
+    const runtime = runtimeFor(temp, createCsvMetadataDatabase(temp));
+    const responses: Array<Response | Error> = [
+      toolCallResponse("plan-report-retry", "submit_agent_execution_plan", {
+        outcome: "execute",
+        summary: "查询并生成报告。",
+        requestedOutputs: ["query", "report"],
+        steps: [
+          {
+            stepId: "query",
+            toolKind: "sql_query",
+            purpose: "查询报告数据",
+            dependencies: [],
+            inputResolution: "selected_data_source",
+            expectedOutput: "查询 Artifact",
+          },
+          {
+            stepId: "report",
+            toolKind: "report_generation",
+            purpose: "生成分析报告",
+            dependencies: ["query"],
+            inputResolution: "current_run",
+            expectedOutput: "Markdown 报告 Artifact",
+          },
+        ],
+      }),
+      nonStreamToolCallResponse("sql-report-retry", "request_sql_query_execution", {
+        sql: "select '正常' as category, 10 as count",
+      }),
+      new Error("transient provider failure"),
+      new Error("transient provider failure after provider retry"),
+      toolCallResponse("report-retry-success", "request_markdown_report_generation", {
+        title: "分类分析报告",
+        markdown: "# 分类分析报告\n\n## 分析结果\n\n正常类共 10 笔。",
+      }),
+    ];
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      const response = responses.shift();
+      if (!response) throw new Error("unexpected model request");
+      if (response instanceof Error) throw response;
+      return response;
+    }));
+
+    const result = await runtime.sendMessage({
+      userId: "user-1",
+      clientRequestId: "report-provider-retry",
+      prompt: "查询并生成报告",
+      modelName: "reasoning-model",
+      executionModelName: "execution-model",
+      dualModelOrchestrationEnabled: true,
+      dataSourceLabel: "测试数据源",
+      schemaContextMarkdown: "table test(category text, count integer)",
+      approvalMode: "full_access",
+    });
+    const run = await waitForRun(runtime, "user-1", result.assistantMessage.id, "completed");
+    const records = (await runtime.listConversationToolCalls("user-1", result.conversation.id))
+      .filter((record) => record.messageId === result.assistantMessage.id);
+
+    expect(run.completedStepIds).toEqual(["query", "report"]);
+    expect(run.events).toContainEqual(expect.objectContaining({
+      phase: "fallback",
+      detail: expect.objectContaining({
+        fallbackReason: "report_provider_request_failed",
+        stepId: "report",
+      }),
+    }));
+    expect(records.find((record) => record.toolKind === "report_generation")?.status).toBe("completed");
+    expect(responses).toHaveLength(0);
+  });
+
+  it("preserves the provider error when the report retry also fails", async () => {
+    const temp = mkdtempSync(join(tmpdir(), "cycle-probe-report-provider-failed-"));
+    const runtime = runtimeFor(temp, createCsvMetadataDatabase(temp));
+    const responses: Array<Response | Error> = [
+      toolCallResponse("plan-report-failed", "submit_agent_execution_plan", {
+        outcome: "execute",
+        summary: "查询并生成报告。",
+        requestedOutputs: ["query", "report"],
+        steps: [
+          {
+            stepId: "query",
+            toolKind: "sql_query",
+            purpose: "查询报告数据",
+            dependencies: [],
+            inputResolution: "selected_data_source",
+            expectedOutput: "查询 Artifact",
+          },
+          {
+            stepId: "report",
+            toolKind: "report_generation",
+            purpose: "生成分析报告",
+            dependencies: ["query"],
+            inputResolution: "current_run",
+            expectedOutput: "Markdown 报告 Artifact",
+          },
+        ],
+      }),
+      nonStreamToolCallResponse("sql-report-failed", "request_sql_query_execution", {
+        sql: "select '正常' as category, 10 as count",
+      }),
+      new Error("first provider failure"),
+      new Error("first provider failure after provider retry"),
+      new Error("second provider failure"),
+      new Error("second provider failure after provider retry"),
+    ];
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      const response = responses.shift();
+      if (!response) throw new Error("unexpected model request");
+      if (response instanceof Error) throw response;
+      return response;
+    }));
+
+    const result = await runtime.sendMessage({
+      userId: "user-1",
+      clientRequestId: "report-provider-failed",
+      prompt: "查询并生成报告",
+      modelName: "reasoning-model",
+      executionModelName: "execution-model",
+      dualModelOrchestrationEnabled: true,
+      dataSourceLabel: "测试数据源",
+      schemaContextMarkdown: "table test(category text, count integer)",
+      approvalMode: "full_access",
+    });
+    const run = await waitForRun(runtime, "user-1", result.assistantMessage.id, "partial");
+    const records = (await runtime.listConversationToolCalls("user-1", result.conversation.id))
+      .filter((record) => record.messageId === result.assistantMessage.id);
+    const reportRecord = records.find((record) => record.toolKind === "report_generation");
+
+    expect(run.failedStepIds).toEqual(["report"]);
+    expect(reportRecord?.status).toBe("failed");
+    expect(reportRecord?.error?.message).toContain("模型流解析失败");
+    expect(reportRecord?.error?.message).not.toContain("未返回可执行参数");
+    expect(responses).toHaveLength(0);
+  });
+
   it("plans with the reasoning model and executes SQL with the execution model", async () => {
     const temp = mkdtempSync(join(tmpdir(), "cycle-probe-dual-model-"));
     const csvPath = join(temp, "csv.sqlite");
@@ -224,6 +633,184 @@ describe("AssistantRuntime dual-model flow", () => {
     const parameterLogs = logs.filter((log) => log.phase === "tool-parameter-validation");
     expect(parameterLogs.filter((log) => log.status === "success")).toHaveLength(3);
     expect(JSON.stringify(parameterLogs)).not.toContain("select 'A'");
+  });
+
+  it("repairs Python syntax once before creating or executing the tool call", async () => {
+    const temp = mkdtempSync(join(tmpdir(), "cycle-probe-dual-model-python-syntax-"));
+    const csvPath = createCsvMetadataDatabase(temp);
+    const toolLogPath = join(temp, "tools.jsonl");
+    const requests: Array<Record<string, unknown>> = [];
+    const responses = [
+      toolCallResponse("plan", "submit_agent_execution_plan", {
+        outcome: "execute",
+        summary: "查询并分析合同金额。",
+        requestedOutputs: ["query", "analysis"],
+        steps: [
+          {
+            stepId: "query",
+            toolKind: "sql_query",
+            purpose: "查询合同金额明细",
+            dependencies: [],
+            inputResolution: "selected_data_source",
+            expectedOutput: "查询 Artifact",
+          },
+          {
+            stepId: "analysis",
+            toolKind: "python_analysis",
+            purpose: "汇总合同金额",
+            dependencies: ["query"],
+            inputResolution: "current_run",
+            expectedOutput: "分析 Artifact",
+          },
+        ],
+      }),
+      nonStreamToolCallResponse("sql", "request_sql_query_execution", {
+        sql: "select 1 as \"合同金额(万元)\"",
+      }),
+      nonStreamToolCallResponse("python-invalid", "request_python_analysis_execution", {
+        script: "contract_amount_field = '合同金额(万元')\nprint(contract_amount_field)",
+      }),
+      nonStreamToolCallResponse("python-repaired", "request_python_analysis_execution", {
+        script: "import json, sys\nrows = json.load(sys.stdin)\nfield = '合同金额(万元)'\nprint(json.dumps({'total': sum(row.get(field, 0) for row in rows)}, ensure_ascii=False))",
+      }),
+    ];
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init?: RequestInit) => {
+      requests.push(JSON.parse(String(init?.body ?? "{}")));
+      const response = responses.shift();
+      if (!response) throw new Error("unexpected model request");
+      return response;
+    }));
+    const runtime = new AssistantRuntime({
+      dbPath: join(temp, "assistant.sqlite"),
+      csvSqlitePath: csvPath,
+      toolLogPath,
+      getModelApiKey: async () => "test-key",
+      emit: () => undefined,
+    });
+    const result = await runtime.sendMessage({
+      userId: "user-1",
+      clientRequestId: "python-syntax-repair",
+      prompt: "查询并汇总合同金额",
+      modelName: "reasoning-model",
+      executionModelName: "execution-model",
+      dualModelOrchestrationEnabled: true,
+      dataSourceLabel: "测试数据源",
+      schemaContextMarkdown: "table test(\"合同金额(万元)\" real)",
+      approvalMode: "full_access",
+    });
+
+    const run = await waitForRun(runtime, "user-1", result.assistantMessage.id, "completed");
+    expect(run.completedStepIds).toEqual(["query", "analysis"]);
+    expect(requests.map((request) => request.model)).toEqual([
+      "reasoning-model",
+      "execution-model",
+      "execution-model",
+      "execution-model",
+    ]);
+    expect(run.events).toContainEqual(expect.objectContaining({
+      phase: "fallback",
+      detail: expect.objectContaining({ fallbackReason: "python_syntax_preflight_failed" }),
+    }));
+    const logs = readFileSync(toolLogPath, "utf8").trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+    const pythonExecutionStarts = logs.filter((log) => log.kind === "python" && log.phase === "execution-start");
+    expect(pythonExecutionStarts).toHaveLength(1);
+    expect(JSON.stringify(pythonExecutionStarts)).not.toContain("合同金额(万元')");
+  });
+
+  it("repairs one Python Decimal runtime type error with the execution model", async () => {
+    const temp = mkdtempSync(join(tmpdir(), "cycle-probe-dual-model-python-decimal-"));
+    const csvPath = createCsvMetadataDatabase(temp);
+    const toolLogPath = join(temp, "tools.jsonl");
+    const requests: Array<Record<string, unknown>> = [];
+    const responses = [
+      toolCallResponse("plan", "submit_agent_execution_plan", {
+        outcome: "execute",
+        summary: "查询并汇总贷款余额。",
+        requestedOutputs: ["query", "analysis"],
+        steps: [
+          {
+            stepId: "query",
+            toolKind: "sql_query",
+            purpose: "查询贷款余额",
+            dependencies: [],
+            inputResolution: "selected_data_source",
+            expectedOutput: "查询 Artifact",
+          },
+          {
+            stepId: "analysis",
+            toolKind: "python_analysis",
+            purpose: "计算贷款余额占比",
+            dependencies: ["query"],
+            inputResolution: "current_run",
+            expectedOutput: "分析 Artifact",
+          },
+        ],
+      }),
+      nonStreamToolCallResponse("sql", "request_sql_query_execution", {
+        sql: "select 100 as \"贷款余额(万元)\"",
+      }),
+      nonStreamToolCallResponse("python-type-error", "request_python_analysis_execution", {
+        script: [
+          "import json, sys",
+          "from decimal import Decimal",
+          "rows = json.load(sys.stdin)",
+          "amount = float(rows[0]['贷款余额(万元)'])",
+          "total = Decimal('100')",
+          "print(amount / total)",
+        ].join("\n"),
+      }),
+      nonStreamToolCallResponse("python-repaired", "request_python_analysis_execution", {
+        script: [
+          "import json, sys",
+          "from decimal import Decimal",
+          "rows = json.load(sys.stdin)",
+          "amount = Decimal(str(rows[0]['贷款余额(万元)']))",
+          "total = Decimal('100')",
+          "print(json.dumps({'amountRate': float(amount / total)}, ensure_ascii=False))",
+        ].join("\n"),
+      }),
+    ];
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init?: RequestInit) => {
+      requests.push(JSON.parse(String(init?.body ?? "{}")));
+      const response = responses.shift();
+      if (!response) throw new Error("unexpected model request");
+      return response;
+    }));
+    const runtime = new AssistantRuntime({
+      dbPath: join(temp, "assistant.sqlite"),
+      csvSqlitePath: csvPath,
+      toolLogPath,
+      getModelApiKey: async () => "test-key",
+      emit: () => undefined,
+    });
+    const result = await runtime.sendMessage({
+      userId: "user-1",
+      clientRequestId: "python-decimal-repair",
+      prompt: "查询并分析贷款余额占比",
+      modelName: "reasoning-model",
+      executionModelName: "execution-model",
+      dualModelOrchestrationEnabled: true,
+      dataSourceLabel: "测试数据源",
+      schemaContextMarkdown: "table test(\"贷款余额(万元)\" real)",
+      approvalMode: "full_access",
+    });
+
+    const run = await waitForRun(runtime, "user-1", result.assistantMessage.id, "completed");
+    expect(run.completedStepIds).toEqual(["query", "analysis"]);
+    expect(requests.map((request) => request.model)).toEqual([
+      "reasoning-model",
+      "execution-model",
+      "execution-model",
+      "execution-model",
+    ]);
+    expect(run.events).toContainEqual(expect.objectContaining({
+      phase: "fallback",
+      detail: expect.objectContaining({ fallbackReason: "python_runtime_error" }),
+    }));
+    const logs = readFileSync(toolLogPath, "utf8").trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(logs.filter((log) => log.kind === "python" && log.phase === "execution-start")).toHaveLength(2);
+    expect(logs.filter((log) => log.kind === "python" && log.phase === "execution-error")).toHaveLength(1);
+    expect(logs.filter((log) => log.kind === "python" && log.phase === "execution-complete")).toHaveLength(1);
   });
 
   it("returns the model text instead of creating a local fallback plan", async () => {
@@ -1111,6 +1698,16 @@ function nonStreamToolCallResponse(id: string, name: string, input: Record<strin
         tool_calls: [{ id, function: { name, arguments: JSON.stringify(input) } }],
       },
       finish_reason: "tool_calls",
+    }],
+    usage: { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 },
+  }), { status: 200, headers: { "content-type": "application/json" } });
+}
+
+function nonStreamTextResponse(content: string) {
+  return new Response(JSON.stringify({
+    choices: [{
+      message: { content },
+      finish_reason: "stop",
     }],
     usage: { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 },
   }), { status: 200, headers: { "content-type": "application/json" } });

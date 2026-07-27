@@ -11,7 +11,6 @@ import {
   type DataSourceRef,
 } from "./schemaContext/index.js";
 import {
-  OVERALL_RISK_REQUIRED_FIELDS,
   convertCsvValue,
   parseCsvDictionary,
   validateCsvRows,
@@ -1494,71 +1493,6 @@ export class DataManagementStore {
         })),
     );
     return candidates.length === 1 ? candidates[0] : null;
-  }
-
-  resolveSkillFields(input: { skillId: string; dataSourceId: string; tableIds?: string[] }) {
-    const requirements = input.skillId === "overall-risk-classification-distribution" ? OVERALL_RISK_REQUIRED_FIELDS : [];
-    const tables = this.listTables(input.dataSourceId).filter((table) => !input.tableIds || input.tableIds.includes(table.id));
-    const resolvedFields: Array<{
-      businessFieldId: string;
-      displayNameZh: string;
-      tableId: string;
-      physicalTableName: string;
-      physicalName: string;
-      required: boolean;
-    }> = [];
-    const missingRequiredFields: Array<{ businessFieldId: string; displayNameZh: string }> = [];
-    const ambiguousFields: Array<{ businessFieldId: string; candidates: NonNullable<ReturnType<DataManagementStore["resolveBusinessField"]>>[] }> = [];
-
-    for (const requirement of requirements) {
-      const acceptableBusinessFieldIds: string[] = [requirement.businessFieldId, ...("compatibleBusinessFieldIds" in requirement ? requirement.compatibleBusinessFieldIds : [])];
-      const candidates = tables.flatMap((table) =>
-        table.columns
-          .filter((column) => column.businessFieldId && acceptableBusinessFieldIds.includes(column.businessFieldId))
-          .map((column) => ({
-            tableId: table.id,
-            physicalTableName: table.name,
-            businessFieldId: column.businessFieldId ?? requirement.businessFieldId,
-            displayNameZh: column.displayNameZh ?? requirement.displayNameZh,
-            physicalName: column.physicalName ?? column.name,
-            logicalType: column.logicalType ?? "unknown",
-            sqliteType: column.sqliteType ?? sqliteTypeForColumn(column),
-            mappingSource: column.mappingSource ?? "inferred",
-            mappingConfidence: column.mappingConfidence,
-            mappingStatus: column.mappingStatus ?? "suggested",
-          })),
-      ).sort((left, right) => {
-        const leftRank = left.businessFieldId === requirement.businessFieldId ? 0 : acceptableBusinessFieldIds.indexOf(left.businessFieldId);
-        const rightRank = right.businessFieldId === requirement.businessFieldId ? 0 : acceptableBusinessFieldIds.indexOf(right.businessFieldId);
-        return leftRank - rightRank;
-      });
-      const bestRank = candidates.length > 0 ? acceptableBusinessFieldIds.indexOf(candidates[0].businessFieldId) : -1;
-      const bestCandidates = bestRank >= 0 ? candidates.filter((candidate) => acceptableBusinessFieldIds.indexOf(candidate.businessFieldId) === bestRank) : [];
-      if (bestCandidates.length === 1) {
-        const candidate = bestCandidates[0];
-        resolvedFields.push({
-          businessFieldId: candidate.businessFieldId,
-          displayNameZh: candidate.displayNameZh,
-          tableId: candidate.tableId,
-          physicalTableName: candidate.physicalTableName,
-          physicalName: candidate.physicalName,
-          required: requirement.required,
-        });
-      } else if (bestCandidates.length > 1) {
-        ambiguousFields.push({ businessFieldId: requirement.businessFieldId, candidates: bestCandidates });
-      } else if (requirement.required) {
-        missingRequiredFields.push({ businessFieldId: requirement.businessFieldId, displayNameZh: requirement.displayNameZh });
-      }
-    }
-
-    return {
-      skillId: input.skillId,
-      dataSourceId: input.dataSourceId,
-      resolvedFields,
-      missingRequiredFields,
-      ambiguousFields,
-      ready: missingRequiredFields.length === 0 && ambiguousFields.length === 0,
-    };
   }
 
   private appendQueryAudit(log: Omit<QueryAuditLog, "id" | "createdAt">) {

@@ -186,41 +186,6 @@ describe("DataManagementStore", () => {
     }
   });
 
-  it("resolves overall risk skill fields from uploaded loan contract dictionary ids", () => {
-    const store = new DataManagementStore();
-    const upload = store.uploadCsv(
-      "loan_contracts_standardized.csv",
-      [
-        "contract_serial,latest_risk,latest_five_level_risk,latest_risk_result,loan_balance_10k,contract_amount_10k",
-        "C001,正常,正常,0101--正常1,1250.5,1600",
-        "C002,不良,关注,0203--关注3,300,500",
-      ].join("\n"),
-    );
-    const imported = importCsvWithDictionary(store, upload.file.id, "usr_admin", [
-      { source: "contract_serial", zh: "合同流水号", en: "contract_serial", businessId: "bf.loan_contract.contract_serial", logical: "identifier", sqlite: "TEXT", nullable: false, unique: true, primary: true },
-      { source: "latest_risk", zh: "最新风险分类", en: "latest_risk", businessId: "bf.loan_contract.latest_risk", logical: "enum", sqlite: "TEXT", nullable: false },
-      { source: "latest_five_level_risk", zh: "最新风险五级分类", en: "latest_five_level_risk", businessId: "bf.loan_contract.latest_five_level_risk", logical: "enum", sqlite: "TEXT", nullable: false },
-      { source: "latest_risk_result", zh: "最新风险分类结果", en: "latest_risk_result", businessId: "bf.loan_contract.latest_risk_result", logical: "enum", sqlite: "TEXT" },
-      { source: "loan_balance_10k", zh: "贷款余额(万元)", en: "loan_balance_10k", businessId: "bf.loan_contract.loan_balance_10k", logical: "amount", sqlite: "NUMERIC", nullable: false },
-      { source: "contract_amount_10k", zh: "合同金额(万元)", en: "contract_amount_10k", businessId: "bf.loan_contract.contract_amount_10k", logical: "amount", sqlite: "NUMERIC" },
-    ]);
-    const resolved = store.resolveSkillFields({
-      skillId: "overall-risk-classification-distribution",
-      dataSourceId: imported.job.dataSourceId,
-    });
-
-    expect(resolved.ready).toBe(true);
-    expect(resolved.missingRequiredFields).toEqual([]);
-    expect(resolved.ambiguousFields).toEqual([]);
-    expect(Object.fromEntries(resolved.resolvedFields.map((field) => [field.businessFieldId, field.physicalName]))).toMatchObject({
-      "bf.loan_contract.contract_serial": "contract_serial",
-      "bf.loan_contract.latest_risk": "latest_risk",
-      "bf.loan_contract.latest_risk_result": "latest_risk_result",
-      "bf.loan_contract.loan_balance_10k": "loan_balance_10k",
-      "bf.loan_contract.contract_amount_10k": "contract_amount_10k",
-    });
-  });
-
   it("keeps previous CSV table names as SQL aliases after rename", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lifecycle-x-csv-alias-"));
     const storePath = join(tempDir, "data-management-store.json");

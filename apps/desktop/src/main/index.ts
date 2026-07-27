@@ -1,10 +1,13 @@
-import { app, BrowserWindow, Menu, ipcMain, nativeImage, safeStorage, shell, type MenuItemConstructorOptions } from "electron";
+import { app, BrowserWindow, Menu, dialog, ipcMain, nativeImage, safeStorage, shell, type MenuItemConstructorOptions } from "electron";
+import { randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import defaultDockIconPath from "../../build/icon.png?asset";
 import type { DataSourceMenuAction } from "../preload";
+import type { SkillIpcResult, SkillOperation } from "../shared/skills";
 import { AssistantRuntime, type AssistantStreamEvent } from "./assistantRuntime";
+import { asSkillOperationError, LocalSkillManager } from "./skills";
 
 const isMac = process.platform === "darwin";
 const secretStoreFileName = "cycle-probe-secrets.json";
@@ -12,6 +15,7 @@ let refreshToken: string | null = null;
 
 let currentDockIcon = nativeImage.createFromPath(defaultDockIconPath);
 let assistantRuntime: AssistantRuntime | null = null;
+let localSkillManager: LocalSkillManager | null = null;
 
 const e2eCdpPort = (process.env.LIFECYCLE_X_E2E_CDP_PORT ?? (app.isPackaged ? "" : "9333")).trim();
 if (e2eCdpPort && /^\d{2,5}$/.test(e2eCdpPort)) {
@@ -94,9 +98,34 @@ function getAssistantRuntime() {
       toolLogPath: join(app.getPath("userData"), "cycle-probe-tool-calls.jsonl"),
       getModelApiKey: modelApiKeyForUser,
       emit: broadcastAssistantEvent,
+      loadSkill: (userId, skillId) => getLocalSkillManager().load(userId, skillId),
     });
   }
   return assistantRuntime;
+}
+
+function getLocalSkillManager() {
+  if (!localSkillManager) {
+    localSkillManager = new LocalSkillManager({
+      userDataRoot: app.getPath("userData"),
+    });
+  }
+  return localSkillManager;
+}
+
+async function runSkillOperation<T>(
+  operation: SkillOperation,
+  action: () => Promise<T>,
+): Promise<SkillIpcResult<T>> {
+  const traceId = randomUUID();
+  try {
+    return { success: true, data: await action() };
+  } catch (error) {
+    return {
+      success: false,
+      error: asSkillOperationError(error, operation, traceId),
+    };
+  }
 }
 
 function buildApplicationMenu() {
@@ -249,6 +278,27 @@ ipcMain.handle("model-api-key:set", async (_event, userId: string, apiKey: strin
   });
   return true;
 });
+
+ipcMain.handle("skill:list", (_event, userId: string) =>
+  runSkillOperation("list", () => getLocalSkillManager().list(userId)));
+ipcMain.handle("skill:pick-and-install", async (_event, userId: string) => {
+  const selected = await dialog.showOpenDialog({
+    title: "安装个人 Skill",
+    properties: ["openFile"],
+    filters: [{ name: "Skill 安装包", extensions: ["zip"] }],
+  });
+  if (selected.canceled || !selected.filePaths[0]) {
+    return { success: true, data: { status: "cancelled" } };
+  }
+  return runSkillOperation("install", () =>
+    getLocalSkillManager().install(userId, selected.filePaths[0]));
+});
+ipcMain.handle("skill:set-enabled", (_event, userId: string, skillId: string, enabled: boolean) =>
+  runSkillOperation("set_enabled", () =>
+    getLocalSkillManager().setEnabled(userId, skillId, enabled)));
+ipcMain.handle("skill:remove", (_event, userId: string, skillId: string) =>
+  runSkillOperation("remove", () =>
+    getLocalSkillManager().remove(userId, skillId)));
 ipcMain.handle("assistant:conversations:list", (_event, userId: string) => getAssistantRuntime().listConversations(userId));
 ipcMain.handle("assistant:conversation:create", (_event, userId: string, title?: string) => getAssistantRuntime().createConversation(userId, title));
 ipcMain.handle("assistant:conversation:rename", (_event, userId: string, conversationId: string, title: string) =>

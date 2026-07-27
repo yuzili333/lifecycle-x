@@ -593,11 +593,21 @@ export const TOOL_SCHEMAS: Record<ToolKind, JsonSchema> = {
       title: { type: "string", minLength: 1, description: "必填。图表标题。" },
       chartType: {
         type: "string",
-        enum: ["kpi", "line", "area", "bar", "horizontal_bar", "stacked_bar", "bar_line_combo", "scatter", "bubble", "heatmap", "histogram", "pareto", "funnel", "waterfall", "table"],
-        description: "图表类型。横向条形图使用 horizontal_bar；普通条形图/柱状图使用 bar；趋势使用 line 或 area。",
+        enum: ["kpi", "line", "area", "bar", "horizontal_bar", "stacked_bar", "bar_line_combo", "pie", "donut", "scatter", "bubble", "heatmap", "histogram", "pareto", "funnel", "waterfall", "table"],
+        description: "图表类型。饼图使用 pie；横向条形图使用 horizontal_bar；普通条形图/柱状图使用 bar；趋势使用 line 或 area。",
       },
       dimensionFields: { type: "array", items: { type: "string", minLength: 1 }, description: "图表维度字段或分析结果中的类别列，例如分组、分类、行业、分行等。" },
       measureFields: { type: "array", items: { type: "string", minLength: 1 }, description: "图表指标字段或分析结果中的数值列，例如数量、金额、占比、比率、百分率等。" },
+      dimensionLabels: {
+        type: "object",
+        additionalProperties: { type: "string", minLength: 1 },
+        description: "可选。维度字段到展示名称的映射，例如 category 映射为“最新风险五级分类”。键必须来自 dimensionFields。",
+      },
+      measureLabels: {
+        type: "object",
+        additionalProperties: { type: "string", minLength: 1 },
+        description: "可选。指标字段到展示名称的映射，例如 loanBalance 映射为“贷款余额（万元）”。键必须来自 measureFields。",
+      },
       sortBy: { type: "string", description: "排序字段，通常为主要指标字段。" },
       sortDirection: { type: "string", enum: ["asc", "desc"], description: "排序方向。降序使用 desc，升序使用 asc。" },
       colorBy: { type: "string", description: "颜色编码字段，可使用维度字段或指标字段。" },

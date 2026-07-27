@@ -268,11 +268,11 @@ describe("report markdown segment content", () => {
   });
 
   it("matches the confirmed report block by title instead of ordinary markdown", () => {
-    expect(isReportMarkdownContentBlock("# 普通 Markdown\n这段文字提到了报告。", "整体风险分类分布报告 v1")).toBe(false);
-    expect(isReportMarkdownContentBlock("# 整体风险分类分布报告 v1\n正文", "整体风险分类分布报告 v1")).toBe(true);
+    expect(isReportMarkdownContentBlock("# 普通 Markdown\n这段文字提到了报告。", "贷款组合分析报告 v1")).toBe(false);
+    expect(isReportMarkdownContentBlock("# 贷款组合分析报告 v1\n正文", "贷款组合分析报告 v1")).toBe(true);
     expect(reportMarkdownContentIndex([
       "# 普通 Markdown\n这段文字提到了报告。",
-      "# 整体风险分类分布报告 v1\n正文",
-    ], "整体风险分类分布报告 v1")).toBe(1);
+      "# 贷款组合分析报告 v1\n正文",
+    ], "贷款组合分析报告 v1")).toBe(1);
   });
 });

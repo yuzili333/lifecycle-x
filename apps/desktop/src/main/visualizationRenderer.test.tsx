@@ -219,8 +219,34 @@ describe("VisualizationRenderer", () => {
 
     expect(html).toContain(type === "pie" ? "饼图：分行风险数量" : "环形图：分行风险数量");
     expect(html).toContain("pie-slice");
+    expect(html).toContain("pie-value-label");
+    expect(html).toContain("120 · 52.17%");
+    expect(html).toContain("120（52.17%）");
     expect(html).toContain("assistant-visualization-circular-legend");
     expect(html).toContain("杭州分行");
     expect(html).not.toContain("Artifact");
+  });
+
+  it("renders a loan balance bar chart with a labeled numeric y-axis", () => {
+    const html = renderToString(<VisualizationRenderer spec={barSpec({
+      title: "最新风险五级分类贷款余额分布",
+      data: {
+        mode: "inline",
+        trusted: true,
+        rowCount: 2,
+        rows: [
+          { category: "正常", loanBalance: 12_000 },
+          { category: "关注", loanBalance: 6_000 },
+        ],
+      },
+      dimensions: [{ field: "category", label: "最新风险五级分类", dataType: "category", role: "x" }],
+      measures: [{ field: "loanBalance", label: "贷款余额（万元）", dataType: "number", role: "y" }],
+      encoding: { x: "category", y: ["loanBalance"] },
+    })} />);
+
+    expect(html).toContain("柱状图：最新风险五级分类贷款余额分布");
+    expect(html).toContain("贷款余额（万元）");
+    expect(html).toContain("class=\"axis-tick-label\"");
+    expect(html).toMatch(/>[\d,.万]+<\/text>/);
   });
 });

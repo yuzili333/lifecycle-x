@@ -156,6 +156,9 @@ export function transformToControlledEChartsOption(spec: VisualizationSpec, data
     xAxis: isCircular ? undefined : {
       type: spec.type === "horizontal_bar" ? "value" : "category",
       field: spec.type === "horizontal_bar" ? undefined : xField,
+      name: spec.type === "horizontal_bar"
+        ? labelForField(spec, yFields[0] ?? "value")
+        : labelForField(spec, xField ?? "category"),
       axisLine: { lineStyle: { color: theme.colors.border } },
       axisLabel: { color: theme.colors.textSecondary },
       splitLine: { lineStyle: { color: theme.colors.border } },
@@ -165,6 +168,9 @@ export function transformToControlledEChartsOption(spec: VisualizationSpec, data
       : {
           type: spec.type === "horizontal_bar" ? "category" : "value",
           field: spec.type === "horizontal_bar" ? xField : undefined,
+          name: spec.type === "horizontal_bar"
+            ? labelForField(spec, xField ?? "category")
+            : yFields.length === 1 ? labelForField(spec, yFields[0] ?? "value") : "数值",
           axisLine: { lineStyle: { color: theme.colors.border } },
           axisLabel: { color: theme.colors.textSecondary },
           splitLine: { lineStyle: { color: theme.colors.border } },
@@ -175,7 +181,11 @@ export function transformToControlledEChartsOption(spec: VisualizationSpec, data
       radius: spec.type === "donut" ? ["48%", "72%"] : "72%",
       encode: { itemName: xField, value: yFields[0] },
       itemStyle: { borderColor: theme.colors.background, borderWidth: 1 },
-      label: { color: theme.colors.textSecondary },
+      label: {
+        show: true,
+        color: theme.colors.textSecondary,
+        formatter: "{c}（{d}%）",
+      },
     }] : yFields.map((field, index) => ({
       name: labelForField(spec, field),
       type: seriesTypeFor(spec.type, index),

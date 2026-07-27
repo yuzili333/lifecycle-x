@@ -14,6 +14,12 @@ import type { WorkflowContextSummary, WorkflowDatasetRef } from "../main/workflo
 import type { ResolvedReportVisualizationArtifact } from "../shared/visualization";
 import type { ResolvedReportEvidenceCard } from "../shared/evidence";
 import type { AgentRunRecord } from "../main/agentOrchestration";
+import type {
+  SkillInstallResult,
+  SkillIpcResult,
+  SkillRemoveResult,
+  SkillSummary,
+} from "../shared/skills";
 
 export type DataSourceMenuAction = "open-database" | "open-csv" | "create-connection" | "import-csv";
 
@@ -28,6 +34,16 @@ const lifecycleXApi = {
   modelApiKey: {
     has: (userId: string) => ipcRenderer.invoke("model-api-key:has", userId) as Promise<boolean>,
     set: (userId: string, apiKey: string) => ipcRenderer.invoke("model-api-key:set", userId, apiKey) as Promise<boolean>,
+  },
+  skills: {
+    list: (userId: string) =>
+      ipcRenderer.invoke("skill:list", userId) as Promise<SkillIpcResult<SkillSummary[]>>,
+    pickAndInstall: (userId: string) =>
+      ipcRenderer.invoke("skill:pick-and-install", userId) as Promise<SkillIpcResult<SkillInstallResult>>,
+    setEnabled: (userId: string, skillId: string, enabled: boolean) =>
+      ipcRenderer.invoke("skill:set-enabled", userId, skillId, enabled) as Promise<SkillIpcResult<SkillSummary>>,
+    remove: (userId: string, skillId: string) =>
+      ipcRenderer.invoke("skill:remove", userId, skillId) as Promise<SkillIpcResult<SkillRemoveResult>>,
   },
   assistant: {
     listConversations: (userId: string) =>
