@@ -21,7 +21,7 @@ import type {
   SkillSummary,
 } from "../shared/skills";
 
-export type DataSourceMenuAction = "open-database" | "open-csv" | "create-connection" | "import-csv";
+export type DataSourceMenuAction = "open-database" | "create-connection";
 
 const lifecycleXApi = {
   getAppInfo: () => ipcRenderer.invoke("app:info"),

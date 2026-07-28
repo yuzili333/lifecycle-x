@@ -33,21 +33,32 @@ export function SkillManagementPanel({
   const personalSkills = skills.filter((skill) => skill.origin === "personal");
 
   const renderList = (items: SkillSummary[], origin: "system" | "personal") => (
-    <List density="balanced" hasDividers>
+    <List density="balanced" hasDividers className="skill-management-list">
       {items.map((skill) => (
         <ListItem
           key={`${skill.origin}:${skill.skillId}`}
           label={(
-            <HStack gap={2} vAlign="center">
-              <Text type="body">{skill.displayName}</Text>
-              <Text type="supporting" color="secondary">v{skill.version || "--"}</Text>
+            <HStack gap={2} vAlign="center" className="skill-management-item-heading">
+              <Text type="body" maxLines={1}>{skill.displayName}</Text>
+              <Text type="supporting" color="secondary" maxLines={1}>v{skill.version || "--"}</Text>
             </HStack>
           )}
-          description={skill.availability === "invalid" ? skill.error : skill.description}
+          description={(
+            <Text
+              type="supporting"
+              color="secondary"
+              display="block"
+              maxLines={2}
+              wordBreak="break-word"
+              className="skill-management-description"
+            >
+              {skill.availability === "invalid" ? skill.error : skill.description}
+            </Text>
+          )}
           endContent={origin === "system"
             ? <Text type="supporting" color="secondary">{skill.availability === "ready" ? "系统" : "无效"}</Text>
             : (
-              <HStack gap={2} vAlign="center">
+              <HStack gap={2} vAlign="center" className="skill-management-item-actions">
                 {skill.canToggle && (
                   <Switch
                     label={`${skill.enabled ? "停用" : "启用"} ${skill.displayName}`}

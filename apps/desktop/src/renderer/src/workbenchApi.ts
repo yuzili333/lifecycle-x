@@ -335,58 +335,6 @@ export const workbenchApi = {
     });
   },
 
-  uploadCsv(accessToken: string, name: string, content: string) {
-    return request<{ success: true; file: { id: string; name: string; size: number; createdAt: string } }>("/csv/files", {
-      method: "POST",
-      headers: authHeaders(accessToken),
-      body: JSON.stringify({ name, content }),
-    });
-  },
-
-  previewCsv(accessToken: string, fileId: string) {
-    return request<{
-      success: true;
-      preview: {
-        fileId: string;
-        headers: string[];
-        rows: Array<Record<string, string>>;
-        inferredColumns: Array<{ name: string; type: string; sensitive: boolean; csvInjectionRisk: boolean }>;
-      };
-    }>(`/csv/files/${encodeURIComponent(fileId)}/preview`, {
-      method: "POST",
-      headers: authHeaders(accessToken),
-    });
-  },
-
-  importCsv(accessToken: string, fileId: string, dictionaryFileId: string, validationMode: "strict" | "quarantine" = "strict") {
-    return request<{
-      success: true;
-      job: { id: string; status: "completed" | "completed_with_warnings"; importedTableId: string; dataSourceId: string; importedRows: number; invalidRows?: number };
-    }>(`/csv/files/${encodeURIComponent(fileId)}/import`, {
-      method: "POST",
-      headers: authHeaders(accessToken),
-      body: JSON.stringify({ dictionaryFileId, validationMode }),
-    });
-  },
-
-  deleteCsvDataSource(accessToken: string, dataSourceId: string) {
-    return request<{ success: true; dataSourceId: string }>(
-      `/csv/data-sources/${encodeURIComponent(dataSourceId)}/delete`,
-      { method: "POST", headers: authHeaders(accessToken) },
-    );
-  },
-
-  renameCsvDataSource(accessToken: string, dataSourceId: string, name: string) {
-    return request<{ success: true; dataSource: DataSourceSummary; table: DatabaseTable | null }>(
-      `/csv/data-sources/${encodeURIComponent(dataSourceId)}/rename`,
-      {
-        method: "POST",
-        headers: authHeaders(accessToken),
-        body: JSON.stringify({ name }),
-      },
-    );
-  },
-
   schemaContext(accessToken: string, query: SchemaContextQuery) {
     const params = new URLSearchParams();
     if (query.conversationId) {

@@ -142,14 +142,9 @@ function buildApplicationMenu() {
       label: "Data Source",
       submenu: [
         {
-          label: "New Connection",
+          label: "连接数据库",
           accelerator: "CommandOrControl+Shift+N",
           click: () => sendDataSourceAction("create-connection"),
-        },
-        {
-          label: "Import CSV",
-          accelerator: "CommandOrControl+Shift+I",
-          click: () => sendDataSourceAction("import-csv"),
         },
       ],
     },

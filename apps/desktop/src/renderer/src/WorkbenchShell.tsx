@@ -3,29 +3,36 @@ import { AppShell } from "@astryxdesign/core/AppShell";
 import { Avatar } from "@astryxdesign/core/Avatar";
 import { Button } from "@astryxdesign/core/Button";
 import { Dialog } from "@astryxdesign/core/Dialog";
+import { DropdownMenu, type DropdownMenuOption } from "@astryxdesign/core/DropdownMenu";
 import { HStack, VStack } from "@astryxdesign/core/Layout";
 import { Section } from "@astryxdesign/core/Section";
 import { Selector } from "@astryxdesign/core/Selector";
+import { SideNav, SideNavHeading, SideNavItem, SideNavSection } from "@astryxdesign/core/SideNav";
 import { Slider } from "@astryxdesign/core/Slider";
 import { Switch } from "@astryxdesign/core/Switch";
 import { Text } from "@astryxdesign/core/Text";
 import { TextInput } from "@astryxdesign/core/TextInput";
-import { TopNav, TopNavHeading, TopNavItem, TopNavMenu } from "@astryxdesign/core/TopNav";
-import { UserCog } from "lucide-react";
+import { DatabasePlus, Ellipsis, LogOut, MessageCirclePlus, Pencil, Settings, Trash2 } from "lucide-react";
 import type { AuthFailure } from "./auth";
-import { DataAssistantWorkspace } from "./DataAssistantWorkspace";
+import {
+  DataAssistantWorkspace,
+  type AssistantNavigationSnapshot,
+  type DataAssistantWorkspaceHandle,
+} from "./DataAssistantWorkspace";
 import { DataManagementWorkspace } from "./DataManagementWorkspace";
 import { SkillManagementPanel } from "./SkillManagementPanel";
 import { useAppToast } from "./useAppToast";
 import type { useAuthStore } from "./useAuthStore";
-import aiIcon from "./assets/ai.svg";
-import dockIconDark512 from "./assets/cycle_probe_docker_icon_dark_512.png";
-import dockIconLight512 from "./assets/cycle_probe_docker_icon_light_512.png";
-import csvIcon from "./assets/csv.svg";
-import databaseIcon from "./assets/database.svg";
 import { workbenchApi, type ApiResult, type UserProfile, type WorkbenchSettings } from "./workbenchApi";
 import type { DataSourceMenuAction } from "../../preload";
 import type { SkillSummary } from "../../shared/skills";
+import {
+  WORKBENCH_ROUTE_HASH,
+  canAccessWorkbenchRoute,
+  fallbackWorkbenchRoute,
+  parseWorkbenchRoute,
+  type WorkbenchRoute,
+} from "./workbench-route";
 
 type WorkbenchAuth = ReturnType<typeof useAuthStore>;
 
@@ -34,12 +41,12 @@ type WorkbenchShellProps = {
   runtimeLabel: string;
 };
 
-type WorkbenchModule = "data-assistant" | "data-management";
-type SettingsTab = "profile" | "appearance" | "skills" | "agent" | "logout";
+type SettingsTab = "profile" | "appearance" | "skills" | "agent";
 type SessionExpiredPromptPhase = "idle" | "prompting" | "logging-out" | "handled";
+type PendingAssistantNavigationAction =
+  | { type: "start" }
+  | { type: "select" | "rename" | "delete"; conversationId: string };
 
-const DEFAULT_WORKBENCH_MODULE: WorkbenchModule = "data-assistant";
-const WORKBENCH_NAV_CACHE_KEY_PREFIX = "cycle-probe:workbench:last-module";
 const WORKBENCH_SETTINGS_CACHE_KEY_PREFIX = "cycle-probe:workbench:settings";
 const MODEL_CONFIG_PROMPT_CACHE_KEY_PREFIX = "cycle-probe:workbench:model-config-prompted";
 const APP_THEME_MODE_CACHE_KEY = "cycle-probe:theme-mode";
@@ -100,63 +107,8 @@ const defaultSettings: WorkbenchSettings = {
   },
 };
 
-function isWorkbenchModule(value: string | null): value is WorkbenchModule {
-  return value === "data-assistant" || value === "data-management";
-}
-
-function canAccessWorkbenchModule(module: WorkbenchModule, permissions: string[]) {
-  if (module === "data-assistant") {
-    return permissions.includes("analysis:read");
-  }
-  return permissions.includes("datasource:read");
-}
-
-function fallbackWorkbenchModule(permissions: string[]): WorkbenchModule {
-  if (canAccessWorkbenchModule(DEFAULT_WORKBENCH_MODULE, permissions)) {
-    return DEFAULT_WORKBENCH_MODULE;
-  }
-  if (canAccessWorkbenchModule("data-management", permissions)) {
-    return "data-management";
-  }
-  return DEFAULT_WORKBENCH_MODULE;
-}
-
-function workbenchNavCacheKey(user: WorkbenchAuth["user"]) {
-  return `${WORKBENCH_NAV_CACHE_KEY_PREFIX}:${user?.id ?? "anonymous"}`;
-}
-
 function workbenchSettingsCacheKey(user: WorkbenchAuth["user"]) {
   return `${WORKBENCH_SETTINGS_CACHE_KEY_PREFIX}:${user?.id ?? "anonymous"}`;
-}
-
-function readCachedWorkbenchModule(user: WorkbenchAuth["user"], permissions: string[]): WorkbenchModule {
-  const fallback = fallbackWorkbenchModule(permissions);
-  if (typeof window === "undefined") {
-    return fallback;
-  }
-
-  try {
-    const cached = window.localStorage.getItem(workbenchNavCacheKey(user));
-    if (isWorkbenchModule(cached) && canAccessWorkbenchModule(cached, permissions)) {
-      return cached;
-    }
-  } catch {
-    return fallback;
-  }
-
-  return fallback;
-}
-
-function writeCachedWorkbenchModule(user: WorkbenchAuth["user"], module: WorkbenchModule) {
-  if (typeof window === "undefined") {
-    return;
-  }
-
-  try {
-    window.localStorage.setItem(workbenchNavCacheKey(user), module);
-  } catch {
-    // Ignore storage failures; navigation state still works in memory.
-  }
 }
 
 function modelConfigPromptCacheKey(user: WorkbenchAuth["user"]) {
@@ -298,13 +250,6 @@ function withLocalModelApiKeyStatus(settings: WorkbenchSettings, hasLocalApiKey:
   };
 }
 
-type AppIconVariant = WorkbenchSettings["appearance"]["dockIcon"];
-
-const appIconAssets: Record<AppIconVariant, string> = {
-  dark: dockIconDark512,
-  light: dockIconLight512,
-};
-
 async function hasLocalModelApiKey(user: WorkbenchAuth["user"]) {
   if (!user?.id || !window.lifecycleX?.modelApiKey) {
     return false;
@@ -322,7 +267,6 @@ const settingsTabs: Array<{ id: SettingsTab; label: string; description: string 
   { id: "appearance", label: "外观", description: "主题、颜色和字体" },
   { id: "skills", label: "技能", description: "系统与个人 Skill" },
   { id: "agent", label: "模型配置", description: "大模型和 API Key" },
-  { id: "logout", label: "退出登录", description: "结束当前登录态" },
 ];
 
 function isFailure<T extends { success: true }>(result: ApiResult<T>): result is AuthFailure {
@@ -358,8 +302,91 @@ function ReadOnlyField({ label, value }: { label: string; value: string }) {
   );
 }
 
-function NavAssetIcon({ src, size = "sm" }: { src: string; size?: "sm" | "lg" }) {
-  return <span className={`nav-asset-icon ${size === "lg" ? "nav-asset-icon-lg" : ""}`} style={{ "--nav-icon-url": `url(${src})` } as CSSProperties} aria-hidden="true" />;
+function formatConversationHistoryTime(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  const pad = (part: number) => String(part).padStart(2, "0");
+  return `${date.getFullYear()}/${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function SideNavActionMenu({
+  label,
+  items,
+  className,
+}: {
+  label: string;
+  items: DropdownMenuOption[];
+  className?: string;
+}) {
+  return (
+    <span className={className}>
+      <DropdownMenu
+        button={{
+          label,
+          icon: <Ellipsis />,
+          variant: "ghost",
+          size: "sm",
+          isIconOnly: true,
+        }}
+        items={items}
+        hasChevron={false}
+      />
+    </span>
+  );
+}
+
+function ConversationMarqueeTitle({ title }: { title: string }) {
+  const viewportRef = useRef<HTMLElement>(null);
+  const contentRef = useRef<HTMLSpanElement>(null);
+  const [overflowDistance, setOverflowDistance] = useState(0);
+
+  useEffect(() => {
+    const updateOverflowDistance = () => {
+      const viewport = viewportRef.current;
+      const content = contentRef.current;
+      if (!viewport || !content) {
+        return;
+      }
+      const nextDistance = Math.max(0, Math.ceil(content.scrollWidth - viewport.clientWidth));
+      setOverflowDistance((currentDistance) => currentDistance === nextDistance ? currentDistance : nextDistance);
+    };
+
+    updateOverflowDistance();
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", updateOverflowDistance);
+      return () => window.removeEventListener("resize", updateOverflowDistance);
+    }
+
+    const observer = new ResizeObserver(updateOverflowDistance);
+    if (viewportRef.current) {
+      observer.observe(viewportRef.current);
+    }
+    if (contentRef.current) {
+      observer.observe(contentRef.current);
+    }
+    return () => observer.disconnect();
+  }, [title]);
+
+  const animationDuration = Math.max(4, overflowDistance / 30);
+  const marqueeStyle = {
+    "--conversation-marquee-distance": `-${overflowDistance}px`,
+    "--conversation-marquee-duration": `${animationDuration.toFixed(2)}s`,
+  } as CSSProperties;
+
+  return (
+    <strong
+      ref={viewportRef}
+      className="workbench-conversation-title"
+      data-overflowing={overflowDistance > 0 ? "true" : undefined}
+      style={marqueeStyle}
+    >
+      <span ref={contentRef} className="workbench-conversation-title-content">
+        {title}
+      </span>
+    </strong>
+  );
 }
 
 export function WorkbenchShell({ auth }: WorkbenchShellProps) {
@@ -369,7 +396,18 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
   const lastSessionActivityAtRef = useRef(0);
   const skillCatalogUserIdRef = useRef<string | null>(null);
   const skillLoadRequestIdRef = useRef(0);
-  const [activeModule, setActiveModule] = useState<WorkbenchModule>(() => readCachedWorkbenchModule(auth.user, auth.permissions));
+  const assistantNavigationHandleRef = useRef<DataAssistantWorkspaceHandle | null>(null);
+  const pendingAssistantNavigationActionRef = useRef<PendingAssistantNavigationAction | null>(null);
+  const [route, setRoute] = useState<WorkbenchRoute>(() =>
+    typeof window === "undefined"
+      ? fallbackWorkbenchRoute(auth.permissions)
+      : parseWorkbenchRoute(window.location.hash, auth.permissions));
+  const [assistantNavigationSnapshot, setAssistantNavigationSnapshot] = useState<AssistantNavigationSnapshot>({
+    conversations: [],
+    activeConversationId: "",
+    isLoading: true,
+  });
+  const [assistantNavigationRevision, setAssistantNavigationRevision] = useState(0);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isLogoutConfirmOpen, setIsLogoutConfirmOpen] = useState(false);
   const [isSessionExpiredConfirmOpen, setIsSessionExpiredConfirmOpen] = useState(false);
@@ -551,16 +589,18 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
   }, [auth.status, clearSessionIdleTimer, refreshSessionIdleTimer]);
 
   useEffect(() => {
-    setActiveModule(readCachedWorkbenchModule(auth.user, auth.permissions));
-  }, [auth.permissions, auth.user]);
-
-  useEffect(() => {
-    if (!canAccessWorkbenchModule(activeModule, auth.permissions)) {
-      setActiveModule(readCachedWorkbenchModule(auth.user, auth.permissions));
-      return;
-    }
-    writeCachedWorkbenchModule(auth.user, activeModule);
-  }, [activeModule, auth.permissions, auth.user]);
+    const syncRouteFromHash = () => {
+      const nextRoute = parseWorkbenchRoute(window.location.hash, auth.permissions);
+      setRoute(nextRoute);
+      const normalizedHash = WORKBENCH_ROUTE_HASH[nextRoute];
+      if (window.location.hash !== normalizedHash) {
+        window.history.replaceState(null, "", normalizedHash);
+      }
+    };
+    syncRouteFromHash();
+    window.addEventListener("hashchange", syncRouteFromHash);
+    return () => window.removeEventListener("hashchange", syncRouteFromHash);
+  }, [auth.permissions]);
 
   useEffect(() => {
     let isMounted = true;
@@ -637,15 +677,15 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
 
   useEffect(() => {
     const dispose = window.lifecycleX?.dataSource.onAction((action) => {
-      setActiveModule("data-management");
-      setPendingDataSourceAction(action);
+      const nextRoute = parseWorkbenchRoute(WORKBENCH_ROUTE_HASH.database, auth.permissions);
+      setRoute(nextRoute);
+      window.location.hash = WORKBENCH_ROUTE_HASH[nextRoute];
+      setPendingDataSourceAction(nextRoute === "database" ? action : null);
     });
 
     return () => dispose?.();
-  }, []);
+  }, [auth.permissions]);
 
-  const activeAppIconVariant = settings.appearance.dockIcon;
-  const activeAppIcon = appIconAssets[activeAppIconVariant];
   const workbenchStyle = {
     "--workbench-background": "var(--color-background-body)",
     "--workbench-foreground": "var(--color-text-primary)",
@@ -669,19 +709,59 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
     openSettings("agent");
   };
 
-  const activateDataManagement = (action: DataSourceMenuAction = "open-csv") => {
-    if (!auth.permissions.includes("datasource:read")) {
+  const navigateToRoute = useCallback((nextRoute: WorkbenchRoute) => {
+    if (!canAccessWorkbenchRoute(nextRoute, auth.permissions)) {
       toast({
         type: "error",
-        body: "当前账号无数据管理访问权限。",
-        uniqueID: "data-source-nav-denied",
+        body: nextRoute === "database" ? "当前账号无数据库访问权限。" : "当前账号无助手访问权限。",
+        uniqueID: "workbench-route-denied",
         collisionBehavior: "overwrite",
       });
       return;
     }
-    setActiveModule("data-management");
-    setPendingDataSourceAction(action);
-  };
+    setRoute(nextRoute);
+    if (window.location.hash !== WORKBENCH_ROUTE_HASH[nextRoute]) {
+      window.location.hash = WORKBENCH_ROUTE_HASH[nextRoute];
+    }
+  }, [auth.permissions, toast]);
+
+  const handleAssistantNavigationHandleChange = useCallback((handle: DataAssistantWorkspaceHandle | null) => {
+    assistantNavigationHandleRef.current = handle;
+    if (handle && pendingAssistantNavigationActionRef.current) {
+      setAssistantNavigationRevision((current) => current + 1);
+    }
+  }, []);
+
+  const requestAssistantNavigation = useCallback((action: PendingAssistantNavigationAction) => {
+    pendingAssistantNavigationActionRef.current = action;
+    navigateToRoute("home");
+    setAssistantNavigationRevision((current) => current + 1);
+  }, [navigateToRoute]);
+
+  useEffect(() => {
+    if (route !== "home") {
+      return;
+    }
+    const action = pendingAssistantNavigationActionRef.current;
+    const handle = assistantNavigationHandleRef.current;
+    if (!action || !handle) {
+      return;
+    }
+    pendingAssistantNavigationActionRef.current = null;
+    if (action.type === "start") {
+      void handle.startConversation();
+      return;
+    }
+    if (action.type === "select") {
+      handle.selectConversation(action.conversationId);
+      return;
+    }
+    if (action.type === "rename") {
+      handle.openRenameConversation(action.conversationId);
+      return;
+    }
+    handle.requestDeleteConversation(action.conversationId);
+  }, [assistantNavigationRevision, route]);
 
   const requestLogout = () => {
     setIsLogoutConfirmOpen(true);
@@ -843,7 +923,7 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
   const renderContent = () => {
     return (
       <div className="workbench-module-stack">
-        <Activity mode={activeModule === "data-assistant" ? "visible" : "hidden"} name="workbench-data-assistant">
+        <Activity mode={route === "home" ? "visible" : "hidden"} name="workbench-data-assistant">
           <div className="workbench-module">
             <DataAssistantWorkspace
               user={auth.user}
@@ -856,14 +936,16 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
               skills={skills.filter((skill) => skill.enabled && skill.availability === "ready")}
               requestWithRefresh={requestWithRefresh}
               onRequireModelConfig={() => setIsModelConfigRequiredOpen(true)}
+              onNavigationSnapshotChange={setAssistantNavigationSnapshot}
+              onNavigationHandleChange={handleAssistantNavigationHandleChange}
             />
           </div>
         </Activity>
-        <Activity mode={activeModule === "data-management" ? "visible" : "hidden"} name="workbench-data-management">
+        <Activity mode={route === "database" ? "visible" : "hidden"} name="workbench-data-management">
           <div className="workbench-module">
             {auth.permissions.includes("datasource:read") && (
               <DataManagementWorkspace
-                isActive={activeModule === "data-management"}
+                isActive={route === "database"}
                 canManage={auth.permissions.includes("datasource:manage")}
                 requestWithRefresh={requestWithRefresh}
                 menuAction={pendingDataSourceAction}
@@ -876,64 +958,112 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
     );
   };
 
-  const topNav = (
-    <div className="workbench-top-nav-frame" style={workbenchStyle}>
-      <TopNav
-        label="Cycle Probe navigation"
-        heading={<TopNavHeading heading="Cycle Probe" logo={<img className="workbench-brand-icon" src={activeAppIcon} alt="" />} />}
-        startContent={
-          <>
+  const sideNav = (
+    <SideNav
+      className="workbench-side-nav"
+      data-theme-mode={settings.appearance.themeMode}
+      style={workbenchStyle}
+      header={<SideNavHeading className="workbench-side-nav-heading" heading="溯据" />}
+      topContent={
+        <SideNavSection title="导航">
+          <div className="workbench-primary-navigation">
             {auth.permissions.includes("analysis:read") && (
-              <TopNavItem
-                label="Assistant"
-                href="#assistant"
-                icon={<NavAssetIcon src={aiIcon} />}
-                isSelected={activeModule === "data-assistant"}
-                onClick={(event) => {
-                  event.preventDefault();
-                  setActiveModule("data-assistant");
-                }}
+              <SideNavItem
+                label="新建对话"
+                icon={<MessageCirclePlus />}
+                isDisabled={assistantNavigationSnapshot.isLoading}
+                onClick={() => requestAssistantNavigation({ type: "start" })}
               />
             )}
             {auth.permissions.includes("datasource:read") && (
-              <TopNavMenu
-                label="DataSource"
-                items={[
-                  {
-                    title: "CSV",
-                    description: "Import CSV",
-                    icon: <NavAssetIcon src={csvIcon} size="lg" />,
-                    href: "#csv",
-                    onClick: () => activateDataManagement("open-csv"),
-                  },
-                  {
-                    title: "Database",
-                    description: "Database Connection",
-                    icon: <NavAssetIcon src={databaseIcon} size="lg" />,
-                    href: "#database",
-                    onClick: () => activateDataManagement("open-database"),
-                  },
-                ]}
+              <SideNavItem
+                label="数据库"
+                icon={<DatabasePlus />}
+                isSelected={route === "database"}
+                onClick={() => navigateToRoute("database")}
               />
             )}
-          </>
-        }
-        endContent={
-          <Button
-            label="Profile"
-            variant="ghost"
-            icon={<UserCog size={24} />}
-            isIconOnly
-            className="workbench-profile-button"
-            onClick={() => openSettings("profile")}
+          </div>
+        </SideNavSection>
+      }
+      footerIcons={
+        <HStack hAlign="between" vAlign="center" gap={2} className="workbench-side-nav-user">
+          <HStack vAlign="center" gap={2} className="workbench-side-nav-user-identity">
+            <Avatar
+              src={profile?.avatarUrl ?? auth.user?.avatarUrl}
+              name={profile?.displayName ?? auth.user?.displayName ?? auth.user?.username}
+              size={32}
+            />
+            <Text type="body" weight="semibold" maxLines={1}>
+              {profile?.displayName ?? auth.user?.displayName ?? auth.user?.username ?? "用户"}
+            </Text>
+          </HStack>
+          <SideNavActionMenu
+            label="用户操作"
+            items={[
+              {
+                label: "设置",
+                icon: <Settings size={16} />,
+                onClick: () => openSettings("profile"),
+              },
+              {
+                label: "退出登录",
+                icon: <LogOut size={16} />,
+                onClick: requestLogout,
+              },
+            ]}
           />
-        }
-      />
-    </div>
+        </HStack>
+      }
+    >
+      {auth.permissions.includes("analysis:read") && (
+        <SideNavSection title="最近" className="workbench-recent-section">
+          <section className="workbench-recent-conversations" aria-label="最近会话">
+            {assistantNavigationSnapshot.conversations.map((conversation) => (
+              <article
+                key={conversation.id}
+                className={
+                  conversation.id === assistantNavigationSnapshot.activeConversationId
+                    ? "workbench-recent-conversation active"
+                    : "workbench-recent-conversation"
+                }
+              >
+                <button
+                  type="button"
+                  className="workbench-recent-conversation-select"
+                  onClick={() => requestAssistantNavigation({ type: "select", conversationId: conversation.id })}
+                >
+                  <ConversationMarqueeTitle title={conversation.title} />
+                  <span className="workbench-conversation-timestamp">
+                    {formatConversationHistoryTime(conversation.updatedAt)}
+                  </span>
+                </button>
+                <SideNavActionMenu
+                  label={`${conversation.title} 操作`}
+                  className="workbench-recent-conversation-menu"
+                  items={[
+                    {
+                      label: "重命名",
+                      icon: <Pencil size={16} />,
+                      onClick: () => requestAssistantNavigation({ type: "rename", conversationId: conversation.id }),
+                    },
+                    {
+                      label: "删除",
+                      icon: <Trash2 size={16} />,
+                      onClick: () => requestAssistantNavigation({ type: "delete", conversationId: conversation.id }),
+                    },
+                  ]}
+                />
+              </article>
+            ))}
+          </section>
+        </SideNavSection>
+      )}
+    </SideNav>
   );
 
   return (
-    <AppShell variant="section" topNav={topNav} contentPadding={0} mobileNav={{ breakpoint: "md" }}>
+    <AppShell variant="section" sideNav={sideNav} contentPadding={0} mobileNav={false}>
       <section className="workbench-main" data-theme-mode={settings.appearance.themeMode} style={workbenchStyle}>
         <div className="workbench-content">{renderContent()}</div>
       </section>
@@ -1163,36 +1293,22 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
             )}
 
             {activeSettingsTab === "skills" && (
-              <SkillManagementPanel
-                skills={skills}
-                isLoading={isLoadingSkills}
-                pendingSkillId={pendingSkillId}
-                isInstalling={isInstallingSkill}
-                onInstall={() => void installSkill()}
-                onSetEnabled={(skill, enabled) => void setSkillEnabled(skill, enabled)}
-                onRemove={(skill) => void removeSkill(skill)}
-              />
-            )}
-
-            {activeSettingsTab === "logout" && (
-              <VStack gap={4} hAlign="stretch">
-                <Text type="display-3" as="h3">
-                  退出登录
-                </Text>
-                <Section variant="muted" padding={4}>
-                  <VStack gap={3} hAlign="stretch">
-                    <Text type="body" color="secondary">
-                      退出后会清理本地刷新令牌和当前运行时访问令牌，并返回登录页。
-                    </Text>
-                    <Button label="退出登录" variant="destructive" onClick={requestLogout} />
-                  </VStack>
-                </Section>
-              </VStack>
+              <section className="settings-skill-content">
+                <SkillManagementPanel
+                  skills={skills}
+                  isLoading={isLoadingSkills}
+                  pendingSkillId={pendingSkillId}
+                  isInstalling={isInstallingSkill}
+                  onInstall={() => void installSkill()}
+                  onSetEnabled={(skill, enabled) => void setSkillEnabled(skill, enabled)}
+                  onRemove={(skill) => void removeSkill(skill)}
+                />
+              </section>
             )}
 
             <div className="settings-footer">
               <Button label="关闭" variant="secondary" onClick={() => setIsSettingsOpen(false)} />
-              {activeSettingsTab !== "profile" && activeSettingsTab !== "skills" && activeSettingsTab !== "logout" && (
+              {activeSettingsTab !== "profile" && activeSettingsTab !== "skills" && (
                 <Button label="保存设置" variant="primary" isLoading={isSavingSettings} onClick={handleSettingsSave} />
               )}
             </div>

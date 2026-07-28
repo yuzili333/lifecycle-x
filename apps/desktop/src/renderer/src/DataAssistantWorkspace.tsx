@@ -30,7 +30,7 @@ import { Text } from "@astryxdesign/core/Text";
 import { Token } from "@astryxdesign/core/Token";
 import { Toolbar } from "@astryxdesign/core/Toolbar";
 import { Tooltip } from "@astryxdesign/core/Tooltip";
-import { BadgeInfo, BrainCircuit, CheckCircle2, ChevronDown, ChevronRight, CircleAlert, Clock, Copy, FileSpreadsheet, FileText, LoaderCircle, Maximize2, Minimize2, Pencil, Plus, RotateCcw, Sparkles, Trash2, X, type LucideIcon } from "lucide-react";
+import { BadgeInfo, BrainCircuit, CheckCircle2, ChevronDown, ChevronRight, CircleAlert, Clock, Copy, FileSpreadsheet, FileText, LoaderCircle, Maximize2, Minimize2, Pencil, Plus, RotateCcw, Sparkles, X, type LucideIcon } from "lucide-react";
 import type { AuthFailure, AuthUser } from "./auth";
 import { useAppToast } from "./useAppToast";
 import { workbenchApi, type ApiResult, type DataSourceSummary } from "./workbenchApi";
@@ -111,6 +111,21 @@ type DataAssistantWorkspaceProps = {
   skills: SkillSummary[];
   requestWithRefresh: RequestWithRefresh;
   onRequireModelConfig: () => void;
+  onNavigationSnapshotChange?: (snapshot: AssistantNavigationSnapshot) => void;
+  onNavigationHandleChange?: (handle: DataAssistantWorkspaceHandle | null) => void;
+};
+
+export type AssistantNavigationSnapshot = {
+  conversations: AssistantConversation[];
+  activeConversationId: string;
+  isLoading: boolean;
+};
+
+export type DataAssistantWorkspaceHandle = {
+  startConversation: () => Promise<void>;
+  selectConversation: (conversationId: string) => void;
+  openRenameConversation: (conversationId: string) => void;
+  requestDeleteConversation: (conversationId: string) => void;
 };
 
 const approvalOptions: Array<{ label: string; value: AssistantApprovalMode }> = [
@@ -118,6 +133,7 @@ const approvalOptions: Array<{ label: string; value: AssistantApprovalMode }> = 
   { label: "完全访问权限", value: "full_access" },
   { label: "禁止访问权限", value: "no_access" },
 ];
+const EMPTY_ASSISTANT_MESSAGES: AssistantMessage[] = [];
 
 const ARTIFACT_WINDOW_STATE_KEY = "cycle-probe:assistant:artifact-window";
 const ARTIFACT_PANEL_WIDTH_KEY = "cycle-probe:assistant:artifact-panel-width";
@@ -211,19 +227,6 @@ function formatChatTime(value: string) {
     hour: "2-digit",
     minute: "2-digit",
   }).format(new Date(value));
-}
-
-function formatConversationHistoryTime(value: string) {
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return value;
-  }
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-  const hour = String(date.getHours()).padStart(2, "0");
-  const minute = String(date.getMinutes()).padStart(2, "0");
-  return `${year}/${month}/${day} ${hour}:${minute}`;
 }
 
 function formatStoppedMessageFromCreatedAt(createdAt?: string) {
@@ -1347,6 +1350,8 @@ export function DataAssistantWorkspace({
   skills,
   requestWithRefresh,
   onRequireModelConfig,
+  onNavigationSnapshotChange,
+  onNavigationHandleChange,
 }: DataAssistantWorkspaceProps) {
   const toast = useAppToast();
   const [conversations, setConversations] = useState<AssistantConversation[]>([]);
@@ -1417,6 +1422,7 @@ export function DataAssistantWorkspace({
   const locallyStoppedMessageIdsRef = useRef(new Set<string>());
   const pendingMessageDeltasRef = useRef(new Map<string, MessageDeltaStreamEvent>());
   const messageDeltaFlushTimerRef = useRef<number | null>(null);
+  const loadedConversationsUserIdRef = useRef<string | null>(null);
   const reportTransitionController = useMemo(
     () =>
       new ReportTransitionController(
@@ -1601,7 +1607,9 @@ export function DataAssistantWorkspace({
     };
   }, [activeConversationDraftId, buildCurrentComposerDraft]);
 
-  const activeMessages = activeConversation ? messagesByConversation[activeConversation.id] ?? [] : [];
+  const activeMessages = activeConversation
+    ? messagesByConversation[activeConversation.id] ?? EMPTY_ASSISTANT_MESSAGES
+    : EMPTY_ASSISTANT_MESSAGES;
   const activeToolState = activeConversation ? toolStateByConversation[activeConversation.id] ?? null : null;
   const activePendingPythonToolCallId = useMemo(() => pendingPythonToolCallId(activeMessages), [activeMessages]);
   const landingUserName = user?.displayName?.trim() || user?.username || "Yuzili";
@@ -1786,6 +1794,11 @@ export function DataAssistantWorkspace({
   );
 
   useEffect(() => {
+    if (loadedConversationsUserIdRef.current === user?.id) {
+      setIsLoadingConversations(false);
+      return;
+    }
+
     let isMounted = true;
 
     async function loadConversations() {
@@ -1802,6 +1815,7 @@ export function DataAssistantWorkspace({
         setConversations(nextConversations);
         const nextActiveId = nextConversations[0]?.id ?? "";
         setActiveConversationId(nextActiveId);
+        loadedConversationsUserIdRef.current = user.id;
         if (nextActiveId) {
           await loadConversationMessages(nextActiveId);
         }
@@ -2168,7 +2182,7 @@ export function DataAssistantWorkspace({
     setSelectedFieldRefs((current) => current.filter((field) => composerValue.includes(field.rawText)));
   }, [composerValue, selectedFieldRefs.length]);
 
-  const startConversation = async () => {
+  const startConversation = useCallback(async () => {
     if (!user?.id || !window.lifecycleX?.assistant) {
       return;
     }
@@ -2182,7 +2196,29 @@ export function DataAssistantWorkspace({
     setWorkflowContextByConversation((current) => ({ ...current, [conversation.id]: null }));
     setActiveConversationId(conversation.id);
     setComposerValue("");
-  };
+  }, [activeStreamingMessageIds, user?.id]);
+
+  const selectConversation = useCallback((conversationId: string) => {
+    setActiveConversationId(conversationId);
+    if (!messagesByConversation[conversationId]) {
+      void loadConversationMessages(conversationId);
+      return;
+    }
+    if (
+      conversationId in workflowContextByConversation ||
+      !user?.id ||
+      !window.lifecycleX?.assistant
+    ) {
+      return;
+    }
+    void Promise.all([
+      window.lifecycleX.assistant.getWorkflowContext(user.id, conversationId),
+      window.lifecycleX.assistant.getToolState(user.id, conversationId),
+    ]).then(([context, toolState]) => {
+      setWorkflowContextByConversation((current) => ({ ...current, [conversationId]: context }));
+      setToolStateByConversation((current) => ({ ...current, [conversationId]: toolState }));
+    });
+  }, [loadConversationMessages, messagesByConversation, user?.id, workflowContextByConversation]);
 
   const importChatCsvFile = useCallback(
     async (file: File) => {
@@ -2675,6 +2711,44 @@ export function DataAssistantWorkspace({
     setEditingConversation(conversation);
     setEditTitleDraft(conversation.title.slice(0, MAX_CONVERSATION_TITLE_LENGTH));
   };
+
+  const openRenameConversation = useCallback((conversationId: string) => {
+    const conversation = conversations.find((item) => item.id === conversationId);
+    if (conversation) {
+      openEditConversation(conversation);
+    }
+  }, [conversations]);
+
+  const requestDeleteConversation = useCallback((conversationId: string) => {
+    const conversation = conversations.find((item) => item.id === conversationId);
+    if (conversation) {
+      setDeletingConversation(conversation);
+    }
+  }, [conversations]);
+
+  const navigationHandle = useMemo<DataAssistantWorkspaceHandle>(() => ({
+    startConversation,
+    selectConversation,
+    openRenameConversation,
+    requestDeleteConversation,
+  }), [openRenameConversation, requestDeleteConversation, selectConversation, startConversation]);
+
+  useEffect(() => {
+    onNavigationSnapshotChange?.({
+      conversations,
+      activeConversationId,
+      isLoading: isLoadingConversations,
+    });
+  }, [activeConversationId, conversations, isLoadingConversations, onNavigationSnapshotChange]);
+
+  useEffect(() => {
+    onNavigationHandleChange?.(navigationHandle);
+  }, [navigationHandle, onNavigationHandleChange]);
+
+  useEffect(
+    () => () => onNavigationHandleChange?.(null),
+    [onNavigationHandleChange],
+  );
 
   const closeEditConversation = () => {
     setEditingConversation(null);
@@ -3853,66 +3927,6 @@ export function DataAssistantWorkspace({
 
   return (
     <section className="data-assistant-workspace" aria-label="数据助手">
-      <aside className="assistant-history-panel" aria-label="对话列表">
-        <div className="assistant-history-list">
-          {conversations.map((conversation) => (
-            <div
-              key={conversation.id}
-              className={conversation.id === activeConversation?.id ? "assistant-history-item active" : "assistant-history-item"}
-            >
-              <button
-                type="button"
-                className="assistant-history-select"
-                onClick={() => {
-                  setActiveConversationId(conversation.id);
-                  if (!messagesByConversation[conversation.id]) {
-                    void loadConversationMessages(conversation.id);
-                  } else if (!(conversation.id in workflowContextByConversation) && user?.id && window.lifecycleX?.assistant) {
-                    void Promise.all([
-                      window.lifecycleX.assistant.getWorkflowContext(user.id, conversation.id),
-                      window.lifecycleX.assistant.getToolState(user.id, conversation.id),
-                    ]).then(([context, toolState]) => {
-                      setWorkflowContextByConversation((current) => ({ ...current, [conversation.id]: context }));
-                      setToolStateByConversation((current) => ({ ...current, [conversation.id]: toolState }));
-                    });
-                  }
-                }}
-              >
-                <strong>{conversation.title}</strong>
-                <span>{formatConversationHistoryTime(conversation.updatedAt)}</span>
-              </button>
-              <div className="assistant-history-actions">
-                <Button
-                  label="编辑记录"
-                  variant="secondary"
-                  size="sm"
-                  icon={<Icon icon={Pencil} size="xsm" color="inherit" />}
-                  isIconOnly
-                  onClick={() => openEditConversation(conversation)}
-                />
-                <Button
-                  label="删除记录"
-                  variant="destructive"
-                  size="sm"
-                  icon={<Icon icon={Trash2} size="xsm" color="inherit" />}
-                  isIconOnly
-                  onClick={() => setDeletingConversation(conversation)}
-                />
-              </div>
-            </div>
-          ))}
-        </div>
-        <div className="assistant-history-new-chat">
-          <Button
-            label="新增对话"
-            variant="primary"
-            icon={<Icon icon={Plus} size="sm" color="inherit" />}
-            isLoading={isLoadingConversations}
-            onClick={startConversation}
-          />
-        </div>
-      </aside>
-
       <div className={`assistant-chat-shell ${activeArtifactMessage ? "with-artifact" : ""}`}>
         <div className="assistant-chat-main">
           <ChatLayout

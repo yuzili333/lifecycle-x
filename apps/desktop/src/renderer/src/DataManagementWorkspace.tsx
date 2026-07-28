@@ -1,8 +1,7 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type CSSProperties, type MouseEvent as ReactMouseEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent } from "react";
 import { AlertDialog } from "@astryxdesign/core/AlertDialog";
 import { Badge } from "@astryxdesign/core/Badge";
 import { Button } from "@astryxdesign/core/Button";
-import { ContextMenu } from "@astryxdesign/core/ContextMenu";
 import { Dialog } from "@astryxdesign/core/Dialog";
 import { EmptyState } from "@astryxdesign/core/EmptyState";
 import { HStack, VStack } from "@astryxdesign/core/Layout";
@@ -17,8 +16,6 @@ import { TextInput } from "@astryxdesign/core/TextInput";
 import { Toast, type ToastType } from "@astryxdesign/core/Toast";
 import { TreeList, type TreeListItemData } from "@astryxdesign/core/TreeList";
 import connectIcon from "./assets/connect.svg";
-import csvImportIcon from "./assets/csv-import.svg";
-import csvIcon from "./assets/csv.svg";
 import databaseSourceIcon from "./assets/database-source.svg";
 import tableSheetIcon from "./assets/table-sheet.svg";
 import type { AuthFailure } from "./auth";
@@ -90,8 +87,6 @@ type PendingLargeTable = {
   table: DatabaseTable;
 };
 
-type DataManagementPage = "database" | "csv";
-
 type ConnectionTestToast = {
   id: number;
   type: ToastType;
@@ -138,8 +133,8 @@ function statusBadge(source: DataSourceSummary) {
   return <Badge variant="neutral" label="离线" />;
 }
 
-function tableEntityIcon(table?: DatabaseTable) {
-  return table?.type === "imported" ? csvIcon : tableSheetIcon;
+function tableEntityIcon() {
+  return tableSheetIcon;
 }
 
 function formatNumber(value: number) {
@@ -237,7 +232,13 @@ function FieldHeader({ column }: { column: DatabaseColumn }) {
   );
 }
 
-export function DataManagementWorkspace({ isActive, canManage, requestWithRefresh, menuAction, onMenuActionHandled }: DataManagementWorkspaceProps) {
+export function DataManagementWorkspace({
+  isActive,
+  canManage,
+  requestWithRefresh,
+  menuAction,
+  onMenuActionHandled,
+}: DataManagementWorkspaceProps) {
   const toast = useAppToast();
   const requestWithRefreshRef = useRef(requestWithRefresh);
   const dataSourceLoadAttemptsRef = useRef(0);
@@ -246,7 +247,6 @@ export function DataManagementWorkspace({ isActive, canManage, requestWithRefres
   const [dataSources, setDataSources] = useState<DataSourceSummary[]>([]);
   const [schemas, setSchemas] = useState<DatabaseSchema[]>([]);
   const [tables, setTables] = useState<DatabaseTable[]>([]);
-  const [activePage, setActivePage] = useState<DataManagementPage>("csv");
   const [selectedSourceId, setSelectedSourceId] = useState<string | null>(null);
   const [selectedSchema, setSelectedSchema] = useState<string | null>(null);
   const [selectedTableId, setSelectedTableId] = useState<string | null>(null);
@@ -254,16 +254,6 @@ export function DataManagementWorkspace({ isActive, canManage, requestWithRefres
   const [resourceError, setResourceError] = useState<string | null>(null);
   const [isConnectionDialogOpen, setIsConnectionDialogOpen] = useState(false);
   const [connectionForm, setConnectionForm] = useState<DataSourceInput>(defaultConnectionForm);
-  const [isCsvDialogOpen, setIsCsvDialogOpen] = useState(false);
-  const [csvName, setCsvName] = useState("");
-  const [csvContent, setCsvContent] = useState("");
-  const [csvDictionaryName, setCsvDictionaryName] = useState("");
-  const [csvDictionaryContent, setCsvDictionaryContent] = useState("");
-  const [csvInputVersion, setCsvInputVersion] = useState(0);
-  const [isCsvImporting, setIsCsvImporting] = useState(false);
-  const [editingCsvSource, setEditingCsvSource] = useState<DataSourceSummary | null>(null);
-  const [editingCsvName, setEditingCsvName] = useState("");
-  const [isSavingCsvName, setIsSavingCsvName] = useState(false);
   const [pendingLargeTable, setPendingLargeTable] = useState<PendingLargeTable | null>(null);
   const [schemaColumnWidths, setSchemaColumnWidths] = useState<Record<string, number>>({});
   const [tableColumnWidths, setTableColumnWidths] = useState<Record<string, number>>({});
@@ -275,7 +265,6 @@ export function DataManagementWorkspace({ isActive, canManage, requestWithRefres
   const [sampleDataByTabId, setSampleDataByTabId] = useState<Record<string, SampleDataResult>>({});
   const [loadingSampleTabIds, setLoadingSampleTabIds] = useState<string[]>([]);
   const [connectionTestToast, setConnectionTestToast] = useState<ConnectionTestToast | null>(null);
-  const [csvImportToast, setCsvImportToast] = useState<ConnectionTestToast | null>(null);
   const [databaseContextMenu, setDatabaseContextMenu] = useState<{
     sourceId: string;
     sourceName: string;
@@ -284,28 +273,12 @@ export function DataManagementWorkspace({ isActive, canManage, requestWithRefres
   } | null>(null);
 
   const databaseSources = useMemo(() => dataSources.filter((source) => source.type === "mysql"), [dataSources]);
-  const csvSources = useMemo(() => dataSources.filter((source) => source.type === "csv"), [dataSources]);
   const selectedSource = dataSources.find((source) => source.id === selectedSourceId) ?? null;
-  const visibleTabs = useMemo(
-    () =>
-      openTabs.filter((tab) => {
-        const source = dataSources.find((item) => item.id === tab.sourceId);
-        return activePage === "database" ? source?.type === "mysql" : source?.type === "csv";
-      }),
-    [activePage, dataSources, openTabs],
-  );
+  const visibleTabs = openTabs;
   const activeTab = visibleTabs.find((tab) => tab.id === activeTabId) ?? null;
 
   const showConnectionTestToast = useCallback((type: ToastType, body: string) => {
     setConnectionTestToast({
-      id: Date.now(),
-      type,
-      body,
-    });
-  }, []);
-
-  const showCsvImportToast = useCallback((type: ToastType, body: string) => {
-    setCsvImportToast({
       id: Date.now(),
       type,
       body,
@@ -324,12 +297,6 @@ export function DataManagementWorkspace({ isActive, canManage, requestWithRefres
       return;
     }
     if (menuAction === "open-database") {
-      setActivePage("database");
-      onMenuActionHandled?.();
-      return;
-    }
-    if (menuAction === "open-csv") {
-      setActivePage("csv");
       onMenuActionHandled?.();
       return;
     }
@@ -346,12 +313,7 @@ export function DataManagementWorkspace({ isActive, canManage, requestWithRefres
     }
 
     if (menuAction === "create-connection") {
-      setActivePage("database");
       setIsConnectionDialogOpen(true);
-    }
-    if (menuAction === "import-csv") {
-      setActivePage("csv");
-      setIsCsvDialogOpen(true);
     }
     onMenuActionHandled?.();
   }, [canManage, isActive, menuAction, onMenuActionHandled, toast]);
@@ -371,58 +333,6 @@ export function DataManagementWorkspace({ isActive, canManage, requestWithRefres
     [toast],
   );
 
-  const showCsvFailure = useCallback(
-    (result: AuthFailure) => {
-      if (result.error.code === "SESSION_EXPIRED") {
-        showFailure(result);
-        return;
-      }
-      showCsvImportToast("error", `${result.error.message} Trace: ${result.error.traceId}`);
-    },
-    [showCsvImportToast, showFailure],
-  );
-
-  const resetCsvImportState = useCallback(() => {
-    setCsvName("");
-    setCsvContent("");
-    setCsvDictionaryName("");
-    setCsvDictionaryContent("");
-    setIsCsvImporting(false);
-    setCsvImportToast(null);
-    setCsvInputVersion((current) => current + 1);
-  }, []);
-
-  const closeCsvDialog = useCallback(() => {
-    setIsCsvDialogOpen(false);
-    resetCsvImportState();
-  }, [resetCsvImportState]);
-
-  const handleCsvDialogOpenChange = useCallback(
-    (open: boolean) => {
-      if (open) {
-        setIsCsvDialogOpen(true);
-        return;
-      }
-      if (isCsvImporting) {
-        return;
-      }
-      closeCsvDialog();
-    },
-    [closeCsvDialog, isCsvImporting],
-  );
-
-  const openEditCsvNameDialog = useCallback((source: DataSourceSummary) => {
-    setEditingCsvSource(source);
-    setEditingCsvName(source.name);
-    setIsSavingCsvName(false);
-  }, []);
-
-  const closeEditCsvNameDialog = useCallback(() => {
-    setEditingCsvSource(null);
-    setEditingCsvName("");
-    setIsSavingCsvName(false);
-  }, []);
-
   const loadDataSources = useCallback(async (resetAttempts = false) => {
     if (resetAttempts) {
       dataSourceLoadAttemptsRef.current = 0;
@@ -440,7 +350,9 @@ export function DataManagementWorkspace({ isActive, canManage, requestWithRefres
       dataSourceLoadAttemptsRef.current += 1;
       const result = await requestWithRefreshRef.current(workbenchApi.dataSources);
       if (!isFailure(result)) {
-        const visibleDataSources = result.dataSources.filter((source) => !isLegacyDefaultDataSource(source));
+        const visibleDataSources = result.dataSources.filter(
+          (source) => source.type === "mysql" && !isLegacyDefaultDataSource(source),
+        );
         hasLoadedDataSourcesRef.current = true;
         dataSourceLoadAttemptsRef.current = 0;
         setDataSources(visibleDataSources);
@@ -531,7 +443,6 @@ export function DataManagementWorkspace({ isActive, canManage, requestWithRefres
       schema,
       label: schema,
     };
-    setActivePage("database");
     setSelectedSourceId(sourceId);
     setSelectedSchema(schema);
     setSelectedTableId(null);
@@ -551,9 +462,6 @@ export function DataManagementWorkspace({ isActive, canManage, requestWithRefres
         tableId,
         label: table?.name ?? tableId,
       };
-      if (table?.type !== "imported") {
-        setActivePage("database");
-      }
       setSelectedSourceId(sourceId);
       setSelectedSchema(schema);
       setSelectedTableId(tableId);
@@ -563,125 +471,6 @@ export function DataManagementWorkspace({ isActive, canManage, requestWithRefres
     },
     [tables],
   );
-
-  const openCsvDataSource = useCallback(
-    async (source: DataSourceSummary) => {
-      setActivePage("csv");
-      setSelectedSourceId(source.id);
-      setSelectedSchema(null);
-      setSelectedTableId(null);
-      const loaded = await loadSourceObjects(source.id);
-      const importedTable = loaded?.tables.find((table) => table.type === "imported") ?? loaded?.tables[0];
-      if (!importedTable) {
-        setActiveTabId(null);
-        return;
-      }
-      const nextTab: CompassDataTab = {
-        id: tableTabId(source.id, importedTable.id),
-        kind: "table",
-        sourceId: source.id,
-        schema: importedTable.schema,
-        tableId: importedTable.id,
-        label: importedTable.name,
-      };
-      setSelectedSchema(importedTable.schema);
-      setSelectedTableId(importedTable.id);
-      setOpenTabs((current) => (current.some((tab) => tab.id === nextTab.id) ? current : [...current, nextTab]));
-      setActiveTabId(nextTab.id);
-      setTabPages((current) => ({ ...current, [nextTab.id]: current[nextTab.id] ?? 1 }));
-    },
-    [loadSourceObjects],
-  );
-
-  const deleteCsvDataSource = useCallback(
-    async (sourceId: string) => {
-      const result = await requestWithRefreshRef.current((token) => workbenchApi.deleteCsvDataSource(token, sourceId));
-      if (isFailure(result)) {
-        showFailure(result);
-        return;
-      }
-      setDataSources((current) => current.filter((source) => source.id !== sourceId));
-      setOpenTabs((current) => current.filter((tab) => tab.sourceId !== sourceId));
-      setActiveTabId((current) => {
-        const activeTabSourceId = openTabs.find((tab) => tab.id === current)?.sourceId;
-        return activeTabSourceId === sourceId ? null : current;
-      });
-      setTabPages((current) => {
-        const nextEntries = Object.entries(current).filter(([tabId]) => openTabs.find((tab) => tab.id === tabId)?.sourceId !== sourceId);
-        return Object.fromEntries(nextEntries);
-      });
-      setTabPageSizes((current) => {
-        const nextEntries = Object.entries(current).filter(([tabId]) => openTabs.find((tab) => tab.id === tabId)?.sourceId !== sourceId);
-        return Object.fromEntries(nextEntries);
-      });
-      setSampleDataByTabId((current) => {
-        const nextEntries = Object.entries(current).filter(([tabId]) => openTabs.find((tab) => tab.id === tabId)?.sourceId !== sourceId);
-        return Object.fromEntries(nextEntries);
-      });
-      setSelectedSourceId((current) => (current === sourceId ? null : current));
-      setSelectedSchema(null);
-      setSelectedTableId(null);
-      toast({
-        type: "info",
-        body: "CSV 数据集已删除。",
-        uniqueID: "csv-data-source-deleted",
-        collisionBehavior: "overwrite",
-      });
-    },
-    [openTabs, showFailure, toast],
-  );
-
-  const saveCsvName = useCallback(async () => {
-    if (!editingCsvSource) {
-      return;
-    }
-    const nextName = editingCsvName.trim();
-    if (!nextName) {
-      toast({
-        type: "error",
-        body: "CSV 表名称不能为空。",
-        uniqueID: "csv-rename-empty",
-        collisionBehavior: "overwrite",
-      });
-      return;
-    }
-    if (nextName.length > 100) {
-      toast({
-        type: "error",
-        body: "CSV 表名称不能超过 100 个字符。",
-        uniqueID: "csv-rename-too-long",
-        collisionBehavior: "overwrite",
-      });
-      return;
-    }
-
-    setIsSavingCsvName(true);
-    const result = await requestWithRefreshRef.current((token) => workbenchApi.renameCsvDataSource(token, editingCsvSource.id, nextName));
-    setIsSavingCsvName(false);
-    if (isFailure(result)) {
-      showFailure(result);
-      return;
-    }
-
-    setDataSources((current) => current.map((source) => (source.id === editingCsvSource.id ? result.dataSource : source)));
-    if (result.table) {
-      setTables((current) => current.map((table) => (table.id === result.table?.id ? result.table : table)));
-      setOpenTabs((current) =>
-        current.map((tab) =>
-          tab.sourceId === editingCsvSource.id && tab.kind === "table" && tab.tableId === result.table?.id
-            ? { ...tab, label: result.table.name }
-            : tab,
-        ),
-      );
-    }
-    closeEditCsvNameDialog();
-    toast({
-      type: "info",
-      body: "CSV 表名称已更新。",
-      uniqueID: "csv-renamed",
-      collisionBehavior: "overwrite",
-    });
-  }, [closeEditCsvNameDialog, editingCsvName, editingCsvSource, showFailure, toast]);
 
   const closeTab = useCallback(
     (tabId: string) => {
@@ -777,9 +566,6 @@ export function DataManagementWorkspace({ isActive, canManage, requestWithRefres
 
   const handleResourceContextMenu = useCallback(
     (event: ReactMouseEvent<HTMLElement>) => {
-      if (activePage !== "database") {
-        return;
-      }
       const target = event.target;
       if (!(target instanceof HTMLElement)) {
         return;
@@ -802,7 +588,7 @@ export function DataManagementWorkspace({ isActive, canManage, requestWithRefres
         y: event.clientY,
       });
     },
-    [activePage, dataSources],
+    [dataSources],
   );
 
   useEffect(() => {
@@ -856,7 +642,6 @@ export function DataManagementWorkspace({ isActive, canManage, requestWithRefres
           isExpanded: source.id === selectedSourceId,
           isSelected: source.id === selectedSourceId && !selectedSchema && !selectedTableId,
           onClick: () => {
-            setActivePage("database");
             setSelectedSourceId(source.id);
             setSelectedSchema(null);
             setSelectedTableId(null);
@@ -878,7 +663,7 @@ export function DataManagementWorkspace({ isActive, canManage, requestWithRefres
                   .map((table) => ({
                     id: `table:${table.id}`,
                     label: table.name,
-                    startContent: <CompassAssetIcon icon={tableEntityIcon(table)} />,
+                    startContent: <CompassAssetIcon icon={tableEntityIcon()} />,
                     endContent: table.isLarge ? <Badge variant="warning" label="大表" /> : table.isSensitive ? <Badge variant="purple" label="敏感" /> : undefined,
                     isSelected: table.id === selectedTableId,
                     onClick: () => {
@@ -891,57 +676,6 @@ export function DataManagementWorkspace({ isActive, canManage, requestWithRefres
       },
     ],
     [canManage, databaseSources, openDatabaseTab, openTableTab, schemas, selectedSchema, selectedSourceId, selectedTableId, tables],
-  );
-
-  const csvTreeItems = useMemo<TreeListItemData[]>(
-    () => [
-      {
-        id: "csv-datasets",
-        label: "CSV数据集",
-        isExpanded: true,
-        endContent: (
-          <TreeRootActionButton
-            label="导入CSV"
-            icon={csvImportIcon}
-            variant="secondary"
-            isDisabled={!canManage}
-            onClick={() => setIsCsvDialogOpen(true)}
-          />
-        ),
-        children: csvSources.map((source) => ({
-          id: `source:${source.id}`,
-          label: (
-            <ContextMenu
-              label={`${source.name} 操作`}
-              size="sm"
-              items={[
-                {
-                  label: "编辑名称",
-                  onClick: () => openEditCsvNameDialog(source),
-                  isDisabled: !canManage,
-                },
-                {
-                  label: "删除数据",
-                  onClick: () => {
-                    void deleteCsvDataSource(source.id);
-                  },
-                  isDisabled: !canManage,
-                },
-              ]}
-            >
-              <span className="compass-tree-label">{source.name}</span>
-            </ContextMenu>
-          ),
-          startContent: <CompassAssetIcon icon={csvIcon} />,
-          endContent: <Badge variant="blue" label="CSV" />,
-          isSelected: source.id === selectedSourceId,
-          onClick: () => {
-            void openCsvDataSource(source);
-          },
-        })),
-      },
-    ],
-    [canManage, csvSources, deleteCsvDataSource, openCsvDataSource, openEditCsvNameDialog, selectedSourceId],
   );
 
   const tableColumns = useMemo<Array<TableColumn<TableRow>>>(
@@ -1089,94 +823,6 @@ export function DataManagementWorkspace({ isActive, canManage, requestWithRefres
     showConnectionTestToast("info", statusText);
   };
 
-  const handleCsvFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) {
-      return;
-    }
-    if (!file.name.toLowerCase().endsWith(".csv") && file.type !== "text/csv") {
-      showCsvImportToast("error", "请选择 CSV 文件。");
-      return;
-    }
-    try {
-      const content = await file.text();
-      setCsvName(file.name);
-      setCsvContent(content);
-    } catch {
-      showCsvImportToast("error", "CSV 文件读取失败，请重新选择文件。");
-    }
-  };
-
-  const handleCsvDictionaryFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) {
-      return;
-    }
-    if (!file.name.toLowerCase().endsWith(".csv") && file.type !== "text/csv") {
-      showCsvImportToast("error", "请选择 CSV 格式的表字典文件。");
-      return;
-    }
-    try {
-      const content = await file.text();
-      setCsvDictionaryName(file.name);
-      setCsvDictionaryContent(content);
-    } catch {
-      showCsvImportToast("error", "表字典文件读取失败，请重新选择文件。");
-    }
-  };
-
-  const importCsv = async () => {
-    if (!csvName.trim() || !csvContent.trim()) {
-      showCsvImportToast("error", "请先上传 CSV 文件。");
-      return;
-    }
-    if (!csvDictionaryName.trim() || !csvDictionaryContent.trim()) {
-      showCsvImportToast("error", "请先上传表字典 CSV 文件。");
-      return;
-    }
-    setIsCsvImporting(true);
-    const upload = await requestWithRefresh((token) => workbenchApi.uploadCsv(token, csvName, csvContent));
-    if (isFailure(upload)) {
-      setIsCsvImporting(false);
-      showCsvFailure(upload);
-      return;
-    }
-    const dictionaryUpload = await requestWithRefresh((token) => workbenchApi.uploadCsv(token, csvDictionaryName, csvDictionaryContent));
-    if (isFailure(dictionaryUpload)) {
-      setIsCsvImporting(false);
-      showCsvFailure(dictionaryUpload);
-      return;
-    }
-    const result = await requestWithRefresh((token) => workbenchApi.importCsv(token, upload.file.id, dictionaryUpload.file.id, "strict"));
-    setIsCsvImporting(false);
-    if (isFailure(result)) {
-      showCsvFailure(result);
-      return;
-    }
-    toast({ type: "info", body: `CSV 导入完成，共 ${result.job.importedRows} 行。`, uniqueID: "csv-imported", collisionBehavior: "overwrite" });
-    closeCsvDialog();
-    setActivePage("csv");
-    setSelectedSourceId(result.job.dataSourceId);
-    await loadDataSources(true);
-    const loaded = await loadSourceObjects(result.job.dataSourceId);
-    const importedTable = loaded?.tables.find((table) => table.id === result.job.importedTableId) ?? loaded?.tables[0];
-    if (importedTable) {
-      const nextTab: CompassDataTab = {
-        id: tableTabId(result.job.dataSourceId, importedTable.id),
-        kind: "table",
-        sourceId: result.job.dataSourceId,
-        schema: importedTable.schema,
-        tableId: importedTable.id,
-        label: importedTable.name,
-      };
-      setSelectedSchema(importedTable.schema);
-      setSelectedTableId(importedTable.id);
-      setOpenTabs((current) => (current.some((tab) => tab.id === nextTab.id) ? current : [...current, nextTab]));
-      setActiveTabId(nextTab.id);
-      setTabPages((current) => ({ ...current, [nextTab.id]: current[nextTab.id] ?? 1 }));
-    }
-  };
-
   const sampleColumns = useMemo<Array<TableColumn<Record<string, unknown>>>>(
     () =>
       (activeTab?.kind === "table" ? sampleDataByTabId[activeTab.id]?.columns : undefined)?.map((column) => ({
@@ -1228,23 +874,7 @@ export function DataManagementWorkspace({ isActive, canManage, requestWithRefres
   const paginatedTableRows = useMemo(() => paginateRows(activeTableRows, displayPage, activePageSize), [activePageSize, activeTableRows, displayPage]);
   const paginatedSampleRows = useMemo(() => paginateRows(activeSampleRows, displayPage, activePageSize), [activePageSize, activeSampleRows, displayPage]);
   const isActiveSampleLoading = activeTab ? loadingSampleTabIds.includes(activeTab.id) : false;
-  const currentTreeItems = activePage === "database" ? databaseTreeItems : csvTreeItems;
-  const isCurrentPageEmpty = activePage === "database" ? databaseSources.length === 0 : csvSources.length === 0;
-  const emptyStateConfig = activePage === "database"
-    ? {
-      icon: databaseSourceIcon,
-      title: "新增数据库连接",
-      description: "空空如也的数据库",
-      actionLabel: "新增连接",
-      onAction: () => setIsConnectionDialogOpen(true),
-    }
-    : {
-      icon: csvIcon,
-      title: "新增CSV数据",
-      description: "空空如也的数据集",
-      actionLabel: "导入CSV",
-      onAction: () => setIsCsvDialogOpen(true),
-    };
+  const isDatabaseEmpty = databaseSources.length === 0;
 
   const setActivePaginationPage = (page: number) => {
     if (!activeTab) {
@@ -1284,7 +914,7 @@ export function DataManagementWorkspace({ isActive, canManage, requestWithRefres
               </VStack>
             </Section>
           )}
-          {!isLoading && !resourceError && <TreeList items={currentTreeItems} density="compact" />}
+          {!isLoading && !resourceError && <TreeList items={databaseTreeItems} density="compact" />}
           {databaseContextMenu && (
             <div
               className="compass-context-menu"
@@ -1307,7 +937,7 @@ export function DataManagementWorkspace({ isActive, canManage, requestWithRefres
                   const tabIcon =
                     tab.kind === "database"
                       ? databaseSourceIcon
-                      : tableEntityIcon(tables.find((table) => table.id === tab.tableId));
+                      : tableEntityIcon();
                   return (
                     <Tab
                       key={tab.id}
@@ -1334,19 +964,19 @@ export function DataManagementWorkspace({ isActive, canManage, requestWithRefres
             )}
 
             <div className="compass-main-content">
-              {!activeTab && isCurrentPageEmpty && !isLoading && !resourceError && (
+              {!activeTab && isDatabaseEmpty && !isLoading && !resourceError && (
                 <div className="compass-empty-state">
                   <EmptyState
-                    icon={<CompassEmptyIcon icon={emptyStateConfig.icon} />}
-                    title={emptyStateConfig.title}
-                    description={emptyStateConfig.description}
-                    actions={<Button label={emptyStateConfig.actionLabel} variant="primary" size="sm" isDisabled={!canManage} onClick={emptyStateConfig.onAction} />}
+                    icon={<CompassEmptyIcon icon={databaseSourceIcon} />}
+                    title="新增数据库连接"
+                    description="空空如也的数据库"
+                    actions={<Button label="新增连接" variant="primary" size="sm" isDisabled={!canManage} onClick={() => setIsConnectionDialogOpen(true)} />}
                     isCompact
                   />
                 </div>
               )}
 
-              {!activeTab && !isCurrentPageEmpty && selectedSource && activePage === "database" && (
+              {!activeTab && !isDatabaseEmpty && selectedSource && (
                 <Table<SchemaRow>
                   data={schemaRows}
                   columns={schemaColumns}
@@ -1359,10 +989,10 @@ export function DataManagementWorkspace({ isActive, canManage, requestWithRefres
                 />
               )}
 
-              {!activeTab && !isCurrentPageEmpty && (!selectedSource || activePage === "csv") && (
+              {!activeTab && !isDatabaseEmpty && !selectedSource && (
                 <Section variant="muted" padding={4}>
                   <Text type="body" color="secondary">
-                    {activePage === "csv" ? "请选择左侧 CSV 数据集。" : "请选择左侧连接或数据库。"}
+                    请选择左侧连接或数据库。
                   </Text>
                 </Section>
               )}
@@ -1475,66 +1105,6 @@ export function DataManagementWorkspace({ isActive, canManage, requestWithRefres
             </div>
           )}
         </>
-      </Dialog>
-
-      <Dialog isOpen={isCsvDialogOpen} onOpenChange={handleCsvDialogOpenChange} width={560} purpose="form" padding={5}>
-        <VStack gap={4} hAlign="stretch">
-          <Text type="display-3" as="h2">导入 CSV</Text>
-          <label className="csv-file-field">
-            <span>CSV 文件</span>
-            <input
-              key={csvInputVersion}
-              type="file"
-              accept=".csv,text/csv"
-              disabled={isCsvImporting}
-              onChange={(event) => void handleCsvFileChange(event)}
-            />
-            <em>{csvName || "请选择本地 CSV 文件"}</em>
-          </label>
-          <label className="csv-file-field">
-            <span>表字典文件</span>
-            <input
-              key={`dictionary-${csvInputVersion}`}
-              type="file"
-              accept=".csv,text/csv"
-              disabled={isCsvImporting}
-              onChange={(event) => void handleCsvDictionaryFileChange(event)}
-            />
-            <em>{csvDictionaryName || "请选择表字典 CSV 文件"}</em>
-          </label>
-          {isCsvImporting && <Spinner label="数据导入中...." />}
-          {csvImportToast && (
-            <div className="dialog-local-toast">
-              <Toast
-                key={csvImportToast.id}
-                type={csvImportToast.type}
-                body={csvImportToast.body}
-                isAutoHide
-                autoHideDuration={5000}
-                onDismiss={() => setCsvImportToast(null)}
-              />
-            </div>
-          )}
-          <HStack hAlign="end" gap={2}>
-            <Button label="取消" variant="secondary" isDisabled={isCsvImporting} onClick={closeCsvDialog} />
-            <Button label="确认导入" variant="primary" isDisabled={isCsvImporting} onClick={importCsv} />
-          </HStack>
-        </VStack>
-      </Dialog>
-
-      <Dialog isOpen={Boolean(editingCsvSource)} onOpenChange={(open) => !open && closeEditCsvNameDialog()} width={460} purpose="form" padding={5}>
-        <VStack gap={4} hAlign="stretch">
-          <Text type="display-3" as="h2">编辑名称</Text>
-          <TextInput
-            label="表名称"
-            value={editingCsvName}
-            onChange={(name) => setEditingCsvName(name.slice(0, 100))}
-          />
-          <HStack hAlign="end" gap={2}>
-            <Button label="取消" variant="secondary" isDisabled={isSavingCsvName} onClick={closeEditCsvNameDialog} />
-            <Button label="保存" variant="primary" isDisabled={isSavingCsvName} onClick={() => void saveCsvName()} />
-          </HStack>
-        </VStack>
       </Dialog>
 
       <AlertDialog

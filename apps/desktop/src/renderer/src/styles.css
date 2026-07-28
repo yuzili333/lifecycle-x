@@ -83,25 +83,6 @@ button {
   max-width: min(420px, calc(100vw - 48px));
 }
 
-.workbench-brand-icon {
-  display: block;
-  width: 32px;
-  height: 32px;
-  border-radius: 8px;
-  object-fit: contain;
-}
-
-.dock-icon-preview {
-  display: block;
-  width: 52px;
-  height: 52px;
-  flex: 0 0 52px;
-  border: 1px solid color-mix(in srgb, var(--workbench-foreground, #e6edf6) 14%, transparent);
-  border-radius: 12px;
-  background: color-mix(in srgb, var(--workbench-background, #0f1724) 82%, #ffffff);
-  object-fit: contain;
-}
-
 .workbench-main {
   display: grid;
   grid-template-rows: 1fr;
@@ -114,46 +95,172 @@ button {
   font-size: var(--workbench-ui-font-size, 14px);
 }
 
-.workbench-top-nav-frame {
-  display: flex;
-  width: 100%;
+.workbench-side-nav {
+  height: 100%;
   color: var(--workbench-foreground, #e6edf6);
-  background: color-mix(in srgb, var(--workbench-background, #0f1724) 94%, #ffffff);
+  background: var(--workbench-background, var(--color-background-body));
 }
 
-.workbench-top-nav-frame [data-xds="top-nav"],
-.workbench-top-nav-frame nav {
-  min-height: 52px;
+.workbench-side-nav-heading span {
+  font-size: var(--font-size-3xl);
 }
 
-.workbench-profile-button {
-  width: 34px !important;
-  min-width: 34px !important;
-  height: 34px !important;
-  min-height: 34px !important;
-  border-radius: 999px !important;
-  padding: 0 !important;
+.workbench-primary-navigation {
+  display: grid;
+  gap: var(--spacing-1);
+  min-width: 0;
 }
 
-.workbench-profile-button svg {
-  width: 20px !important;
-  height: 20px !important;
+.workbench-primary-navigation .astryx-side-nav-item {
+  font-size: var(--font-size-sm);
 }
 
-.nav-asset-icon {
+.workbench-primary-navigation .astryx-side-nav-item svg {
+  width: var(--font-size-sm);
+  height: var(--font-size-sm);
+}
+
+.workbench-side-nav[data-theme-mode="dark"],
+.workbench-main[data-theme-mode="dark"],
+.workbench-main[data-theme-mode="dark"] .data-assistant-workspace,
+.workbench-main[data-theme-mode="dark"] .assistant-chat-shell {
+  background: var(--color-background-body);
+}
+
+.workbench-side-nav-user {
+  width: 100%;
+  min-width: 0;
+  padding: 0;
+}
+
+.workbench-side-nav-user-identity {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.workbench-recent-conversations {
+  display: grid;
+  align-content: start;
+  gap: var(--spacing-1);
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.workbench-side-nav > :has(> .workbench-recent-section) {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.workbench-recent-section {
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.workbench-recent-section > :last-child {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.workbench-recent-conversation {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-1);
+  min-width: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-element);
+  color: var(--color-text-secondary);
+}
+
+.workbench-recent-conversation:hover,
+.workbench-recent-conversation.active {
+  border-color: var(--color-border);
+  color: var(--color-text-primary);
+  background: var(--color-overlay-pressed);
+}
+
+.workbench-recent-conversation-select {
+  display: grid;
+  flex: 1 1 auto;
+  gap: var(--spacing-0-5);
+  min-width: 0;
+  border: 0;
+  padding: var(--spacing-2);
+  color: inherit;
+  background: transparent;
+  text-align: start;
+  cursor: default;
+}
+
+.workbench-conversation-timestamp {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workbench-conversation-title {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+}
+
+.workbench-conversation-title-content {
   display: inline-block;
-  width: 14px;
-  height: 14px;
-  flex: 0 0 14px;
-  background: currentColor;
-  mask: var(--nav-icon-url) center / contain no-repeat;
-  -webkit-mask: var(--nav-icon-url) center / contain no-repeat;
+  min-width: max-content;
+  transform: translateX(0);
 }
 
-.nav-asset-icon-lg {
-  width: 24px;
-  height: 24px;
-  flex-basis: 24px;
+.workbench-conversation-title[data-overflowing="true"] {
+  text-overflow: clip;
+}
+
+.workbench-conversation-title[data-overflowing="true"]:hover .workbench-conversation-title-content,
+.workbench-recent-conversation-select:focus-visible
+  .workbench-conversation-title[data-overflowing="true"]
+  .workbench-conversation-title-content {
+  animation: workbench-conversation-title-marquee var(--conversation-marquee-duration) linear infinite alternate;
+}
+
+@keyframes workbench-conversation-title-marquee {
+  to {
+    transform: translateX(var(--conversation-marquee-distance));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .workbench-conversation-title[data-overflowing="true"] {
+    text-overflow: ellipsis;
+  }
+
+  .workbench-conversation-title[data-overflowing="true"] .workbench-conversation-title-content {
+    animation: none;
+  }
+}
+
+.workbench-conversation-timestamp {
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
+}
+
+.workbench-recent-conversation-menu {
+  flex: 0 0 auto;
+  margin-inline-end: var(--spacing-1);
+  opacity: 0;
+}
+
+.workbench-recent-conversation:hover .workbench-recent-conversation-menu,
+.workbench-recent-conversation:focus-within .workbench-recent-conversation-menu,
+.workbench-recent-conversation.active .workbench-recent-conversation-menu {
+  opacity: 1;
 }
 
 .workbench-content {
@@ -213,12 +320,6 @@ button {
   background: currentColor;
   mask: var(--compass-icon-url) center / contain no-repeat;
   -webkit-mask: var(--compass-icon-url) center / contain no-repeat;
-}
-
-.compass-tree-label {
-  display: inline-flex;
-  align-items: center;
-  min-width: 0;
 }
 
 .compass-empty-state {
@@ -466,31 +567,10 @@ button {
   background: var(--workbench-accent, #65d6d2);
 }
 
-.csv-file-field {
-  display: grid;
-  gap: 8px;
-  color: color-mix(in srgb, var(--workbench-foreground, #e6edf6) 74%, transparent);
-  font-size: 13px;
-}
-
-.csv-file-field input {
-  border: 1px solid color-mix(in srgb, var(--workbench-foreground, #e6edf6) 16%, transparent);
-  border-radius: 8px;
-  padding: 10px;
-  color: var(--workbench-foreground, #e6edf6);
-  background: color-mix(in srgb, var(--workbench-background, #0f1724) 82%, #ffffff);
-  font: inherit;
-}
-
-.csv-file-field em {
-  color: color-mix(in srgb, var(--workbench-foreground, #e6edf6) 58%, transparent);
-  font-style: normal;
-}
-
 .data-assistant-workspace {
   position: relative;
   display: grid;
-  grid-template-columns: 236px minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
   width: 100%;
   height: 100%;
   max-height: 100%;
@@ -505,111 +585,6 @@ button {
 
 .data-assistant-workspace :where(button, input, textarea, [contenteditable="true"]) {
   font-size: 12px;
-}
-
-.assistant-history-panel {
-  position: relative;
-  display: grid;
-  grid-template-rows: minmax(0, 1fr);
-  min-width: 0;
-  min-height: 0;
-  border-right: 1px solid color-mix(in srgb, var(--workbench-foreground, #e6edf6) 12%, transparent);
-  background: color-mix(in srgb, var(--workbench-background, #0f1724) 94%, #ffffff);
-}
-
-.assistant-history-new-chat {
-  position: absolute;
-  right: 0;
-  bottom: 16px;
-  left: 0;
-  display: flex;
-  justify-content: center;
-  pointer-events: none;
-}
-
-.assistant-history-new-chat button {
-  pointer-events: auto;
-}
-
-.assistant-history-list {
-  display: grid;
-  align-content: start;
-  gap: 4px;
-  min-height: 0;
-  padding: 8px 8px 72px;
-  overflow: auto;
-}
-
-.assistant-history-item {
-  display: flex;
-  gap: 6px;
-  align-items: center;
-  width: 100%;
-  border: 1px solid transparent;
-  border-radius: 6px;
-  padding: 5px;
-  color: color-mix(in srgb, var(--workbench-foreground, #e6edf6) 78%, transparent);
-  background: transparent;
-}
-
-.assistant-history-item:hover,
-.assistant-history-item.active {
-  border-color: color-mix(in srgb, var(--workbench-accent, #65d6d2) 34%, transparent);
-  color: var(--workbench-foreground, #e6edf6);
-  background: color-mix(in srgb, var(--workbench-background, #0f1724) 76%, var(--workbench-accent, #65d6d2));
-}
-
-.assistant-history-select {
-  display: grid;
-  flex: 1 1 auto;
-  gap: 4px;
-  min-width: 0;
-  border: 0;
-  padding: 3px 5px;
-  color: inherit;
-  background: transparent;
-  text-align: left;
-  cursor: default;
-}
-
-.assistant-history-select strong,
-.assistant-history-select span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.assistant-history-select strong {
-  font-size: 12px;
-  font-weight: 600;
-}
-
-.assistant-history-select span {
-  color: color-mix(in srgb, currentColor 68%, transparent);
-  font-size: 11px;
-}
-
-.assistant-history-actions {
-  display: flex;
-  flex: 0 0 auto;
-  gap: 4px;
-  opacity: 0;
-  transition: opacity 120ms ease;
-}
-
-.assistant-history-item:hover .assistant-history-actions,
-.assistant-history-item:focus-within .assistant-history-actions,
-.assistant-history-item.active .assistant-history-actions {
-  opacity: 1;
-}
-
-.assistant-history-actions button {
-  width: 24px !important;
-  min-width: 24px !important;
-  height: 24px !important;
-  min-height: 24px !important;
-  padding: 0 !important;
-  border-radius: 5px !important;
 }
 
 .assistant-chat-shell {
@@ -2280,9 +2255,43 @@ button {
   grid-template-rows: 1fr auto;
   gap: 20px;
   min-width: 0;
-  overflow: auto;
+  overflow-y: auto;
+  overflow-x: hidden;
   padding: 24px;
   background: color-mix(in srgb, var(--workbench-background, #0f1724) 88%, #ffffff);
+}
+
+.settings-skill-content,
+.skill-management-list,
+.skill-management-item-heading,
+.skill-management-description {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.settings-skill-content {
+  overflow-x: hidden;
+}
+
+.skill-management-list {
+  overflow: visible;
+}
+
+.skill-management-list li,
+.skill-management-list li > * {
+  min-width: 0;
+}
+
+.skill-management-item-heading {
+  overflow: hidden;
+}
+
+.skill-management-description {
+  overflow-wrap: anywhere;
+}
+
+.skill-management-item-actions {
+  flex: 0 0 auto;
 }
 
 .settings-footer {
