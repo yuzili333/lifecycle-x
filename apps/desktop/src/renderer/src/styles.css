@@ -1560,13 +1560,6 @@ button {
   white-space: pre-wrap;
 }
 
-.assistant-tool-actions {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  margin-top: 6px;
-}
-
 .assistant-stream-cursor {
   display: inline-flex;
   gap: 6px;

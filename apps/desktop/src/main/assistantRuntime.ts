@@ -1231,6 +1231,30 @@ function isJsonContent(value: string) {
   }
 }
 
+function reportAnalysisPayload(value: unknown) {
+  let current = value;
+  for (let depth = 0; depth < 4; depth += 1) {
+    if (typeof current === "string") {
+      const trimmed = current.trim();
+      if (!trimmed) return null;
+      try {
+        current = JSON.parse(trimmed) as unknown;
+        continue;
+      } catch {
+        return trimmed;
+      }
+    }
+    if (isPlainRecordValue(current) && typeof current.stdout === "string") {
+      current = current.stdout;
+      continue;
+    }
+    break;
+  }
+  if (typeof current === "string") return current.trim() || null;
+  if (current === null || current === undefined) return null;
+  return JSON.stringify(current);
+}
+
 function parseCsvAliasJson(value: string | undefined) {
   if (!value) {
     return [];
@@ -4156,16 +4180,20 @@ export class AssistantRuntime {
     const records = (await this.toolResultRegistry.listByConversation(conversationId))
       .filter((record) =>
         record.status === "completed" &&
-        relevantKinds.includes(record.toolKind) &&
-        (!messageId || record.messageId === messageId)
+        relevantKinds.includes(record.toolKind)
       );
     const latestRecords = relevantKinds.flatMap((kind) => {
-      const record = records.filter((candidate) => candidate.toolKind === kind).at(-1);
+      const recordsOfKind = records.filter((candidate) => candidate.toolKind === kind);
+      const record = (
+        messageId
+          ? recordsOfKind.filter((candidate) => candidate.messageId === messageId).at(-1)
+          : null
+      ) ?? recordsOfKind.at(-1);
       return record ? [record] : [];
     });
     if (latestRecords.length === 0) return null;
 
-    const sections = latestRecords.map((record) => {
+    const sections = await Promise.all(latestRecords.map(async (record) => {
       const metadata = record.result?.metadata;
       const preview = typeof metadata?.resultPreview === "string" ? metadata.resultPreview.trim() : "";
       const fields = uniqueValues([
@@ -4179,17 +4207,37 @@ export class AssistantRuntime {
           : null;
       const artifactIds = record.outputArtifactIds ?? record.result?.artifactIds ?? [];
       const includePreview = toolKind === "report_generation" && record.toolKind === "python_analysis" && preview;
+      let analysisResult = includePreview ? reportAnalysisPayload(preview) : null;
+      if (toolKind === "report_generation" && record.toolKind === "python_analysis") {
+        for (const artifactId of artifactIds) {
+          const artifact = await this.toolArtifactManager.getArtifact(artifactId);
+          if (!artifact || (artifact.artifactType !== "analysis" && artifact.artifactType !== "report_summary")) {
+            continue;
+          }
+          const artifactPayload = reportAnalysisPayload(artifact?.content);
+          if (artifactPayload) {
+            analysisResult = artifactPayload;
+            break;
+          }
+        }
+      }
       return [
         `- ${record.toolKind}: toolCallId=${record.toolCallId}`,
         `  artifactIds=${artifactIds.join(", ") || "--"}`,
         `  rowCount=${rowCount ?? "--"}`,
         `  resultFields=${fields.join(", ") || "--"}`,
         record.result?.summary ? `  summary=${truncateText(record.result.summary, 500)}` : null,
-        includePreview ? `  analysisPreview:\n${truncateText(preview, 2_000)}` : null,
+        analysisResult
+          ? `  analysisResult（完整 Python 分析结果，报告中的分组行、合计和结论必须逐项取自该 JSON，禁止使用示例值或自行补齐）：\n${analysisResult}`
+          : null,
       ].filter((line): line is string => Boolean(line)).join("\n");
-    });
-    return truncateText(
-      ["当前步骤可引用的真实上游结果摘要（只使用这些字段和 Artifact，不要复述或猜测上游脚本）：", ...sections].join("\n"),
+    }));
+    const context = [
+      "当前步骤可引用的真实上游结果摘要（只使用这些字段和 Artifact，不要复述或猜测上游脚本）：",
+      ...sections,
+    ].join("\n");
+    return toolKind === "report_generation" ? context : truncateText(
+      context,
       MAX_EXECUTION_RESULT_CONTEXT_CHARS,
     );
   }
@@ -4854,11 +4902,14 @@ export class AssistantRuntime {
   private toolBlock(toolCall: AssistantToolCall, body: string): AssistantBlock {
     const files = extractScriptFiles(toolCall.script);
     const isMarkdownResult = toolCall.status === "completed" && toolCall.kind === "python" && isMarkdownLikeContent(body);
+    const isPendingApproval = toolCall.status === "pending_approval";
     return {
       id: randomUUID(),
       type: isMarkdownResult ? "markdown" : toolCall.status === "completed" ? "json" : "card",
-      title: `${toolCall.kind.toUpperCase()} 工具调用：${toolCall.status}`,
-      content: body,
+      title: isPendingApproval
+        ? `${toolCall.kind.toUpperCase()} 工具调用权限申请`
+        : `${toolCall.kind.toUpperCase()} 工具调用：${toolCall.status}`,
+      content: isPendingApproval ? "" : body,
       toolCallId: toolCall.id,
       toolStatus: toolCall.status,
       toolName: toolCall.kind,
@@ -5175,70 +5226,25 @@ export class AssistantRuntime {
         stack: error instanceof Error ? error.stack : undefined,
       });
       const currentBeforeFailure = this.messageFromRow(this.db.prepare("select * from messages where id = ?").get(toolCall.messageId));
-      const failedBlock = this.toolBlock(failed, messageText);
-      const recovery = this.agentGuidance.handleToolError({
-        conversationId: toolCall.conversationId,
-        toolKind: assistantToolKindToOrchestrationKind(toolCall.kind),
-        message: messageText,
-        toolCallId: toolCall.id,
-      });
-      const toolState = await this.toolResultRegistry.getConversationState(toolCall.conversationId);
-      this.agentGuidance.createCheckpoint({
-        checkpointId: `checkpoint_${randomUUID()}`,
-        workflowId: recovery.guidance.workflowId,
-        conversationId: toolCall.conversationId,
-        status: "recoverable_error",
-        completedStepIds: [],
-        pendingStepIds: [toolCall.kind],
-        activeDatasetIds: [],
-        latestSuccessfulToolCallIds: {
-          sql_query: toolState.latestSuccessfulSqlToolCallId,
-          python_analysis: toolState.latestSuccessfulPythonToolCallId,
-          chart_rendering: toolState.latestSuccessfulChartToolCallId,
-          report_generation: toolState.latestSuccessfulReportToolCallId,
-        },
-        artifactIds: [
-          ...(toolState.latestSuccessfulSqlArtifactIds ?? []),
-          ...(toolState.latestSuccessfulPythonArtifactIds ?? []),
-          ...(toolState.latestSuccessfulChartArtifactIds ?? []),
-          ...(toolState.latestSuccessfulReportArtifactIds ?? []),
-        ],
-        pendingGuidance: recovery.guidance,
-        activeIssue: recovery.issue,
-        createdAt: nowIso(),
-        updatedAt: nowIso(),
-      });
-      await this.workflowMemoryBridge.writeWorkflowMemory({
-        conversationId: toolCall.conversationId,
-        userId: toolCall.userId,
-        type: "workflow_recoverable_error",
-        summary: recovery.guidance.title,
-        payload: {
-          toolCallId: toolCall.id,
-          toolKind: toolCall.kind,
-          issueCode: recovery.issue.code,
-          resumeToken: recovery.guidance.resumeToken,
-          preservedToolCallIds: {
-            sql_query: toolState.latestSuccessfulSqlToolCallId,
-            python_analysis: toolState.latestSuccessfulPythonToolCallId,
-            chart_rendering: toolState.latestSuccessfulChartToolCallId,
-            report_generation: toolState.latestSuccessfulReportToolCallId,
-          },
-          artifactIds: [
-            ...(toolState.latestSuccessfulSqlArtifactIds ?? []),
-            ...(toolState.latestSuccessfulPythonArtifactIds ?? []),
-            ...(toolState.latestSuccessfulChartArtifactIds ?? []),
-            ...(toolState.latestSuccessfulReportArtifactIds ?? []),
-          ],
-        },
-      });
-      const failedBlocks = preserveContent ? replaceToolBlock(currentBeforeFailure.blocks, failedBlock) : [failedBlock];
-      failedBlocks.push(...this.guidanceBlocks(recovery.guidance));
+      const failedBlock: AssistantBlock = {
+        ...this.toolBlock(failed, messageText),
+        type: "json",
+      };
+      const failureSummary = `${this.agentToolLabel(assistantToolKindToOrchestrationKind(toolCall.kind))}执行失败，可在 tool_calls 中查看错误详情。`;
+      const failureTextBlock: AssistantBlock = {
+        id: `tool-failure-text-${failed.id}`,
+        type: "text",
+        content: failureSummary,
+      };
+      const failedBlocks = preserveContent
+        ? [...replaceToolBlock(currentBeforeFailure.blocks, failedBlock), failureTextBlock]
+        : [failureTextBlock, failedBlock];
+      const isDualModelStep = failed.metadata?.orchestrationMode === "dual_model";
       runningMessage = this.updateMessage(toolCall.messageId, {
-        status: "recoverable_error",
-        content: preserveContent ? currentBeforeFailure.content : messageText,
+        status: isDualModelStep ? "processing" : "completed",
+        content: preserveContent ? `${currentBeforeFailure.content.trim()}\n\n${failureSummary}` : failureSummary,
         blocks: failedBlocks,
-        errorMessage: messageText,
+        errorMessage: undefined,
       });
       this.options.emit({ type: "tool", conversationId: toolCall.conversationId, toolCall: failed, message: runningMessage });
       return { success: true as const, toolCall: failed, message: runningMessage };

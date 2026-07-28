@@ -64,7 +64,7 @@ import {
 } from "./chat-tool-selector";
 import { VisualizationRenderer } from "./components/VisualizationRenderer";
 import { AgentGuidanceCard } from "./components/agent-guidance";
-import { ReportMarkdownViewer, toolKindLabel, toolStatusLabel } from "./components/tool-calls";
+import { ReportMarkdownViewer, ToolApprovalCard, toolKindLabel, toolStatusLabel } from "./components/tool-calls";
 import { StreamingReportSegment } from "./components/streaming-content";
 import {
   applyChatStreamEvent,
@@ -1329,7 +1329,11 @@ function toolCallsFromToolState(
 }
 
 function shouldHideInlineToolResult(block: AssistantBlock) {
-  return Boolean(block.toolCallId && block.toolStatus === "completed");
+  return Boolean(
+    block.toolCallId &&
+    block.toolStatus &&
+    ["completed", "error", "blocked", "declined"].includes(block.toolStatus),
+  );
 }
 
 export function DataAssistantWorkspace({
@@ -3742,6 +3746,17 @@ export function DataAssistantWorkspace({
       return null;
     }
 
+    if (role === "assistant" && block.toolCallId && block.toolStatus === "pending_approval") {
+      return (
+        <ToolApprovalCard
+          key={block.id}
+          toolName={block.toolName ?? extractToolName(block)}
+          onAccept={() => approveTool(block.toolCallId!, true)}
+          onReject={() => approveTool(block.toolCallId!, false)}
+        />
+      );
+    }
+
     if (role === "assistant" && block.guidance) {
       return renderGuidanceBlock(block, block.guidance);
     }
@@ -3832,12 +3847,6 @@ export function DataAssistantWorkspace({
       <div key={block.id} className={`assistant-message-block ${block.type}`}>
         {block.title && <strong>{block.title}</strong>}
         {body}
-        {block.toolCallId && block.toolStatus === "pending_approval" && (
-          <div className="assistant-tool-actions">
-            <Button label="批准执行" variant="primary" size="sm" onClick={() => approveTool(block.toolCallId!, true)} />
-            <Button label="拒绝" variant="ghost" size="sm" onClick={() => approveTool(block.toolCallId!, false)} />
-          </div>
-        )}
       </div>
     );
   };

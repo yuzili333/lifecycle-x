@@ -1,5 +1,7 @@
+import { randomUUID } from "node:crypto";
 import {
   createStreamingModelAdapter,
+  ToolRegistry,
   type ConversationMessage,
   type JsonSchema,
   type ModelRequestOptions,
@@ -264,6 +266,9 @@ export class ExecutionParameterAdapter {
   constructor(private readonly config: ModelEndpointConfig) {}
 
   async execute(input: ExecutionAdapterInput): Promise<ExecutionAdapterOutput> {
+    if (input.step.toolKind === "report_generation") {
+      return this.executeReport(input);
+    }
     const adapter = createStreamingModelAdapter({ ...this.config, toolExecutionMode: "serial", maxToolRounds: 1 });
     adapter.registerTool(input.tool);
     let invoked = false;
@@ -274,7 +279,6 @@ export class ExecutionParameterAdapter {
     let error: string | undefined;
     let errorCode: string | undefined;
     let errorStage: ExecutionAdapterOutput["errorStage"];
-    let streamedReport = "";
     for await (const event of adapter.streamChat({
       conversationId: input.conversationId,
       messageId: input.messageId,
@@ -299,13 +303,6 @@ export class ExecutionParameterAdapter {
       if (event.type === "tool-call-start") {
         invoked = true;
         toolCallId = event.toolCallId;
-      } else if (event.type === "tool-call-delta" && input.step.toolKind === "report_generation") {
-        const argumentsText = typeof event.payload.argumentsText === "string" ? event.payload.argumentsText : "";
-        const markdown = extractPartialJsonStringField(argumentsText, "markdown");
-        if (markdown.length > streamedReport.length) {
-          input.onReportDelta?.(markdown.slice(streamedReport.length));
-          streamedReport = markdown;
-        }
       } else if (event.type === "text-delta") {
         content += typeof event.payload.delta === "string" ? event.payload.delta : "";
       } else if (event.type === "tool-execution-result") {
@@ -323,6 +320,125 @@ export class ExecutionParameterAdapter {
       }
     }
     return { invoked, output, toolCallId, content, traceId, error, errorCode, errorStage };
+  }
+
+  private async executeReport(input: ExecutionAdapterInput): Promise<ExecutionAdapterOutput> {
+    const adapter = createStreamingModelAdapter({ ...this.config, toolExecutionMode: "serial", maxToolRounds: 0 });
+    let content = "";
+    let traceId: string | undefined;
+    let error: string | undefined;
+    let errorCode: string | undefined;
+    let finishReason: string | undefined;
+    const metadata = {
+      modelRole: "execution",
+      orchestrationPhase: "parameter_generation",
+      executionProfile: this.config.profileName,
+      stepId: input.step.stepId,
+      toolKind: input.step.toolKind,
+    };
+    for await (const event of adapter.streamChat({
+      conversationId: input.conversationId,
+      messageId: input.messageId,
+      messages: input.messages,
+      model: this.config.model,
+      contentType: "markdown",
+      maxToolRounds: 0,
+      signal: input.signal,
+      timeoutMs: this.config.timeoutMs,
+      requestOptions: this.config.requestOptions,
+      metadata,
+    })) {
+      traceId = event.traceId ?? traceId;
+      input.onEvent?.(event);
+      if (event.type === "text-delta" || event.type === "markdown-delta") {
+        const delta = typeof event.payload.delta === "string" ? event.payload.delta : "";
+        content += delta;
+        input.onReportDelta?.(delta);
+      } else if (event.type === "model-observation" && event.payload.phase === "provider-round-complete") {
+        const detail = event.payload.detail;
+        if (detail && typeof detail === "object" && typeof (detail as Record<string, unknown>).finishReason === "string") {
+          finishReason = (detail as Record<string, unknown>).finishReason as string;
+        }
+      } else if (event.type === "stream-error") {
+        const serialized = event.payload.error as { code?: string; message?: string } | undefined;
+        error = serialized?.message ?? "报告内容生成失败。";
+        errorCode = serialized?.code;
+      }
+    }
+    if (error) {
+      return { invoked: false, content, traceId, error, errorCode, errorStage: "provider" };
+    }
+    if (finishReason === "length") {
+      return {
+        invoked: false,
+        content,
+        traceId,
+        error: "报告正文达到模型输出上限，未登记不完整报告。",
+        errorCode: "PROVIDER_OUTPUT_TRUNCATED",
+        errorStage: "provider",
+      };
+    }
+    const markdown = content.trim();
+    if (!markdown) {
+      return {
+        invoked: false,
+        content,
+        traceId,
+        error: "生成报告未返回 Markdown 正文。",
+        errorCode: "TOOL_INPUT_INVALID",
+        errorStage: "schema",
+      };
+    }
+
+    const toolCallId = `report-${randomUUID()}`;
+    const resolvedTraceId = traceId ?? `trace-${randomUUID()}`;
+    const title = reportTitleFromMarkdown(markdown);
+    const argumentsText = JSON.stringify({ title, markdown });
+    input.onEvent?.(localExecutionEvent(input, "tool-call-start", resolvedTraceId, toolCallId, {
+      index: 0,
+      toolName: input.tool.name,
+      argumentsDelta: "",
+      argumentsText,
+    }));
+    input.onEvent?.(localExecutionEvent(input, "tool-call-end", resolvedTraceId, toolCallId, {
+      index: 0,
+      toolName: input.tool.name,
+      argumentsText,
+    }));
+    const registry = new ToolRegistry();
+    registry.registerTool(input.tool);
+    const [result] = await registry.executeToolCalls(
+      [{ toolCallId, index: 0, name: input.tool.name, argumentsText }],
+      "serial",
+      {
+        conversationId: input.conversationId,
+        messageId: input.messageId,
+        traceId: resolvedTraceId,
+        signal: input.signal,
+        metadata,
+      },
+    );
+    if (result?.success) {
+      input.onEvent?.(localExecutionEvent(input, "tool-execution-result", resolvedTraceId, toolCallId, {
+        result,
+      }));
+      return { invoked: true, output: result.output, toolCallId, content, traceId: resolvedTraceId };
+    }
+    const failure = result?.error;
+    const message = failure?.message ?? "报告工具执行失败。";
+    input.onEvent?.(localExecutionEvent(input, "tool-execution-error", resolvedTraceId, toolCallId, {
+      result,
+      error: failure,
+    }));
+    return {
+      invoked: true,
+      toolCallId,
+      content,
+      traceId: resolvedTraceId,
+      error: message,
+      errorCode: failure?.code ?? "TOOL_EXECUTION_FAILED",
+      errorStage: failure?.code === "TOOL_INPUT_INVALID" ? "schema" : "handler",
+    };
   }
 }
 
@@ -479,14 +595,22 @@ export function buildExecutionSystemPrompt(step: PlannerStep, tool: ToolDefiniti
       ? "只生成非空、简洁且语法完整的 script，并仅使用上游结果摘要中存在的真实字段；字段名称必须从上游结果字段清单逐字符复制，包含单位的中英文括号必须完整保留在字符串引号内，不得手工改写。金额一旦解析为 Decimal，累计、分子、分母、占比和单位换算必须始终使用 Decimal，只在最终 JSON 序列化时转换为 float；正确形式是 float(decimal_numerator / decimal_denominator)，禁止 float_value / Decimal_value。Artifact 血缘由客户端注入。运行时会把已授权 SQL Artifact 的完整数据行作为 JSON 数组写入 stdin，使用 `import json, sys` 和 `rows = json.load(sys.stdin)` 读取；不要输出推测性长注释，不要猜测 artifact_data、df_data 等全局变量，不要读取本地路径，也不要用 Markdown 围栏、<script> 或其他包装标签包裹脚本。"
       : step.toolKind === "chart_rendering"
         ? "只提供 title、chartType、dimensionFields、measureFields 及可选 dimensionLabels、measureLabels、排序/颜色字段；禁止生成 visualizationSpec、ECharts option 或内联数据。维度和指标必须来自上游结果摘要，标签只用于展示且映射键必须是对应字段。"
-        : "只提供 title 和非空 markdown；正文只能使用上游分析摘要和 Artifact 中已经存在的结论，引用关系由客户端注入。只允许展示当前轮成功生成的图表；图表步骤失败或没有可用图表时继续生成文本报告并省略可视化章节，不得引用历史图表补位。正文不得显示 Artifact ID、toolCallId、内部工具名称或“上游 Python 分析结果”等内部血缘信息。禁止使用 Markdown 图片语法或 HTML img 标签表示图表，图表仅由客户端注入的受控可视化节点展示。";
+        : "直接输出非空、完整的 Markdown 正文，一级标题作为报告标题；正文只能使用上游分析摘要和 Artifact 中已经存在的结论，引用关系由客户端注入。只允许展示当前轮成功生成的图表；图表步骤失败或没有可用图表时继续生成文本报告并省略可视化章节，不得引用历史图表补位。正文不得显示 Artifact ID、toolCallId、内部工具名称或“上游 Python 分析结果”等内部血缘信息。禁止使用 Markdown 图片语法或 HTML img 标签表示图表，图表仅由客户端注入的受控可视化节点展示。";
   return [
-    "你是数据探针 Agent 的执行模型，只为当前一个确定步骤生成工具参数。",
+    step.toolKind === "report_generation"
+      ? "你是数据探针 Agent 的报告执行模型，只为当前一个确定步骤生成报告正文。"
+      : "你是数据探针 Agent 的执行模型，只为当前一个确定步骤生成工具参数。",
     `当前步骤：${step.purpose}`,
     `预期产物：${step.expectedOutput}`,
-    `唯一允许调用的工具：${tool.name}`,
-    "必须调用该工具一次；不得改变执行计划、增加分析维度或输出用户未要求的内容。",
-    "参数必须严格符合工具 Schema，并使用上下文中的真实表名、字段名和 Artifact ID。",
+    step.toolKind === "report_generation"
+      ? "当前步骤不向模型暴露工具；请直接流式输出完整 Markdown，客户端会在本地校验后调用受控报告工具。"
+      : `唯一允许调用的工具：${tool.name}`,
+    step.toolKind === "report_generation"
+      ? "最终响应只能包含 Markdown 正文，不得使用 JSON、函数调用、Markdown 代码围栏或解释性前后缀。"
+      : "必须调用该工具一次；不得改变执行计划、增加分析维度或输出用户未要求的内容。",
+    step.toolKind === "report_generation"
+      ? "正文必须使用上下文中的真实字段、统计结果和可用 Artifact 摘要。"
+      : "参数必须严格符合工具 Schema，并使用上下文中的真实表名、字段名和 Artifact ID。",
     canonicalParameterRule,
     "SQL 仅允许单条只读查询；复合分析任务的 SQL 返回后续需要的明细字段，统计、占比和排序交给 Python。",
     "Python 只能使用标准库和已授权输入 Artifact，不得连接业务数据库或构造模拟数据。",
@@ -504,6 +628,30 @@ export function executionMessages(systemContext: string, userPrompt: string, ste
 
 function message(role: ConversationMessage["role"], content: string): ConversationMessage {
   return { id: `agent-${role}-${Math.random().toString(36).slice(2)}`, role, content, createdAt: new Date().toISOString() };
+}
+
+function reportTitleFromMarkdown(markdown: string) {
+  const heading = markdown.match(/^#\s+(.+)$/m)?.[1]?.trim();
+  return (heading || "分析报告").slice(0, 120);
+}
+
+function localExecutionEvent(
+  input: ExecutionAdapterInput,
+  type: ModelStreamEvent["type"],
+  traceId: string,
+  toolCallId: string,
+  payload: Record<string, unknown>,
+): ModelStreamEvent {
+  return {
+    eventId: `evt-${randomUUID()}`,
+    type,
+    conversationId: input.conversationId,
+    messageId: input.messageId,
+    createdAt: new Date().toISOString(),
+    payload,
+    traceId,
+    toolCallId,
+  };
 }
 
 export function extractPartialJsonStringField(source: string, field: string) {

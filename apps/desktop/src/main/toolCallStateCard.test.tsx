@@ -1,6 +1,12 @@
 import { renderToString } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { ReportToolCallCard, ToolCallStateCard, toolRecordSummary, toolStatusLabel } from "../renderer/src/components/tool-calls";
+import {
+  ReportToolCallCard,
+  ToolApprovalCard,
+  ToolCallStateCard,
+  toolRecordSummary,
+  toolStatusLabel,
+} from "../renderer/src/components/tool-calls";
 import { TOOL_NAMES, type ToolCallRecord, type ToolKind } from "./toolOrchestration";
 
 const createdAt = "2026-07-14T00:00:00.000Z";
@@ -63,6 +69,26 @@ describe("ToolCallStateCard", () => {
   it("summarizes version, artifacts and lineage", () => {
     expect(toolStatusLabel("blocked")).toBe("已阻塞");
     expect(toolRecordSummary(record("sql_query", { version: 3, outputArtifactIds: ["a", "b"] }))).toBe("v3 · 已完成 · 2 Artifact · 血缘 2");
+  });
+});
+
+describe("ToolApprovalCard", () => {
+  it("renders explicit approval actions without a surface acceptance hint", () => {
+    const html = renderToString(
+      <ToolApprovalCard
+        toolName="python"
+        onAccept={() => undefined}
+        onReject={() => undefined}
+      />,
+    );
+
+    expect(html).toContain("PYTHON 工具调用权限申请");
+    expect(html).toContain("接受");
+    expect(html).toContain("拒绝");
+    expect(html).toContain("请选择接受或拒绝");
+    expect(html).not.toContain("点击接受");
+    expect(html).not.toContain("批准执行");
+    expect(html).not.toContain("审批通过后执行");
   });
 });
 

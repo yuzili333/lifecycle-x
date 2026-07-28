@@ -125,6 +125,75 @@ describe("Skill package validation", () => {
     }));
   });
 
+  it("loads the built-in branch asset quality report as a read-only system skill", async () => {
+    const root = resolve(
+      dirname(fileURLToPath(import.meta.url)),
+      "../../../../../skill/branch-asset-quality-report",
+    );
+    const validated = await validateSkillDirectory({
+      root,
+      origin: "system",
+      traceId: "trace-branch-asset-quality",
+    });
+    const packageText = await Promise.all([
+      "manifest.json",
+      "SKILL.md",
+      "report-template.md",
+      "schemas/skill-input.schema.json",
+      "schemas/report-data.schema.json",
+      "tool-policy.json",
+    ].map((relativePath) => readFile(join(root, relativePath), "utf8")));
+
+    expect(validated.loaded.summary).toMatchObject({
+      skillId: "branch-asset-quality-report",
+      displayName: "各分行资产质量状况分析报告",
+      version: "1.1.1",
+      origin: "system",
+      enabled: true,
+      canToggle: false,
+      canDelete: false,
+    });
+    expect(validated.loaded.requiredTools).toEqual([
+      "request_sql_query_execution",
+      "request_python_analysis_execution",
+      "request_markdown_report_generation",
+    ]);
+    expect(validated.loaded.requiredTools).not.toContain("request_chart_rendering");
+    expect(validated.loaded.instructions).toContain("不良：源值“不良”，或次级、可疑、损失合计");
+    expect(validated.loaded.instructions).toContain("全行平均率必须使用全量分子除以全量分母计算");
+    expect(validated.loaded.instructions).toContain("按合同流水号去重");
+    expect(validated.loaded.reportTemplate).toContain("{{branch_distribution_rows}}");
+    expect(validated.loaded.reportTemplate).toContain("{{numbered_conclusions}}");
+    expect(validated.loaded.reportTemplate).toContain("正常({{amount_unit_label}})");
+    expect(validated.loaded.reportTemplate).toContain("合计({{amount_unit_label}}) | 不良率% | 关注率%");
+    expect(validated.loaded.reportTemplate).not.toContain("{{amount_business_name}}");
+    expect(validated.loaded.reportTemplate).not.toContain("正常(`{{loan_balance_business_name}}`");
+    expect(validated.loaded.instructions).toContain("默认金额指标为贷款余额，报告展示单位为 `万`");
+    expect(validated.loaded.instructions).toContain("第 12、13 列分别渲染金额不良率和金额关注率");
+    expect(validated.loaded.instructions).toContain("所有对账完成前禁止转换为 `float`");
+    expect(validated.loaded.instructions).toContain("禁止使用 `sum(branch[\"totalBalance\"])`");
+    expect(validated.loaded.instructions).toContain("禁止读取 `branchDistribution[0]`");
+    expect(JSON.stringify(validated.loaded.outputSchema)).toContain("nonperformingBalanceRate");
+    expect(JSON.stringify(validated.loaded.outputSchema)).toContain("attentionBalanceRate");
+    expect(JSON.stringify(validated.loaded.outputSchema)).toContain("normalBalanceDisplay");
+    expect(JSON.stringify(validated.loaded.outputSchema)).toContain("amountDisplayUnit");
+    expect(JSON.stringify(validated.loaded.outputSchema)).toContain("nonperformingCountRateDisplay");
+    expect(packageText.join("\n")).not.toMatch(
+      /latest_five_level_risk|loan_balance_10k|businessFieldId|十二级分类/,
+    );
+
+    const manager = new LocalSkillManager({
+      userDataRoot: temporaryDirectory("skill-branch-catalog-"),
+      systemRoot: resolve(root, ".."),
+    });
+    expect(await manager.list("user-1")).toContainEqual(expect.objectContaining({
+      skillId: "branch-asset-quality-report",
+      origin: "system",
+      availability: "ready",
+      enabled: true,
+    }));
+  });
+
   it("does not expose local paths through generic IPC errors", () => {
     const result = asSkillOperationError(
       new Error("ENOENT: /Users/example/private/package.zip"),

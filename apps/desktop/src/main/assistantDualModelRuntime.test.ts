@@ -262,26 +262,23 @@ describe("AssistantRuntime dual-model flow", () => {
         dimensionFields: ["category"],
         measureFields: ["count"],
       }),
-      toolCallResponse("report-after-chart-failure", "request_markdown_report_generation", {
-        title: "分类分析报告",
-        markdown: [
-          "# 分类分析报告",
-          "",
-          "## 分析结果",
-          "",
-          "正常类共 10 笔。",
-          "",
-          "## 可视化图表",
-          "",
-          "```visualization",
-          JSON.stringify({ data: { mode: "artifact", artifactId: "stale-chart-artifact" } }),
-          "```",
-          "",
-          "## 分析结论",
-          "",
-          "样本以正常类为主。",
-        ].join("\n"),
-      }),
+      textResponse([
+        "# 分类分析报告",
+        "",
+        "## 分析结果",
+        "",
+        "正常类共 10 笔。",
+        "",
+        "## 可视化图表",
+        "",
+        "```visualization",
+        JSON.stringify({ data: { mode: "artifact", artifactId: "stale-chart-artifact" } }),
+        "```",
+        "",
+        "## 分析结论",
+        "",
+        "样本以正常类为主。",
+      ].join("\n")),
     ];
     vi.stubGlobal("fetch", vi.fn(async () => {
       const response = responses.shift();
@@ -353,10 +350,7 @@ describe("AssistantRuntime dual-model flow", () => {
       }),
       new Error("transient provider failure"),
       new Error("transient provider failure after provider retry"),
-      toolCallResponse("report-retry-success", "request_markdown_report_generation", {
-        title: "分类分析报告",
-        markdown: "# 分类分析报告\n\n## 分析结果\n\n正常类共 10 笔。",
-      }),
+      textResponse("# 分类分析报告\n\n## 分析结果\n\n正常类共 10 笔。"),
     ];
     vi.stubGlobal("fetch", vi.fn(async () => {
       const response = responses.shift();
@@ -1017,6 +1011,125 @@ describe("AssistantRuntime dual-model flow", () => {
     expect(context).toContain("workflow-dataset:chart-source");
     expect(context).not.toContain("DO_NOT_INJECT_THIS_SQL_SCRIPT");
     expect(context).not.toContain("FULL_SOURCE_SCHEMA_SHOULD_NOT_BE_IN_CHART_CONTEXT");
+  });
+
+  it("passes the complete Python analysis artifact to report generation", async () => {
+    const temp = mkdtempSync(join(tmpdir(), "cycle-probe-dual-model-report-context-"));
+    const runtime = new AssistantRuntime({
+      dbPath: join(temp, "assistant.sqlite"),
+      csvSqlitePath: createCsvMetadataDatabase(temp),
+      toolLogPath: join(temp, "tools.jsonl"),
+      getModelApiKey: async () => "test-key",
+      emit: () => undefined,
+    });
+    const conversation = runtime.createConversation("user-1");
+    const internals = runtime as unknown as {
+      toolResultRegistry: {
+        register: (record: Record<string, unknown>) => Promise<void>;
+      };
+      toolArtifactManager: {
+        createArtifact: (record: Record<string, unknown>) => Promise<void>;
+      };
+      buildDualModelContext: (
+        input: Record<string, unknown>,
+        conversation: Record<string, unknown>,
+        role: "execution",
+        step: Record<string, unknown>,
+        tokenBudget?: number,
+        messageId?: string,
+      ) => Promise<string>;
+    };
+    const branchDistribution = Array.from({ length: 35 }, (_, index) => ({
+      branchName: index === 34 ? "LAST_REAL_BRANCH_MARKER" : `分行${index + 1}`,
+      totalCount: index + 1,
+    }));
+    const analysis = {
+      deduplicatedRecordCount: branchDistribution.reduce((total, row) => total + row.totalCount, 0),
+      branchDistribution,
+      validation: {
+        distinctBranchCount: 35,
+        distributionRowCount: 35,
+        branchSetReconciled: true,
+        countReconciled: true,
+        balanceReconciled: true,
+      },
+    };
+    const artifactId = "assistant-python-analysis:full-report-context";
+    await internals.toolArtifactManager.createArtifact({
+      artifactId,
+      artifactType: "report_summary",
+      contentType: "json",
+      content: JSON.stringify({ stdout: JSON.stringify(analysis), stderr: null }, null, 2),
+      metadata: {},
+    });
+    const now = new Date().toISOString();
+    await internals.toolResultRegistry.register({
+      toolCallId: "python-report-context-source",
+      conversationId: conversation.id,
+      messageId: "previous-assistant-message",
+      userId: "user-1",
+      toolKind: "python_analysis",
+      toolName: "request_python_analysis_execution",
+      status: "completed",
+      request: { userRequest: "按分行分析资产质量" },
+      result: {
+        resultId: "python-result",
+        toolKind: "python_analysis",
+        artifactIds: [artifactId],
+        summary: "Python 分析完成。",
+        createdAt: now,
+        metadata: {
+          resultPreview: JSON.stringify(analysis).slice(0, 2_000),
+        },
+      },
+      outputArtifactIds: [artifactId],
+      version: 1,
+      isLatestSuccessful: true,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const context = await internals.buildDualModelContext({
+      userId: "user-1",
+      prompt: "生成各分行资产质量报告",
+      dataSourceLabel: "信贷风险.csv",
+      approvalMode: "full_access",
+    }, conversation as unknown as Record<string, unknown>, "execution", {
+      stepId: "report",
+      toolKind: "report_generation",
+      purpose: "生成各分行资产质量报告",
+      dependencies: ["python"],
+      inputResolution: "history_artifact",
+      expectedOutput: "Markdown 报告",
+    }, 8_000, "new-assistant-message");
+
+    expect(context).toContain("LAST_REAL_BRANCH_MARKER");
+    expect(context).toContain("\"distributionRowCount\":35");
+    expect(context).not.toContain("...[truncated");
+  });
+
+  it("keeps tool execution failures in tool_calls without rendering a recovery card", async () => {
+    const temp = mkdtempSync(join(tmpdir(), "cycle-probe-tool-error-message-"));
+    const runtime = runtimeFor(temp, createCsvMetadataDatabase(temp));
+    const result = await runtime.sendMessage({
+      userId: "user-1",
+      clientRequestId: "python-tool-error-without-card",
+      prompt: "```python\nraise ValueError('expected test failure')\n```",
+      modelName: "reasoning-model",
+      dualModelOrchestrationEnabled: false,
+      approvalMode: "full_access",
+    });
+    const message = await waitForMessageStatus(
+      runtime,
+      "user-1",
+      result.conversation.id,
+      result.assistantMessage.id,
+      "completed",
+    );
+
+    expect(message.content).toContain("tool_calls");
+    expect(message.blocks.some((block) => block.type === "card" || Boolean(block.guidance))).toBe(false);
+    expect(message.blocks.some((block) => block.toolStatus === "error")).toBe(true);
   });
 
   it("records context compression observability without logging omitted content", async () => {
@@ -1736,4 +1849,20 @@ async function waitForTerminalRun(runtime: AssistantRuntime, userId: string, mes
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   throw new Error(`run did not terminate: ${JSON.stringify(runtime.getAgentRun(userId, messageId))}`);
+}
+
+async function waitForMessageStatus(
+  runtime: AssistantRuntime,
+  userId: string,
+  conversationId: string,
+  messageId: string,
+  status: string,
+) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const message = runtime.getConversationMessages(userId, conversationId)
+      .find((candidate) => candidate.id === messageId);
+    if (message?.status === status) return message;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`message did not reach ${status}`);
 }

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   AnalysisPlanningAdapter,
+  ExecutionParameterAdapter,
   analysisPlanToPlannerDecision,
   buildAnalysisPlanSystemPrompt,
   compressReasoningContext,
@@ -236,4 +237,103 @@ describe("thinking optimization", () => {
       expect(schema.additionalProperties).toBe(false);
     }
   });
+
+  it("streams long report Markdown without transporting it in tool-call JSON", async () => {
+    const markdown = `# 分行资产质量分析报告\n\n${"报告内容。".repeat(4_000)}`;
+    const requests: Array<Record<string, unknown>> = [];
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init?: RequestInit) => {
+      requests.push(JSON.parse(String(init?.body ?? "{}")));
+      return streamTextResponse(markdown, "stop");
+    }));
+    const handler = vi.fn(async () => ({ status: "completed", toolCallId: "registered-report" }));
+    const adapter = new ExecutionParameterAdapter({
+      providerName: "siliconflow",
+      baseURL: "https://example.local/v1",
+      apiKey: "test-key",
+      model: "execution-model",
+      timeoutMs: 10_000,
+      requestOptions: { enableThinking: false, stream: true, temperature: 0, maxTokens: 12_000 },
+      profileName: "report",
+    });
+
+    const output = await adapter.execute({
+      conversationId: "conversation-1",
+      messageId: "message-1",
+      step: {
+        stepId: "report",
+        toolKind: "report_generation",
+        purpose: "生成报告",
+        dependencies: [],
+        inputResolution: "current_run",
+        expectedOutput: "Markdown 报告",
+      },
+      messages: [{ id: "user-1", role: "user", content: "生成报告", createdAt: new Date().toISOString() }],
+      tool: {
+        name: "request_markdown_report_generation",
+        description: "生成报告",
+        inputSchema: executionToolSchema("report_generation"),
+        handler,
+      },
+    });
+    vi.unstubAllGlobals();
+
+    expect(output.error).toBeUndefined();
+    expect(output.invoked).toBe(true);
+    expect(requests[0]).not.toHaveProperty("tools");
+    expect(handler).toHaveBeenCalledWith(
+      { title: "分行资产质量分析报告", markdown },
+      expect.objectContaining({ conversationId: "conversation-1", messageId: "message-1" }),
+    );
+  });
+
+  it("does not register a report when direct Markdown output is truncated", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => streamTextResponse("# 未完成报告\n\n正文", "length")));
+    const handler = vi.fn(async () => ({ status: "completed" }));
+    const adapter = new ExecutionParameterAdapter({
+      providerName: "siliconflow",
+      baseURL: "https://example.local/v1",
+      apiKey: "test-key",
+      model: "execution-model",
+      timeoutMs: 10_000,
+      requestOptions: { enableThinking: false, stream: true, temperature: 0, maxTokens: 12_000 },
+      profileName: "report",
+    });
+
+    const output = await adapter.execute({
+      conversationId: "conversation-1",
+      messageId: "message-1",
+      step: {
+        stepId: "report",
+        toolKind: "report_generation",
+        purpose: "生成报告",
+        dependencies: [],
+        inputResolution: "current_run",
+        expectedOutput: "Markdown 报告",
+      },
+      messages: [{ id: "user-1", role: "user", content: "生成报告", createdAt: new Date().toISOString() }],
+      tool: {
+        name: "request_markdown_report_generation",
+        description: "生成报告",
+        inputSchema: executionToolSchema("report_generation"),
+        handler,
+      },
+    });
+    vi.unstubAllGlobals();
+
+    expect(output).toMatchObject({
+      invoked: false,
+      errorCode: "PROVIDER_OUTPUT_TRUNCATED",
+      errorStage: "provider",
+    });
+    expect(handler).not.toHaveBeenCalled();
+  });
 });
+
+function streamTextResponse(content: string, finishReason: "stop" | "length") {
+  const body = [
+    `data: ${JSON.stringify({ choices: [{ delta: { content } }] })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: finishReason }] })}\n\n`,
+    "data: [DONE]\n\n",
+  ].join("");
+  return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+}

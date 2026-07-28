@@ -1,0 +1,43 @@
+{
+  "skillId": "branch-asset-quality-report",
+  "name": "branch-asset-quality-report",
+  "displayName": "各分行资产质量状况分析报告",
+  "description": "按一级分行统计最新风险五级分类的笔数、贷款余额、不良率和关注率，并生成匹配模板的资产质量分析报告。",
+  "version": "1.1.1",
+  "category": "credit-risk-analysis",
+  "tags": [
+    "信贷资产",
+    "分行分析",
+    "资产质量",
+    "五级分类",
+    "不良率",
+    "关注率"
+  ],
+  "keywords": [
+    "各分行资产质量状况",
+    "分行资产质量分析",
+    "一级分行",
+    "分行不良率",
+    "分行关注率",
+    "贷款余额分布"
+  ],
+  "sourceType": "local_builtin",
+  "runtime": "cycle-probe-client",
+  "clientOnly": true,
+  "enabled": true,
+  "requiredTools": [
+    "request_sql_query_execution",
+    "request_python_analysis_execution",
+    "request_markdown_report_generation"
+  ],
+  "entryFile": "SKILL.md",
+  "templateFile": "report-template.md",
+  "inputSchemaFile": "schemas/skill-input.schema.json",
+  "reportDataSchemaFile": "schemas/report-data.schema.json",
+  "toolPolicyFile": "tool-policy.json",
+  "aliases": [
+    "@各分行资产质量",
+    "@分行资产质量分析",
+    "@分行不良率分析"
+  ]
+}

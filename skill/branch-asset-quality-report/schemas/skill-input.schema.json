@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cycle-probe.local/schemas/branch-asset-quality-report-input.schema.json",
+  "title": "BranchAssetQualityReportInput",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "dataSourceId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "当前会话选择的数据源 ID；未提供时从会话上下文解析。"
+    },
+    "fieldBindings": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "仅保存当前数据源中已经确认存在的真实字段名称。",
+      "properties": {
+        "branch": {
+          "$ref": "#/$defs/actualField"
+        },
+        "fiveLevelClassification": {
+          "$ref": "#/$defs/actualField"
+        },
+        "loanBalance": {
+          "$ref": "#/$defs/amountField",
+          "description": "报告金额指标对应的真实字段。用户未明确指定其他金额指标时，绑定贷款余额字段并以万为默认展示单位。"
+        },
+        "contractSerial": {
+          "$ref": "#/$defs/actualField"
+        }
+      }
+    },
+    "filters": {
+      "type": "object",
+      "description": "用户明确指定的筛选条件；默认分析所选数据源的全部日期范围。",
+      "additionalProperties": true
+    }
+  },
+  "$defs": {
+    "actualField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "actualName"
+      ],
+      "properties": {
+        "actualName": {
+          "type": "string",
+          "minLength": 1
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1
+        },
+        "selectedByUser": {
+          "type": "boolean"
+        }
+      }
+    },
+    "amountField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "actualName"
+      ],
+      "properties": {
+        "actualName": {
+          "type": "string",
+          "minLength": 1
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sourceUnit": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "只保存从真实字段名称或 Schema 单位信息中识别出的单位。"
+        },
+        "businessName": {
+          "type": "string",
+          "minLength": 1,
+          "description": "去除单位后的真实业务指标名称；默认贷款余额。"
+        },
+        "displayUnit": {
+          "type": "string",
+          "minLength": 1,
+          "description": "报告金额列的展示单位；默认万。"
+        },
+        "selectedByUser": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}
