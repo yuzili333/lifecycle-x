@@ -42,8 +42,10 @@
     "@stylexjs/stylex": "^0.18.3",
     "@vitejs/plugin-react": "^4.3.4",
     "better-sqlite3": "^12.11.1",
+    "docx": "^9.7.1",
     "electron-vite": "^3.0.0",
     "extract-zip": "^2.0.1",
+    "html-to-image": "^1.11.13",
     "lucide-react": "1.23.0",
     "react": "^19.2.7",
     "react-dom": "^19.2.7"

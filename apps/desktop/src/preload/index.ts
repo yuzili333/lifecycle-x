@@ -20,6 +20,7 @@ import type {
   SkillRemoveResult,
   SkillSummary,
 } from "../shared/skills";
+import type { ReportExportRequest, ReportExportResult } from "../shared/reportExport";
 
 export type DataSourceMenuAction = "open-database" | "create-connection";
 
@@ -96,6 +97,8 @@ const lifecycleXApi = {
       ipcRenderer.invoke("assistant:reports:visualization", userId, conversationId, reportArtifactId, reportVersion, visualizationArtifactId) as Promise<ResolvedReportVisualizationArtifact>,
     resolveReportEvidence: (userId: string, conversationId: string, reportArtifactId: string, reportVersion: number, evidenceCardId: string) =>
       ipcRenderer.invoke("assistant:reports:evidence", userId, conversationId, reportArtifactId, reportVersion, evidenceCardId) as Promise<ResolvedReportEvidenceCard>,
+    exportReport: (request: ReportExportRequest) =>
+      ipcRenderer.invoke("assistant:reports:export", request) as Promise<ReportExportResult>,
     confirmWorkflowDataset: (userId: string, conversationId: string, datasetId?: string) =>
       ipcRenderer.invoke("assistant:workflow:confirm-dataset", userId, conversationId, datasetId) as Promise<{
         success: true;

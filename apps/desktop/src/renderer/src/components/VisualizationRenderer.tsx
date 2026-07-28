@@ -31,6 +31,7 @@ type VisualizationRendererProps = {
   error?: VisualizationRenderError;
   isStreaming?: boolean;
   embedded?: boolean;
+  appearance?: "light" | "dark";
 };
 
 export function StreamingVisualizationNode({ visualizationId, state }: StreamingVisualizationNodeProps) {
@@ -43,7 +44,7 @@ export function StreamingVisualizationNode({ visualizationId, state }: Streaming
   return <VisualizationRenderer spec={state.spec} />;
 }
 
-export function VisualizationRenderer({ spec, data: providedData, error, isStreaming, embedded = false }: VisualizationRendererProps) {
+export function VisualizationRenderer({ spec, data: providedData, error, isStreaming, embedded = false, appearance }: VisualizationRendererProps) {
   const astryxTheme = useTheme();
   const validation = useMemo(() => (spec ? validateVisualizationSpec(spec, { allowInlineData: true }) : undefined), [spec]);
   const data = useMemo(() => providedData ?? (validation?.success ? resolveDisplayData(validation.spec) : undefined), [providedData, validation]);
@@ -54,11 +55,11 @@ export function VisualizationRenderer({ spec, data: providedData, error, isStrea
   const theme = useMemo(
     () => validation?.success
       ? themeResolver.resolve(validation.spec, {
-          appearance: astryxTheme.mode,
-          tokens: /neutral/i.test(astryxTheme.name) ? astryxTheme.tokens : undefined,
+          appearance: appearance ?? astryxTheme.mode,
+          tokens: appearance ? undefined : /neutral/i.test(astryxTheme.name) ? astryxTheme.tokens : undefined,
         })
       : neutralDarkVisualizationTheme,
-    [astryxTheme.mode, astryxTheme.tokens, validation],
+    [appearance, astryxTheme.mode, astryxTheme.name, astryxTheme.tokens, validation],
   );
 
   if (isStreaming || !spec) {
@@ -288,14 +289,20 @@ function SvgChartView({ spec, data, theme }: { spec: VisualizationSpec; data: Re
             const y = value >= 0 ? valueY : zeroY;
             return (
               <g key={`${rowIndex}-${field}`} style={seriesStyle(seriesIndex)}>
-                <rect x={round(x)} y={round(y)} width={round(Math.max(3, barWidth - 2))} height={round(barHeight)} />
+                <rect
+                  x={round(x)}
+                  y={round(y)}
+                  width={round(Math.max(3, barWidth - 2))}
+                  height={round(barHeight)}
+                  style={seriesBlockStyle(theme, seriesIndex)}
+                />
                 <title>{`${formatCell(row[xField ?? ""])} ${labelForMeasure(spec, field)}: ${formatCell(value)}`}</title>
               </g>
             );
           }))
         )}
       </svg>
-      <ChartLegend spec={spec} fields={yFields} />
+      <ChartLegend spec={spec} fields={yFields} theme={theme} />
       <VisualizationDataSummary spec={spec} data={data} />
     </div>
   );
@@ -348,7 +355,14 @@ function HorizontalBarChartView({ spec, data, theme }: { spec: VisualizationSpec
               const y = groupTop + 5 + seriesIndex * (barHeight + 3);
               return (
                 <g key={`${rowIndex}-${field}`} style={seriesStyle(seriesIndex)}>
-                  <rect x={x} y={y} width={Math.max(2, Math.abs(valueX - zeroX))} height={barHeight} rx="3" />
+                  <rect
+                    x={x}
+                    y={y}
+                    width={Math.max(2, Math.abs(valueX - zeroX))}
+                    height={barHeight}
+                    rx="3"
+                    style={seriesBlockStyle(theme, seriesIndex)}
+                  />
                   <title>{`${category} ${labelForMeasure(spec, field)}: ${formatCell(value)}`}</title>
                 </g>
               );
@@ -356,7 +370,7 @@ function HorizontalBarChartView({ spec, data, theme }: { spec: VisualizationSpec
           ];
         })}
       </svg>
-      <ChartLegend spec={spec} fields={valueFields} />
+      <ChartLegend spec={spec} fields={valueFields} theme={theme} />
       <VisualizationDataSummary spec={spec} data={data} />
     </div>
   );
@@ -396,7 +410,12 @@ function CircularChartView({ spec, data, theme }: { spec: VisualizationSpec; dat
         {positionedSlices.map((slice, index) => {
           const path = describeArc(centerX, centerY, radius, innerRadius, slice.start, slice.end);
           return (
-            <path key={`${slice.label}-${index}`} d={path} className="pie-slice" style={seriesStyle(index)}>
+            <path
+              key={`${slice.label}-${index}`}
+              d={path}
+              className="pie-slice"
+              style={{ ...seriesStyle(index), fill: seriesColor(theme, index), stroke: theme.colors.neutral[1] }}
+            >
               <title>{`${slice.label}: ${formatCell(slice.value)}（${formatPercentage(slice.ratio)}）`}</title>
             </path>
           );
@@ -435,7 +454,7 @@ function CircularChartView({ spec, data, theme }: { spec: VisualizationSpec; dat
       <ul className="assistant-visualization-circular-legend" aria-label="图例">
         {positionedSlices.map((slice, index) => (
           <li key={`${slice.label}-${index}`} style={seriesStyle(index)}>
-            <span className="assistant-visualization-legend-swatch" />
+            <span className="assistant-visualization-legend-swatch" style={{ backgroundColor: seriesColor(theme, index) }} />
             <span>{slice.label}</span>
             <strong>{`${formatCell(slice.value)}（${formatPercentage(slice.ratio)}）`}</strong>
           </li>
@@ -446,7 +465,7 @@ function CircularChartView({ spec, data, theme }: { spec: VisualizationSpec; dat
   );
 }
 
-function ChartLegend({ spec, fields }: { spec: VisualizationSpec; fields: string[] }) {
+function ChartLegend({ spec, fields, theme }: { spec: VisualizationSpec; fields: string[]; theme: ResolvedVisualizationTheme }) {
   if (spec.interaction?.legend === false || fields.length <= 1) {
     return null;
   }
@@ -454,7 +473,7 @@ function ChartLegend({ spec, fields }: { spec: VisualizationSpec; fields: string
     <ul className="assistant-visualization-legend" aria-label="图例">
       {fields.map((field, index) => (
         <li key={field} style={seriesStyle(index)}>
-          <span className="assistant-visualization-legend-swatch" />
+          <span className="assistant-visualization-legend-swatch" style={{ backgroundColor: seriesColor(theme, index) }} />
           <span>{labelForMeasure(spec, field)}</span>
         </li>
       ))}
@@ -491,6 +510,7 @@ function createChartStyle(theme: ResolvedVisualizationTheme) {
     "--viz-series-2": theme.colors.primary[2],
     "--viz-series-3": theme.colors.primary[3],
     "--viz-series-4": theme.colors.primary[4],
+    "--viz-series-5": theme.colors.primary[5],
     "--viz-axis": theme.colors.textSecondary,
     "--viz-grid": theme.colors.border,
     "--viz-text": theme.colors.textPrimary,
@@ -734,7 +754,16 @@ function labelForField(spec: VisualizationSpec, field: string) {
 }
 
 function seriesStyle(index: number) {
-  return { "--viz-current": `var(--viz-series-${index % 5})` } as CSSProperties;
+  return { "--viz-current": `var(--viz-series-${index % 6})` } as CSSProperties;
+}
+
+function seriesColor(theme: ResolvedVisualizationTheme, index: number) {
+  return theme.colors.primary[index % theme.colors.primary.length] ?? theme.colors.primary[0];
+}
+
+function seriesBlockStyle(theme: ResolvedVisualizationTheme, index: number): CSSProperties {
+  const color = seriesColor(theme, index);
+  return { fill: color, stroke: color };
 }
 
 function NetworkView({ spec, data }: { spec: VisualizationSpec; data: ResolvedVisualizationData }) {

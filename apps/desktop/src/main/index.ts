@@ -6,7 +6,9 @@ import { join } from "node:path";
 import defaultDockIconPath from "../../build/icon.png?asset";
 import type { DataSourceMenuAction } from "../preload";
 import type { SkillIpcResult, SkillOperation } from "../shared/skills";
+import type { ReportExportRequest } from "../shared/reportExport";
 import { AssistantRuntime, type AssistantStreamEvent } from "./assistantRuntime";
+import { ReportExportService } from "./reportExportService";
 import { asSkillOperationError, LocalSkillManager } from "./skills";
 
 const isMac = process.platform === "darwin";
@@ -353,6 +355,9 @@ ipcMain.handle("assistant:reports:visualization", (_event, userId: string, conve
 );
 ipcMain.handle("assistant:reports:evidence", (_event, userId: string, conversationId: string, reportArtifactId: string, reportVersion: number, evidenceCardId: string) =>
   getAssistantRuntime().resolveConversationReportEvidence(userId, conversationId, reportArtifactId, reportVersion, evidenceCardId),
+);
+ipcMain.handle("assistant:reports:export", (_event, request: ReportExportRequest) =>
+  new ReportExportService(getAssistantRuntime()).export(request),
 );
 ipcMain.handle("assistant:workflow:confirm-dataset", (_event, userId: string, conversationId: string, datasetId?: string) =>
   getAssistantRuntime().confirmWorkflowDataset(userId, conversationId, datasetId),

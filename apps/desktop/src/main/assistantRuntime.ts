@@ -3306,6 +3306,45 @@ export class AssistantRuntime {
     return artifact;
   }
 
+  async getConversationReportExportArtifact(
+    userId: string,
+    conversationId: string,
+    artifactId: string,
+    reportVersion: number,
+  ): Promise<ArtifactRecord | null> {
+    const conversation = this.findConversation(userId, conversationId);
+    if (!conversation) {
+      throw new Error("对话不存在或已失效。");
+    }
+    const normalizedArtifactId = artifactId.trim();
+    if (!normalizedArtifactId) {
+      throw new Error("报告 Artifact ID 不能为空。");
+    }
+    const toolCalls = await this.toolResultRegistry.listByConversation(conversation.id);
+    const owner = toolCalls.find((toolCall) =>
+      toolCall.toolKind === "report_generation"
+      && toolCall.status === "completed"
+      && toolCall.version === reportVersion
+      && [...(toolCall.outputArtifactIds ?? []), ...(toolCall.result?.artifactIds ?? [])].includes(normalizedArtifactId));
+    if (!owner) {
+      return null;
+    }
+    let artifact = await this.toolArtifactManager.getArtifact(normalizedArtifactId);
+    if (
+      artifact?.artifactType === "report_markdown"
+      && typeof artifact.content === "string"
+      && typeof artifact.metadata?.evidenceCardId !== "string"
+    ) {
+      await this.attachEvidenceCardToReport(owner);
+      artifact = await this.toolArtifactManager.getArtifact(normalizedArtifactId);
+    }
+    return artifact?.artifactType === "report_markdown"
+      && artifact.contentType === "markdown"
+      && typeof artifact.content === "string"
+      ? artifact
+      : null;
+  }
+
   async resolveConversationReportVisualization(
     userId: string,
     conversationId: string,

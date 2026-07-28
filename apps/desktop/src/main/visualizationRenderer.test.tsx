@@ -79,13 +79,14 @@ describe("VisualizationRenderer", () => {
   });
 
   it("renders cartesian chart axes and neutral themed SVG marks", () => {
-    const html = renderToString(<VisualizationRenderer spec={barSpec()} />);
+    const html = renderToString(<VisualizationRenderer spec={barSpec()} appearance="light" />);
 
     expect(html).toContain("axis-tick-label");
     expect(html).toContain("grid-line");
     expect(html).toContain("杭州分行");
     expect(html).toContain("风险数量");
     expect(html).toContain("--viz-series-0");
+    expect(html).toContain("fill:#00458c");
     expect(html).not.toContain("--color-icon-blue");
     expect(html).not.toContain("--color-icon-teal");
     expect(html).toContain("数据摘要");
@@ -215,7 +216,7 @@ describe("VisualizationRenderer", () => {
   });
 
   it.each(["pie", "donut"] as const)("renders %s charts with neutral controlled series and textual legend", (type) => {
-    const html = renderToString(<VisualizationRenderer spec={barSpec({ type })} />);
+    const html = renderToString(<VisualizationRenderer spec={barSpec({ type })} appearance="light" />);
 
     expect(html).toContain(type === "pie" ? "饼图：分行风险数量" : "环形图：分行风险数量");
     expect(html).toContain("pie-slice");
@@ -224,6 +225,9 @@ describe("VisualizationRenderer", () => {
     expect(html).toContain("120（52.17%）");
     expect(html).toContain("assistant-visualization-circular-legend");
     expect(html).toContain("杭州分行");
+    expect(html).toContain("fill:#00458c");
+    expect(html).toContain("fill:#0c5700");
+    expect(html).toContain("fill:#6e3500");
     expect(html).not.toContain("Artifact");
   });
 

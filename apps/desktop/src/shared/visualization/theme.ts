@@ -16,12 +16,12 @@ export function resolveAstryxNeutralVisualizationTheme(
     mode: appearance,
     colors: {
       primary: [
-        token("--color-accent"),
-        token("--color-text-secondary"),
-        token("--color-border-emphasized", "--color-border"),
-        token("--color-text-disabled", "--color-text-secondary"),
-        token("--color-text-primary"),
-        token("--color-border"),
+        token("--color-text-blue", "--color-accent"),
+        token("--color-text-green", "--color-success"),
+        token("--color-text-orange", "--color-warning"),
+        token("--color-text-purple", "--color-accent"),
+        token("--color-text-teal", "--color-text-secondary"),
+        token("--color-text-red", "--color-error"),
       ],
       positive: token("--color-success", "--color-text-green"),
       warning: token("--color-warning", "--color-text-yellow"),

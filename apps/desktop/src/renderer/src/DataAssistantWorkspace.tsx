@@ -30,7 +30,7 @@ import { Text } from "@astryxdesign/core/Text";
 import { Token } from "@astryxdesign/core/Token";
 import { Toolbar } from "@astryxdesign/core/Toolbar";
 import { Tooltip } from "@astryxdesign/core/Tooltip";
-import { BadgeInfo, BrainCircuit, CheckCircle2, ChevronDown, ChevronRight, CircleAlert, Clock, Copy, FileSpreadsheet, FileText, LoaderCircle, Maximize2, Minimize2, Pencil, Plus, RotateCcw, Sparkles, X, type LucideIcon } from "lucide-react";
+import { BadgeInfo, BrainCircuit, CheckCircle2, ChevronDown, ChevronRight, CircleAlert, Clock, Copy, Download, FileSpreadsheet, FileText, LoaderCircle, Maximize2, Minimize2, Pencil, Plus, RotateCcw, Sparkles, X, type LucideIcon } from "lucide-react";
 import type { AuthFailure, AuthUser } from "./auth";
 import { useAppToast } from "./useAppToast";
 import { workbenchApi, type ApiResult, type DataSourceSummary } from "./workbenchApi";
@@ -95,6 +95,8 @@ import type { ArtifactRecord, ConversationToolState, ToolCallRecord } from "../.
 import type { WorkflowContextSummary } from "../../main/workflowRuntime";
 import type { AgentProgressEvent, AgentRunRecord } from "../../main/agentOrchestration";
 import type { SkillSummary } from "../../shared/skills";
+import type { ReportExportFormat } from "../../shared/reportExport";
+import { prepareReportVisualizationImages } from "./report-export/prepareReportExport";
 
 type RequestWithRefresh = <T extends { success: true }>(
   call: (accessToken: string) => Promise<ApiResult<T>>,
@@ -1339,6 +1341,13 @@ function shouldHideInlineToolResult(block: AssistantBlock) {
   );
 }
 
+function friendlyReportExportError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  const structured = message.match(/\[REPORT_EXPORT_[A-Z_]+\]\s*(.*?)(?:\s+Trace:\s+[a-zA-Z0-9-]+)?\s*$/);
+  const withoutCode = (structured?.[1] ?? message).trim();
+  return withoutCode || "报告导出失败，请重试。";
+}
+
 export function DataAssistantWorkspace({
   user,
   modelName,
@@ -1406,6 +1415,7 @@ export function DataAssistantWorkspace({
   const [isImportingChatCsv, setIsImportingChatCsv] = useState(false);
   const [artifactWindow, setArtifactWindow] = useState<ArtifactWindowState>(() => readArtifactWindowState());
   const [artifactContentByMessage, setArtifactContentByMessage] = useState<Record<string, ArtifactContentState>>({});
+  const [isExportingReport, setIsExportingReport] = useState(false);
   const shouldRestoreLatestReportWindowRef = useRef(artifactWindow.isOpen);
   const [reportCardTransitions, setReportCardTransitions] = useState<Record<string, ReportCardTransitionState>>({});
   const [reportTransitionHeights, setReportTransitionHeights] = useState<Record<string, number>>({});
@@ -3033,6 +3043,79 @@ export function DataAssistantWorkspace({
     [artifactContentByMessage, toast],
   );
 
+  const exportArtifact = useCallback(
+    async (format: ReportExportFormat) => {
+      const api = window.lifecycleX?.assistant;
+      const reportVersion = activeArtifactReportRecord?.version;
+      const markdown = activeArtifactContent?.markdown ?? activeArtifactMessage?.content ?? "";
+      if (
+        isExportingReport
+        || !api
+        || !user?.id
+        || !activeArtifactMessage
+        || !activeArtifactId
+        || !reportVersion
+        || activeArtifactContent?.status !== "ready"
+      ) {
+        toast({
+          type: "error",
+          body: "报告内容尚未准备完成，暂时无法导出。",
+          uniqueID: "assistant-report-export-not-ready",
+          collisionBehavior: "overwrite",
+        });
+        return;
+      }
+      setIsExportingReport(true);
+      try {
+        const visualizationImages = format === "markdown"
+          ? []
+          : await prepareReportVisualizationImages({
+              userId: user.id,
+              conversationId: activeArtifactMessage.conversationId,
+              reportArtifactId: activeArtifactId,
+              reportVersion,
+              markdown,
+            });
+        const result = await api.exportReport({
+          userId: user.id,
+          conversationId: activeArtifactMessage.conversationId,
+          reportArtifactId: activeArtifactId,
+          reportVersion,
+          suggestedTitle: activeArtifactTitle,
+          format,
+          visualizationImages,
+        });
+        if (result.status === "completed") {
+          toast({
+            type: "info",
+            body: `${result.fileName} 已导出。`,
+            uniqueID: `assistant-report-export-${format}`,
+            collisionBehavior: "overwrite",
+          });
+        }
+      } catch (error) {
+        toast({
+          type: "error",
+          body: friendlyReportExportError(error),
+          uniqueID: `assistant-report-export-error-${format}`,
+          collisionBehavior: "overwrite",
+        });
+      } finally {
+        setIsExportingReport(false);
+      }
+    },
+    [
+      activeArtifactContent,
+      activeArtifactId,
+      activeArtifactMessage,
+      activeArtifactReportRecord?.version,
+      activeArtifactTitle,
+      isExportingReport,
+      toast,
+      user?.id,
+    ],
+  );
+
   const openReportRecord = useCallback(
     (toolCallId: string) => {
       const record = activeReportRecords.find((item) => item.toolCallId === toolCallId);
@@ -4230,6 +4313,25 @@ export function DataAssistantWorkspace({
                 }
                 endContent={
                   <HStack gap={1} vAlign="center" className="assistant-artifact-toolbar-actions">
+                    <DropdownMenu
+                      menuWidth={180}
+                      hasChevron={false}
+                      button={{
+                        label: "导出",
+                        variant: "ghost",
+                        size: "sm",
+                        isIconOnly: true,
+                        icon: <Icon icon={Download} size="sm" color="inherit" />,
+                        tooltip: "导出",
+                        isLoading: isExportingReport,
+                        isDisabled: activeArtifactContent?.status !== "ready",
+                      }}
+                      items={[
+                        { label: "PDF", onClick: () => void exportArtifact("pdf") },
+                        { label: "DOCX", onClick: () => void exportArtifact("docx") },
+                        { label: "Markdown", onClick: () => void exportArtifact("markdown") },
+                      ]}
+                    />
                     <Button
                       label="复制内容"
                       variant="ghost"
