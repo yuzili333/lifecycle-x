@@ -136,7 +136,13 @@ button {
 .workbench-side-nav-user-identity {
   flex: 1 1 auto;
   min-width: 0;
+  padding-inline: var(--spacing-1);
+  border-radius: var(--radius-element);
   overflow: hidden;
+}
+
+.workbench-side-nav-user-identity:hover {
+  background: var(--color-overlay-hover);
 }
 
 .workbench-recent-conversations {

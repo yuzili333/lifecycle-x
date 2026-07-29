@@ -992,7 +992,7 @@ export function WorkbenchShell({ auth }: WorkbenchShellProps) {
             <Avatar
               src={profile?.avatarUrl ?? auth.user?.avatarUrl}
               name={profile?.displayName ?? auth.user?.displayName ?? auth.user?.username}
-              size={32}
+              size={24}
             />
             <Text type="body" weight="semibold" maxLines={1}>
               {profile?.displayName ?? auth.user?.displayName ?? auth.user?.username ?? "用户"}
