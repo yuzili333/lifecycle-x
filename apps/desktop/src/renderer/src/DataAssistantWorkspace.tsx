@@ -23,6 +23,7 @@ import { DropdownMenu, DropdownMenuItem, type DropdownMenuOption } from "@astryx
 import { Icon } from "@astryxdesign/core/Icon";
 import { Card, HStack, VStack } from "@astryxdesign/core/Layout";
 import { Markdown, type MarkdownComponents } from "@astryxdesign/core/Markdown";
+import { ProgressBar } from "@astryxdesign/core/ProgressBar";
 import { ResizeHandle, useResizable } from "@astryxdesign/core/Resizable";
 import { Section } from "@astryxdesign/core/Section";
 import { TextInput } from "@astryxdesign/core/TextInput";
@@ -64,7 +65,7 @@ import {
 } from "./chat-tool-selector";
 import { VisualizationRenderer } from "./components/VisualizationRenderer";
 import { AgentGuidanceCard } from "./components/agent-guidance";
-import { ReportMarkdownViewer, ToolApprovalCard, toolKindLabel, toolStatusLabel } from "./components/tool-calls";
+import { ReportMarkdownViewer, ToolApprovalFeedback, toolKindLabel, toolStatusLabel } from "./components/tool-calls";
 import { StreamingReportSegment } from "./components/streaming-content";
 import {
   applyChatStreamEvent,
@@ -97,6 +98,8 @@ import type { AgentProgressEvent, AgentRunRecord } from "../../main/agentOrchest
 import type { SkillSummary } from "../../shared/skills";
 import type { ReportExportFormat } from "../../shared/reportExport";
 import { prepareReportVisualizationImages } from "./report-export/prepareReportExport";
+import { aggregateChatCsvProgress, isChatCsvImportActive } from "./chat-csv-progress";
+import { hasOnlyPendingApprovalBlocks, pendingToolApprovals } from "./tool-approval";
 
 type RequestWithRefresh = <T extends { success: true }>(
   call: (accessToken: string) => Promise<ApiResult<T>>,
@@ -133,7 +136,6 @@ export type DataAssistantWorkspaceHandle = {
 const approvalOptions: Array<{ label: string; value: AssistantApprovalMode }> = [
   { label: "请求批准", value: "request_approval" },
   { label: "完全访问权限", value: "full_access" },
-  { label: "禁止访问权限", value: "no_access" },
 ];
 const EMPTY_ASSISTANT_MESSAGES: AssistantMessage[] = [];
 
@@ -612,21 +614,29 @@ function formatFileSize(bytes: number) {
   return `${bytes} B`;
 }
 
-function isPythonApprovalPrompt(value: string) {
-  return /^(确认|批准|同意|执行|开始执行|确认执行)\s*(执行)?\s*python\s*$/i.test(value.trim());
-}
-
-function pendingPythonToolCallId(messages: AssistantMessage[]) {
-  for (const message of messages.slice().reverse()) {
-    const block = message.blocks
-      .slice()
-      .reverse()
-      .find((item) => item.toolCallId && item.toolName === "python" && item.toolStatus === "pending_approval");
-    if (block?.toolCallId) {
-      return block.toolCallId;
-    }
-  }
-  return null;
+function readFileWithProgress(
+  file: File,
+  onProgress: (percent: number) => void,
+): Promise<ArrayBuffer> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onprogress = (event) => {
+      if (event.lengthComputable && event.total > 0) {
+        onProgress(Math.round((event.loaded / event.total) * 15));
+      }
+    };
+    reader.onerror = () => reject(reader.error ?? new Error("CSV 文件读取失败。"));
+    reader.onabort = () => reject(new Error("CSV 文件读取已取消。"));
+    reader.onload = () => {
+      onProgress(15);
+      if (reader.result instanceof ArrayBuffer) {
+        resolve(reader.result);
+        return;
+      }
+      reject(new Error("CSV 文件读取失败。"));
+    };
+    reader.readAsArrayBuffer(file);
+  });
 }
 
 function formatMessageDuration(message: AssistantMessage, nowMs: number) {
@@ -1267,7 +1277,6 @@ function toolCallsFromMessage(message: AssistantMessage): ChatToolCallItem[] {
 function toolCallsFromToolState(
   message: AssistantMessage,
   toolState: ConversationToolState | null | undefined,
-  onApprove: (toolCallId: string, approved: boolean) => void,
 ): ChatToolCallItem[] {
   return sortToolRecordsByExecutionOrder(
     (toolState?.toolCalls ?? []).filter((record) => record.messageId === message.id),
@@ -1286,14 +1295,7 @@ function toolCallsFromToolState(
         status: orchestrationToolStatus(record.status),
         duration: formatToolDuration(toolRecordDurationMs(record)),
         node: "agent-workflow",
-        stats: record.status === "waiting_approval" ? (
-          <HStack gap={1} vAlign="center" wrap="wrap" onClick={(event) => event.stopPropagation()}>
-            <Button label="批准" variant="primary" size="sm" onClick={() => onApprove(record.toolCallId, true)} />
-            <Button label="拒绝" variant="ghost" size="sm" onClick={() => onApprove(record.toolCallId, false)} />
-          </HStack>
-        ) : (
-          toolStatusLabel(record.status)
-        ),
+        stats: toolStatusLabel(record.status),
         errorMessage,
         resultDetail: (
           <div className="assistant-tool-call-detail">
@@ -1412,7 +1414,7 @@ export function DataAssistantWorkspace({
   const [editTitleDraft, setEditTitleDraft] = useState("");
   const [deletingConversation, setDeletingConversation] = useState<AssistantConversation | null>(null);
   const [fullFieldContextApprovalRequest, setFullFieldContextApprovalRequest] = useState<FullFieldContextApprovalRequest | null>(null);
-  const [isImportingChatCsv, setIsImportingChatCsv] = useState(false);
+  const [submittingApprovalToolCallId, setSubmittingApprovalToolCallId] = useState<string | null>(null);
   const [artifactWindow, setArtifactWindow] = useState<ArtifactWindowState>(() => readArtifactWindowState());
   const [artifactContentByMessage, setArtifactContentByMessage] = useState<Record<string, ArtifactContentState>>({});
   const [isExportingReport, setIsExportingReport] = useState(false);
@@ -1621,7 +1623,11 @@ export function DataAssistantWorkspace({
     ? messagesByConversation[activeConversation.id] ?? EMPTY_ASSISTANT_MESSAGES
     : EMPTY_ASSISTANT_MESSAGES;
   const activeToolState = activeConversation ? toolStateByConversation[activeConversation.id] ?? null : null;
-  const activePendingPythonToolCallId = useMemo(() => pendingPythonToolCallId(activeMessages), [activeMessages]);
+  const activePendingToolApprovals = useMemo(
+    () => pendingToolApprovals(activeMessages, activeToolState),
+    [activeMessages, activeToolState],
+  );
+  const activePendingToolApproval = activePendingToolApprovals[0] ?? null;
   const landingUserName = user?.displayName?.trim() || user?.username || "Yuzili";
   const activeArtifactMessage = useMemo(
     () => {
@@ -1659,6 +1665,11 @@ export function DataAssistantWorkspace({
     [activeConversation?.id, agentRunsByMessage],
   );
   const activeChatCsvAttachments = activeConversation ? chatCsvAttachmentsByConversation[activeConversation.id] ?? [] : [];
+  const activeChatCsvProgress = useMemo(
+    () => aggregateChatCsvProgress(activeChatCsvAttachments),
+    [activeChatCsvAttachments],
+  );
+  const isImportingChatCsv = activeChatCsvProgress !== null;
   const readyChatCsvAttachments = activeChatCsvAttachments.filter((attachment) => attachment.status === "ready" && attachment.tempDataSourceId);
   const activeTempDataSourceIds = readyChatCsvAttachments.map((attachment) => attachment.tempDataSourceId as string);
   const selectedTempDataSourceIds = activeTempDataSourceIds.filter((tempDataSourceId) => !disabledTempDataSourceIds.includes(tempDataSourceId));
@@ -1912,6 +1923,32 @@ export function DataAssistantWorkspace({
         setWorkflowContextByConversation((current) => ({ ...current, [event.conversationId]: event.context }));
         return;
       }
+      if (event.type === "chat-csv-progress") {
+        if (
+          event.userId !== user?.id ||
+          removedChatCsvAttachmentIdsRef.current.has(event.attachmentId)
+        ) {
+          return;
+        }
+        setChatCsvAttachmentsByConversation((current) => ({
+          ...current,
+          [event.conversationId]: (current[event.conversationId] ?? []).map((attachment) =>
+            attachment.attachmentId === event.attachmentId
+              ? {
+                  ...attachment,
+                  status: event.phase,
+                  progressPhase: event.phase,
+                  progressPercent: event.percent,
+                  processedRows: event.processedRows,
+                  totalRows: event.totalRows,
+                  progressMessage: event.message,
+                  error: event.error,
+                }
+              : attachment,
+          ),
+        }));
+        return;
+      }
       if (event.type === "error") {
         toast({
           type: "error",
@@ -1930,7 +1967,7 @@ export function DataAssistantWorkspace({
       pendingMessageDeltasRef.current.clear();
       dispose?.();
     };
-  }, [flushPendingMessageDeltas, queueMessageDelta, toast, upsertMessage]);
+  }, [flushPendingMessageDeltas, queueMessageDelta, toast, upsertMessage, user?.id]);
 
   useEffect(() => {
     let isMounted = true;
@@ -2231,7 +2268,7 @@ export function DataAssistantWorkspace({
   }, [loadConversationMessages, messagesByConversation, user?.id, workflowContextByConversation]);
 
   const importChatCsvFile = useCallback(
-    async (file: File) => {
+    async (file: File, targetConversation?: AssistantConversation | null) => {
       if (!user?.id || !window.lifecycleX?.assistant) {
         toast({
           type: "error",
@@ -2271,29 +2308,62 @@ export function DataAssistantWorkspace({
         return;
       }
 
-      setIsImportingChatCsv(true);
+      let conversationId: string | null = null;
+      let localAttachmentId: string | null = null;
       try {
-        const conversation = activeConversation ?? await window.lifecycleX.assistant.createConversation(user.id, file.name.replace(/\.csv$/i, "").slice(0, 18) || "CSV 数据分析");
+        const conversation = targetConversation ?? activeConversation ?? await window.lifecycleX.assistant.createConversation(user.id, file.name.replace(/\.csv$/i, "").slice(0, 18) || "CSV 数据分析");
+        conversationId = conversation.id;
         setConversations((current) => mergeConversation(current, conversation));
         setMessagesByConversation((current) => ({ ...current, [conversation.id]: current[conversation.id] ?? [] }));
         setActiveConversationId(conversation.id);
 
         const localAttachment: ChatCsvAttachment = {
-          attachmentId: `local-${Date.now()}`,
+          attachmentId: `local-${createOptimisticMessageId()}`,
           conversationId: conversation.id,
           fileName: file.name,
           fileSizeBytes: file.size,
           mimeType: "text/csv",
-          status: "importing",
+          status: "reading",
           createdAt: new Date().toISOString(),
+          progressPhase: "reading",
+          progressPercent: 0,
+          progressMessage: "正在读取 CSV 文件",
         };
+        localAttachmentId = localAttachment.attachmentId;
         setChatCsvAttachmentsByConversation((current) => ({
           ...current,
           [conversation.id]: [localAttachment, ...(current[conversation.id] ?? [])],
         }));
 
-        const buffer = await file.arrayBuffer();
+        const updateLocalProgress = (
+          status: ChatCsvAttachment["status"],
+          progressPercent: number,
+          progressMessage: string,
+        ) => {
+          if (removedChatCsvAttachmentIdsRef.current.has(localAttachment.attachmentId)) {
+            return;
+          }
+          setChatCsvAttachmentsByConversation((current) => ({
+            ...current,
+            [conversation.id]: (current[conversation.id] ?? []).map((attachment) =>
+              attachment.attachmentId === localAttachment.attachmentId
+                ? {
+                    ...attachment,
+                    status,
+                    progressPhase: status === "selected" || status === "removed" ? undefined : status,
+                    progressPercent,
+                    progressMessage,
+                  }
+                : attachment,
+            ),
+          }));
+        };
+        const buffer = await readFileWithProgress(file, (percent) => {
+          updateLocalProgress("reading", percent, "正在读取 CSV 文件");
+        });
+        updateLocalProgress("validating", 20, "正在校验 CSV 文件");
         const imported = await window.lifecycleX.assistant.importConversationCsv({
+          clientAttachmentId: localAttachment.attachmentId,
           conversationId: conversation.id,
           userId: user.id,
           fileName: file.name,
@@ -2338,14 +2408,29 @@ export function DataAssistantWorkspace({
           });
         }
       } catch (error) {
+        if (conversationId && localAttachmentId && !removedChatCsvAttachmentIdsRef.current.has(localAttachmentId)) {
+          const message = error instanceof Error ? error.message : "CSV 导入失败。";
+          setChatCsvAttachmentsByConversation((current) => ({
+            ...current,
+            [conversationId!]: (current[conversationId!] ?? []).map((attachment) =>
+              attachment.attachmentId === localAttachmentId
+                ? {
+                    ...attachment,
+                    status: "failed",
+                    progressPhase: "failed",
+                    progressMessage: message,
+                    error: { code: "UNKNOWN_ERROR", message },
+                  }
+                : attachment,
+            ),
+          }));
+        }
         toast({
           type: "error",
           body: error instanceof Error ? error.message : "CSV 导入失败。",
           uniqueID: "assistant-chat-csv-import-exception",
           collisionBehavior: "overwrite",
         });
-      } finally {
-        setIsImportingChatCsv(false);
       }
     },
     [activeConversation, toast, user?.id],
@@ -2353,14 +2438,36 @@ export function DataAssistantWorkspace({
 
   const handleChatCsvFileSelect = useCallback(
     (event: ChangeEvent<HTMLInputElement>) => {
-      const file = event.target.files?.[0];
+      const files = Array.from(event.target.files ?? []);
       event.target.value = "";
-      if (!file) {
+      if (files.length === 0) {
         return;
       }
-      void importChatCsvFile(file);
+      void (async () => {
+        let targetConversation = activeConversation;
+        if (!targetConversation && user?.id && window.lifecycleX?.assistant) {
+          targetConversation = await window.lifecycleX.assistant.createConversation(
+            user.id,
+            files[0]!.name.replace(/\.csv$/i, "").slice(0, 18) || "CSV 数据分析",
+          );
+          setConversations((current) => mergeConversation(current, targetConversation!));
+          setMessagesByConversation((current) => ({
+            ...current,
+            [targetConversation!.id]: current[targetConversation!.id] ?? [],
+          }));
+          setActiveConversationId(targetConversation.id);
+        }
+        await Promise.all(files.map((file) => importChatCsvFile(file, targetConversation)));
+      })().catch((error) => {
+        toast({
+          type: "error",
+          body: error instanceof Error ? error.message : "CSV 文件选择失败。",
+          uniqueID: "assistant-chat-csv-select-error",
+          collisionBehavior: "overwrite",
+        });
+      });
     },
-    [importChatCsvFile],
+    [activeConversation, importChatCsvFile, toast, user?.id],
   );
 
   const closeToolSelector = useCallback(() => {
@@ -2695,7 +2802,7 @@ export function DataAssistantWorkspace({
         return;
       }
       try {
-        if (attachment.status === "importing" || attachment.status === "validating" || attachment.status === "parsing") {
+        if (isChatCsvImportActive(attachment) || !attachment.tempDataSourceId) {
           removedChatCsvAttachmentIdsRef.current.add(attachment.attachmentId);
         }
         if (user?.id && window.lifecycleX?.assistant && attachment.tempDataSourceId) {
@@ -3295,45 +3402,53 @@ export function DataAssistantWorkspace({
   const approveTool = useCallback(
     async (toolCallId: string, approved: boolean) => {
       if (!user?.id || !window.lifecycleX?.assistant) {
-        return;
+        return false;
       }
       try {
         const result = await window.lifecycleX.assistant.approveTool(user.id, toolCallId, approved);
         upsertMessage(result.message.conversationId, result.message);
-        if (activeConversation?.id && window.lifecycleX.assistant) {
+        if (result.message.conversationId && window.lifecycleX.assistant) {
           const [context, toolState] = await Promise.all([
-            window.lifecycleX.assistant.getWorkflowContext(user.id, activeConversation.id),
-            window.lifecycleX.assistant.getToolState(user.id, activeConversation.id),
+            window.lifecycleX.assistant.getWorkflowContext(user.id, result.message.conversationId),
+            window.lifecycleX.assistant.getToolState(user.id, result.message.conversationId),
           ]);
-          setWorkflowContextByConversation((current) => ({ ...current, [activeConversation.id]: context }));
-          setToolStateByConversation((current) => ({ ...current, [activeConversation.id]: toolState }));
+          setWorkflowContextByConversation((current) => ({ ...current, [result.message.conversationId]: context }));
+          setToolStateByConversation((current) => ({ ...current, [result.message.conversationId]: toolState }));
         }
+        return true;
       } catch (error) {
+        if (activeConversation?.id) {
+          try {
+            await loadConversationMessages(activeConversation.id);
+          } catch {
+            // Preserve the original approval error; a later stream event can refresh state.
+          }
+        }
         toast({
           type: "error",
           body: error instanceof Error ? error.message : "工具审批失败。",
           uniqueID: "assistant-tool-approval-error",
           collisionBehavior: "overwrite",
         });
+        return false;
       }
     },
-    [activeConversation?.id, toast, upsertMessage, user?.id],
+    [activeConversation?.id, loadConversationMessages, toast, upsertMessage, user?.id],
   );
 
-  const approvePendingPython = useCallback(
-    async (approved: boolean) => {
-      if (!activePendingPythonToolCallId) {
-        toast({
-          type: "error",
-          body: "当前没有待审批的 Python 工具调用。",
-          uniqueID: "assistant-python-approval-missing",
-          collisionBehavior: "overwrite",
-        });
+  const submitToolApproval = useCallback(
+    async (toolCallId: string, approved: boolean) => {
+      if (submittingApprovalToolCallId) {
         return;
       }
-      await approveTool(activePendingPythonToolCallId, approved);
+      setSubmittingApprovalToolCallId(toolCallId);
+      try {
+        await approveTool(toolCallId, approved);
+      } finally {
+        setSubmittingApprovalToolCallId((current) => current === toolCallId ? null : current);
+      }
     },
-    [activePendingPythonToolCallId, approveTool, toast],
+    [approveTool, submittingApprovalToolCallId],
   );
 
   const resolveFullFieldContextApproval = useCallback((approved: boolean) => {
@@ -3421,18 +3536,13 @@ export function DataAssistantWorkspace({
       if (!prompt || isStreaming || !user?.id) {
         return;
       }
-      if (activeChatCsvAttachments.some((attachment) => attachment.status === "importing" || attachment.status === "validating" || attachment.status === "parsing")) {
+      if (activeChatCsvAttachments.some(isChatCsvImportActive)) {
         toast({
           type: "error",
           body: "CSV 正在导入，请等待完成后再发送。",
           uniqueID: "assistant-chat-csv-importing-submit",
           collisionBehavior: "overwrite",
         });
-        return;
-      }
-      if (activePendingPythonToolCallId && isPythonApprovalPrompt(prompt)) {
-        setComposerValue("");
-        await approvePendingPython(true);
         return;
       }
       const invalidFieldRefs = selectedFieldRefs.filter((field) => field.status !== "valid" || !composerValue.includes(field.rawText));
@@ -3562,9 +3672,7 @@ export function DataAssistantWorkspace({
     [
       activeConversation,
       activeChatCsvAttachments,
-      activePendingPythonToolCallId,
       approvalMode,
-      approvePendingPython,
       clearComposerContextSelection,
       isModelConfigured,
       isStreaming,
@@ -3904,14 +4012,7 @@ export function DataAssistantWorkspace({
     }
 
     if (role === "assistant" && block.toolCallId && block.toolStatus === "pending_approval") {
-      return (
-        <ToolApprovalCard
-          key={block.id}
-          toolName={block.toolName ?? extractToolName(block)}
-          onAccept={() => approveTool(block.toolCallId!, true)}
-          onReject={() => approveTool(block.toolCallId!, false)}
-        />
-      );
+      return null;
     }
 
     if (role === "assistant" && block.guidance) {
@@ -4032,6 +4133,7 @@ export function DataAssistantWorkspace({
                   ref={chatCsvInputRef}
                   type="file"
                   accept=".csv,text/csv"
+                  multiple
                   className="assistant-chat-csv-input"
                   onChange={handleChatCsvFileSelect}
                 />
@@ -4050,9 +4152,41 @@ export function DataAssistantWorkspace({
                   isStopShown={isStreaming}
                   placeholder="问问数据助手"
                   density="compact"
+                  headerContext={
+                    activeChatCsvProgress ? (
+                      <VStack
+                        gap={1}
+                        hAlign="stretch"
+                        width="100%"
+                        className="assistant-chat-csv-progress"
+                      >
+                        <Text type="supporting" color="secondary">
+                          {activeChatCsvProgress.fileName
+                            ? `正在导入 ${activeChatCsvProgress.fileName}`
+                            : `正在导入 ${activeChatCsvProgress.fileCount} 个 CSV 文件`}
+                        </Text>
+                        <ProgressBar
+                          label="CSV 导入进度"
+                          value={activeChatCsvProgress.percent}
+                          max={100}
+                          variant="accent"
+                          hasValueLabel
+                        />
+                      </VStack>
+                    ) : undefined
+                  }
                   drawer={
-                    fieldSelectorOpen || activeChatCsvAttachments.length > 0 ? (
+                    activePendingToolApproval || fieldSelectorOpen || activeChatCsvAttachments.length > 0 ? (
                       <div className="assistant-composer-drawer-stack">
+                        {activePendingToolApproval ? (
+                          <ToolApprovalFeedback
+                            toolName={activePendingToolApproval.toolName}
+                            isSubmitting={submittingApprovalToolCallId === activePendingToolApproval.toolCallId}
+                            onDecision={(approved) =>
+                              void submitToolApproval(activePendingToolApproval.toolCallId, approved)
+                            }
+                          />
+                        ) : null}
                         {fieldSelectorOpen && (
                           <div
                             className="assistant-field-selector-panel"
@@ -4108,7 +4242,7 @@ export function DataAssistantWorkspace({
                                   ? `${attachment.rowCount ?? 0} 行 · ${attachment.columnCount ?? 0} 列`
                                   : attachment.status === "failed"
                                     ? attachment.error?.message ?? "导入失败"
-                                    : "导入中";
+                                    : `${attachment.progressMessage ?? "导入中"} · ${Math.round(attachment.progressPercent ?? 0)}%`;
                                 const color = attachment.status === "failed" ? "red" : attachment.status === "ready" ? "green" : "gray";
                                 return (
                                   <Token
@@ -4156,7 +4290,6 @@ export function DataAssistantWorkspace({
                           size: "sm",
                           className: "assistant-composer-action-button assistant-tool-selector-button",
                           icon: <Icon icon={Plus} size="xsm" color="inherit" />,
-                          tooltip: "选择工具",
                           isIconOnly: true,
                           isLoading: isLoadingDataSources || isImportingChatCsv,
                         }}
@@ -4204,7 +4337,7 @@ export function DataAssistantWorkspace({
               <ChatMessageList isStreaming={isStreaming} density="compact">
                 {activeMessages.map((message) => {
                   const sender = message.role === "user" ? "user" : "assistant";
-                  const workflowToolCalls = sender === "assistant" ? toolCallsFromToolState(message, activeToolState, approveTool) : [];
+                  const workflowToolCalls = sender === "assistant" ? toolCallsFromToolState(message, activeToolState) : [];
                   const toolCalls = sender === "assistant"
                     ? workflowToolCalls.length > 0
                       ? workflowToolCalls
@@ -4212,6 +4345,7 @@ export function DataAssistantWorkspace({
                     : [];
                   const agentRun = sender === "assistant" ? agentRunsByMessage[message.id] : undefined;
                   const showAgentProgress = Boolean(agentRun && (isActiveAgentRun(agentRun) || expandedAgentRunMessageIds.has(message.id)));
+                  const hideApprovalOnlyBubble = sender === "assistant" && hasOnlyPendingApprovalBlocks(message);
                   return (
                     <ChatMessage
                       key={message.id}
@@ -4226,21 +4360,23 @@ export function DataAssistantWorkspace({
                     >
                       {sender === "user" && renderUserContextTokens(message)}
                       {showAgentProgress && agentRun ? <AgentProgressPanel run={agentRun} /> : null}
-                      <ChatMessageBubble
-                        variant={sender === "assistant" ? "ghost" : "filled"}
-                        metadata={renderMessageMetadata(message)}
-                      >
-                        {sender === "user" ? (
-                          renderUserMessageBody(message)
-                        ) : message.blocks.length > 0 ? (
-                          renderAssistantMessageBlocks(message)
-                        ) : (
-                          <span className="assistant-stream-cursor">
-                            <Icon icon={LoaderCircle} size="xsm" color="inherit" className="assistant-message-status-spinner" />
-                            <span>思考中...</span>
-                          </span>
-                        )}
-                      </ChatMessageBubble>
+                      {!hideApprovalOnlyBubble ? (
+                        <ChatMessageBubble
+                          variant={sender === "assistant" ? "ghost" : "filled"}
+                          metadata={renderMessageMetadata(message)}
+                        >
+                          {sender === "user" ? (
+                            renderUserMessageBody(message)
+                          ) : message.blocks.length > 0 ? (
+                            renderAssistantMessageBlocks(message)
+                          ) : (
+                            <span className="assistant-stream-cursor">
+                              <Icon icon={LoaderCircle} size="xsm" color="inherit" className="assistant-message-status-spinner" />
+                              <span>思考中...</span>
+                            </span>
+                          )}
+                        </ChatMessageBubble>
+                      ) : null}
                       {toolCalls.length > 0 && (
                         <ChatToolCalls
                           label={`${toolCalls.length} tool calls`}

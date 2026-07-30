@@ -677,7 +677,10 @@ button {
 }
 
 .assistant-composer-shell .astryx-chat-composer {
+  width: 100%;
+  max-width: 700px;
   min-height: 92px;
+  margin-inline: auto;
 }
 
 .assistant-composer-shell .astryx-chat-composer > *:not(.astryx-chat-composer-drawer) {
@@ -685,6 +688,9 @@ button {
 }
 
 .assistant-composer-shell .astryx-chat-composer-input {
+  width: 66.6667%;
+  max-width: 66.6667%;
+  min-width: 0;
   min-height: 30px;
 }
 
@@ -699,9 +705,12 @@ button {
 .assistant-composer-context-tokens {
   display: flex;
   width: 100%;
-  max-width: 100%;
+  max-width: 700px;
   min-width: 0;
+  margin-inline: auto;
   margin-bottom: 8px;
+  padding-inline: 16px;
+  box-sizing: border-box;
 }
 
 .assistant-composer-context-tokens > span {
@@ -767,6 +776,32 @@ button {
   width: 100%;
   max-width: 100%;
   min-width: 0;
+}
+
+.assistant-tool-approval-drawer {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.assistant-tool-approval-drawer .astryx-list {
+  width: 100%;
+  min-width: 0;
+}
+
+.assistant-tool-approval-drawer .astryx-list-item {
+  border-block-end: 0 !important;
+}
+
+.assistant-chat-csv-progress {
+  max-width: 100%;
+  min-width: 0;
+}
+
+.assistant-chat-csv-progress .astryx-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .assistant-field-selector-panel {

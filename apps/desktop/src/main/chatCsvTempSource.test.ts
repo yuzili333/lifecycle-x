@@ -119,6 +119,26 @@ describe("ConversationTempSourceManager", () => {
     ]);
   });
 
+  it("reports monotonic validation, parsing, SQLite import and completion progress", () => {
+    const { manager } = createManager();
+    const progress: Array<{ phase: string; percent: number; processedRows?: number }> = [];
+
+    manager.importCsv(
+      importInput("合同编号,金额\nHT001,10\nHT002,20\nHT003,30"),
+      (event) => progress.push(event),
+    );
+
+    expect(progress[0]).toMatchObject({ phase: "validating", percent: 20 });
+    expect(progress.some((event) => event.phase === "parsing")).toBe(true);
+    expect(progress.some((event) => event.phase === "importing" && event.processedRows === 3)).toBe(true);
+    expect(progress.at(-1)).toMatchObject({
+      phase: "ready",
+      percent: 100,
+      processedRows: 3,
+    });
+    expect(progress.every((event, index) => index === 0 || event.percent >= progress[index - 1]!.percent)).toBe(true);
+  });
+
   it("renames duplicate and empty headers while preserving source names", () => {
     const { manager } = createManager();
     const attachment = manager.importCsv(importInput("金额,金额,,\n10,20,30,40"));

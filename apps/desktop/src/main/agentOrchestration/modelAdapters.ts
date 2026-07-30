@@ -259,7 +259,7 @@ export type ExecutionAdapterOutput = {
   traceId?: string;
   error?: string;
   errorCode?: string;
-  errorStage?: "provider" | "schema" | "handler";
+  errorStage?: "provider" | "protocol" | "schema" | "handler";
 };
 
 export class ExecutionParameterAdapter {
@@ -289,7 +289,10 @@ export class ExecutionParameterAdapter {
       stopAfterToolExecution: true,
       signal: input.signal,
       timeoutMs: this.config.timeoutMs,
-      requestOptions: this.config.requestOptions,
+      requestOptions: {
+        ...this.config.requestOptions,
+        toolChoice: { name: input.tool.name },
+      },
       metadata: {
         modelRole: "execution",
         orchestrationPhase: "parameter_generation",
@@ -318,6 +321,18 @@ export class ExecutionParameterAdapter {
           ? "provider"
           : serialized?.code === "TOOL_INPUT_INVALID" ? "schema" : "handler";
       }
+    }
+    if (!invoked && !error) {
+      return {
+        invoked: false,
+        content,
+        traceId,
+        error: content.trim()
+          ? "执行模型返回了普通文本，但未调用指定工具。"
+          : "执行模型未调用指定工具。",
+        errorCode: "TOOL_CALL_REQUIRED",
+        errorStage: "protocol",
+      };
     }
     return { invoked, output, toolCallId, content, traceId, error, errorCode, errorStage };
   }

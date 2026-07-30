@@ -10,7 +10,6 @@ export type ToolCallStateCardProps = {
   onSelect?: (record: ToolCallRecord) => void;
   onOpenReport?: (record: ToolCallRecord) => void;
   onOpenResult?: (record: ToolCallRecord) => void;
-  onApprove?: (record: ToolCallRecord, approved: boolean) => void;
 };
 
 const toolKindLabels: Record<ToolKind, string> = {
@@ -69,7 +68,6 @@ export function ToolCallStateCard({
   onSelect,
   onOpenReport,
   onOpenResult,
-  onApprove,
 }: ToolCallStateCardProps) {
   const IconComponent = toolKindIcons[record.toolKind];
   return (
@@ -86,22 +84,6 @@ export function ToolCallStateCard({
       </div>
       <div className="assistant-tool-state-card-actions">
         {isSelected ? <span className="assistant-tool-state-selected">默认输入</span> : null}
-        {record.status === "waiting_approval" ? (
-          <>
-            <Button
-              label="批准"
-              variant="primary"
-              size="sm"
-              onClick={() => onApprove?.(record, true)}
-            />
-            <Button
-              label="拒绝"
-              variant="ghost"
-              size="sm"
-              onClick={() => onApprove?.(record, false)}
-            />
-          </>
-        ) : null}
         {record.status === "completed" && (record.outputArtifactIds?.length || record.result?.primaryArtifactId) ? (
           <Button
             label="查看结果"

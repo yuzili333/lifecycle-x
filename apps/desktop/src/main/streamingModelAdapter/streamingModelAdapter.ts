@@ -557,6 +557,7 @@ function sanitizedRequestOptions(options: StreamChatInput["requestOptions"]) {
     temperature: options.temperature,
     maxTokens: options.maxTokens,
     responseFormat: options.responseFormat ? "configured" : undefined,
+    toolChoice: options.toolChoice?.name,
   };
 }
 

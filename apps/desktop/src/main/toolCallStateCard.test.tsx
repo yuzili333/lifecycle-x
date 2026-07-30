@@ -2,7 +2,7 @@ import { renderToString } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import {
   ReportToolCallCard,
-  ToolApprovalCard,
+  ToolApprovalFeedback,
   ToolCallStateCard,
   toolRecordSummary,
   toolStatusLabel,
@@ -64,6 +64,8 @@ describe("ToolCallStateCard", () => {
     expect(html).toContain("失败");
     expect(html).toContain("默认输入");
     expect(html).toContain("打开报告");
+    expect(html).not.toContain(">批准<");
+    expect(html).not.toContain(">拒绝<");
   });
 
   it("summarizes version, artifacts and lineage", () => {
@@ -72,23 +74,23 @@ describe("ToolCallStateCard", () => {
   });
 });
 
-describe("ToolApprovalCard", () => {
-  it("renders explicit approval actions without a surface acceptance hint", () => {
+describe("ToolApprovalFeedback", () => {
+  it("renders explicit lettered approval options in the composer drawer", () => {
     const html = renderToString(
-      <ToolApprovalCard
+      <ToolApprovalFeedback
         toolName="python"
-        onAccept={() => undefined}
-        onReject={() => undefined}
+        isSubmitting={false}
+        onDecision={() => undefined}
       />,
     );
 
     expect(html).toContain("PYTHON 工具调用权限申请");
     expect(html).toContain("接受");
     expect(html).toContain("拒绝");
-    expect(html).toContain("请选择接受或拒绝");
-    expect(html).not.toContain("点击接受");
-    expect(html).not.toContain("批准执行");
-    expect(html).not.toContain("审批通过后执行");
+    expect(html).toContain(">A<");
+    expect(html).toContain(">B<");
+    expect(html).not.toContain("检测到");
+    expect(html).not.toContain("xxhr3t");
   });
 });
 

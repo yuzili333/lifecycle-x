@@ -529,6 +529,41 @@ describe("StreamingModelAdapter", () => {
     expect(events.some((event) => event.type === "stream-error" && (event.payload.error as { code: string }).code === "PROVIDER_STREAM_PARSE_FAILED")).toBe(true);
   });
 
+  it("retries and classifies fetch failures as provider request failures", async () => {
+    const fetchMock = vi.fn().mockRejectedValue(new TypeError("fetch failed"));
+    const adapter = createStreamingModelAdapter({
+      baseURL: "https://example.local/v1",
+      apiKey: "secret",
+      model: "test-model",
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+
+    const events = await collect(adapter.streamChat(baseInput()));
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "model-observation",
+      payload: expect.objectContaining({
+        phase: "provider-retry",
+        detail: expect.objectContaining({ retryReason: "network_error" }),
+      }),
+    }));
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "stream-error",
+      payload: {
+        error: expect.objectContaining({
+          code: "PROVIDER_REQUEST_FAILED",
+          message: "模型服务请求失败。",
+          cause: "fetch failed",
+        }),
+      },
+    }));
+    expect(events.some((event) =>
+      event.type === "stream-error" &&
+      (event.payload.error as { code: string }).code === "PROVIDER_STREAM_PARSE_FAILED"
+    )).toBe(false);
+  });
+
   it("emits user aborted errors", async () => {
     const controller = new AbortController();
     controller.abort();

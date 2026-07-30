@@ -82,6 +82,8 @@ import {
   chatCsvError,
   ConversationTempSourceManager,
   type ChatCsvAttachment,
+  type ChatCsvImportError,
+  type ChatCsvImportProgress,
   type ChatCsvSelectedFieldRef,
   type ConversationTempCsvTable,
   type ImportConversationCsvInput,
@@ -297,6 +299,19 @@ export type AssistantStreamEvent =
   | { type: "tool-state"; conversationId: string; state: ConversationToolState }
   | { type: "workflow"; conversationId: string; context: WorkflowContextSummary }
   | { type: "agent-progress"; conversationId: string; messageId: string; event: AgentProgressEvent; run: AgentRunRecord }
+  | {
+      type: "chat-csv-progress";
+      userId: string;
+      conversationId: string;
+      attachmentId: string;
+      fileName: string;
+      phase: ChatCsvImportProgress["phase"];
+      percent: number;
+      processedRows?: number;
+      totalRows?: number;
+      message?: string;
+      error?: ChatCsvImportError;
+    }
   | { type: "error"; conversationId: string; messageId?: string; message: string; traceId: string };
 
 export type AssistantSendResult = {
@@ -2396,20 +2411,59 @@ export class AssistantRuntime {
     if (!conversation) {
       throw new Error("对话记录不存在，无法导入会话临时 CSV。");
     }
+    const requestedAttachmentId = input.clientAttachmentId?.trim();
+    const attachmentId = requestedAttachmentId && requestedAttachmentId.length <= 200
+      ? requestedAttachmentId
+      : `pending_${randomUUID()}`;
+    let latestProgress: ChatCsvImportProgress = {
+      phase: "validating",
+      percent: 15,
+      message: "正在校验 CSV 文件",
+    };
+    const emitProgress = (progress: ChatCsvImportProgress) => {
+      latestProgress = progress;
+      this.options.emit({
+        type: "chat-csv-progress",
+        userId: input.userId,
+        conversationId: input.conversationId,
+        attachmentId,
+        fileName: input.fileName,
+        ...progress,
+      });
+    };
     try {
-      const attachment = this.tempSourceManager.importCsv(input);
+      const attachment = this.tempSourceManager.importCsv(input, emitProgress);
       this.touchConversation(input.conversationId);
       return attachment;
     } catch (error) {
+      const importError = chatCsvError(error);
+      this.options.emit({
+        type: "chat-csv-progress",
+        userId: input.userId,
+        conversationId: input.conversationId,
+        attachmentId,
+        fileName: input.fileName,
+        phase: "failed",
+        percent: latestProgress.percent,
+        processedRows: latestProgress.processedRows,
+        totalRows: latestProgress.totalRows,
+        message: importError.message,
+        error: importError,
+      });
       return {
-        attachmentId: `failed_${randomUUID()}`,
+        attachmentId,
         conversationId: input.conversationId,
         fileName: input.fileName,
         fileSizeBytes: input.fileSizeBytes,
         mimeType: "text/csv",
         status: "failed",
         createdAt: nowIso(),
-        error: chatCsvError(error),
+        error: importError,
+        progressPhase: "failed",
+        progressPercent: latestProgress.percent,
+        processedRows: latestProgress.processedRows,
+        totalRows: latestProgress.totalRows,
+        progressMessage: importError.message,
       };
     }
   }
@@ -4753,19 +4807,23 @@ export class AssistantRuntime {
     outcome: "generated" | "passed" | "failed",
     detail: Record<string, unknown>,
   ) {
+    const generationFailure = outcome === "failed" &&
+      (detail.validationLayer === "provider" || detail.validationLayer === "protocol");
     const log = {
       id: randomUUID(),
       toolCallId: event.toolCallId ?? null,
       conversationId: event.conversationId,
       userId: input.userId,
       kind: "model",
-      phase: "tool-parameter-validation",
+      phase: generationFailure ? "tool-parameter-generation" : "tool-parameter-validation",
       status: outcome === "failed" ? "error" as const : outcome === "passed" ? "success" as const : "info" as const,
       message: outcome === "generated"
         ? `${this.agentToolLabel(step.toolKind)}参数已生成，等待本地校验。`
         : outcome === "passed"
           ? `${this.agentToolLabel(step.toolKind)}参数通过本地校验。`
-          : `${this.agentToolLabel(step.toolKind)}参数未通过本地校验。`,
+          : generationFailure
+            ? `${this.agentToolLabel(step.toolKind)}参数生成未按工具调用协议完成。`
+            : `${this.agentToolLabel(step.toolKind)}参数未通过本地校验。`,
       detail: {
         stepId: step.stepId,
         toolKind: step.toolKind,
@@ -7420,21 +7478,57 @@ export class AssistantRuntime {
       let parameterIssues = this.executionParameterIssues(execution);
 
       if (
-        step.toolKind === "report_generation" &&
+        step.toolKind !== "report_generation" &&
         !localToolCall &&
-        execution.errorStage === "provider" &&
-        ["PROVIDER_TIMEOUT", "PROVIDER_FIRST_EVENT_TIMEOUT", "PROVIDER_STREAM_PARSE_FAILED"]
-          .includes(execution.errorCode ?? "") &&
+        execution.errorStage === "protocol" &&
+        execution.errorCode === "TOOL_CALL_REQUIRED" &&
         !signal.aborted
       ) {
-        this.agentTurnOrchestrator.fallback(runId, "报告生成请求未从模型服务获得结果，正在重试一次。", {
-          fallbackReason: "report_provider_request_failed",
+        const toolLabel = this.agentToolLabel(step.toolKind);
+        this.agentTurnOrchestrator.fallback(runId, `${toolLabel}参数未按工具调用协议返回，正在纠正一次。`, {
+          fallbackReason: `${step.toolKind}_tool_call_required`,
+          stepId: step.stepId,
+        });
+        context = [
+          context,
+          `上一次${toolLabel}参数生成响应错误地使用了普通文本，没有调用唯一允许的工具 ${tool.name}。`,
+          `本次必须调用 ${tool.name} 且只调用一次，参数严格符合其 Schema；禁止输出普通文本、代码围栏或解释。`,
+        ].join("\n\n");
+        this.agentTurnOrchestrator.preparingStep(runId, step);
+        execution = await this.executeDualModelStep({
+          runId,
+          step,
+          input: executionInput,
+          tool,
+          context,
+          modelName: run.executionModelName,
+          apiKey,
+          signal,
+        });
+        localToolCall = this.findAgentToolCall(run.messageId, runId, step.stepId);
+        parameterIssues = this.executionParameterIssues(execution);
+      }
+
+      const retryableProviderErrorCodes = step.toolKind === "report_generation"
+        ? ["PROVIDER_REQUEST_FAILED", "PROVIDER_TIMEOUT", "PROVIDER_FIRST_EVENT_TIMEOUT", "PROVIDER_STREAM_PARSE_FAILED"]
+        : ["PROVIDER_REQUEST_FAILED", "PROVIDER_STREAM_PARSE_FAILED"];
+      if (
+        !localToolCall &&
+        execution.errorStage === "provider" &&
+        retryableProviderErrorCodes.includes(execution.errorCode ?? "") &&
+        !signal.aborted
+      ) {
+        const toolLabel = this.agentToolLabel(step.toolKind);
+        this.agentTurnOrchestrator.fallback(runId, `${toolLabel}参数生成请求未从模型服务获得结果，正在重试一次。`, {
+          fallbackReason: step.toolKind === "report_generation"
+            ? "report_provider_request_failed"
+            : `${step.toolKind}_provider_request_failed`,
           stepId: step.stepId,
           providerErrorCode: execution.errorCode,
         });
         context = [
           context,
-          "上一次报告参数生成请求未从模型服务获得结果。本次只重试当前报告步骤，不得修改任务目标、统计结果或引用范围。",
+          `上一次${toolLabel}参数生成请求未从模型服务获得结果。本次只重试当前步骤，不得修改任务目标、统计口径或引用范围。`,
         ].join("\n\n");
         this.agentTurnOrchestrator.preparingStep(runId, step);
         execution = await this.executeDualModelStep({
@@ -7606,6 +7700,8 @@ export class AssistantRuntime {
         ? "EXECUTION_MODEL_REQUEST_FAILED"
         : execution.errorStage === "schema"
           ? "TOOL_PARAMETER_SCHEMA_INVALID"
+          : execution.errorStage === "protocol"
+            ? "TOOL_PARAMETER_GENERATION_FAILED"
           : issues.length > 0
             ? "TOOL_PARAMETER_VALIDATION_FAILED"
             : "TOOL_PARAMETER_GENERATION_FAILED";

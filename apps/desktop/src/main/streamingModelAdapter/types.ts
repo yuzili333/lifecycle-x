@@ -199,6 +199,9 @@ export type ModelRequestOptions = {
   temperature?: number;
   maxTokens?: number;
   responseFormat?: Record<string, unknown>;
+  toolChoice?: {
+    name: string;
+  };
 };
 
 export type StreamingModelAdapterConfig = {

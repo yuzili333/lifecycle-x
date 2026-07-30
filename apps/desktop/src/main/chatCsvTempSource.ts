@@ -3,7 +3,16 @@ import { randomUUID } from "node:crypto";
 export const CHAT_CSV_MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024;
 export const DEFAULT_CHAT_CSV_TTL_MS = 24 * 60 * 60 * 1000;
 
-export type ChatCsvUploadStatus = "selected" | "validating" | "parsing" | "importing" | "ready" | "failed" | "removed";
+export type ChatCsvUploadStatus = "selected" | "reading" | "validating" | "parsing" | "importing" | "ready" | "failed" | "removed";
+export type ChatCsvProgressPhase = "reading" | "validating" | "parsing" | "importing" | "ready" | "failed";
+
+export type ChatCsvImportProgress = {
+  phase: ChatCsvProgressPhase;
+  percent: number;
+  processedRows?: number;
+  totalRows?: number;
+  message?: string;
+};
 
 export type ChatCsvImportErrorCode =
   | "CSV_FILE_TOO_LARGE"
@@ -92,6 +101,11 @@ export type ChatCsvAttachment = {
   createdAt: string;
   warnings?: string[];
   error?: ChatCsvImportError;
+  progressPhase?: ChatCsvProgressPhase;
+  progressPercent?: number;
+  processedRows?: number;
+  totalRows?: number;
+  progressMessage?: string;
 };
 
 export type ConversationTempCsvTable = {
@@ -112,6 +126,7 @@ export type ConversationTempCsvTable = {
 };
 
 export type ImportConversationCsvInput = {
+  clientAttachmentId?: string;
   conversationId: string;
   userId: string;
   fileName: string;
@@ -178,29 +193,36 @@ function validateFile(input: ImportConversationCsvInput) {
   }
 }
 
-function parseCsv(content: string): ParsedCsv {
+function parseCsv(content: string, onProgress?: (fraction: number) => void): ParsedCsv {
   const encoding = content.startsWith("\uFEFF") ? "utf-8-bom" : "utf-8";
   const normalizedContent = content.replace(/^\uFEFF/, "");
-  const records = parseCsvRecords(normalizedContent);
+  const records = parseCsvRecords(normalizedContent, (fraction) => onProgress?.(fraction * 0.7));
   if (records.length === 0) {
     fail("CSV_HEADER_MISSING", "CSV 表头不能为空。");
   }
   const delimiter = detectDelimiter(records[0] ?? "");
-  const parsedRows = records.map((record) => parseCsvRecord(record, delimiter));
+  const parsedRows: string[][] = [];
+  for (const [index, record] of records.entries()) {
+    parsedRows.push(parseCsvRecord(record, delimiter));
+    onProgress?.(0.7 + ((index + 1) / records.length) * 0.2);
+  }
   const rawHeaders = parsedRows[0] ?? [];
   if (rawHeaders.length === 0 || rawHeaders.every((header) => !header.trim())) {
     fail("CSV_HEADER_MISSING", "CSV 表头不能为空。");
   }
   const headers = normalizeHeaders(rawHeaders);
   const rows = parsedRows.slice(1);
+  onProgress?.(0.95);
   const columns = buildColumns(headers, rows);
+  onProgress?.(1);
   return { delimiter, encoding, headers: headers.map((header) => header.sqliteColumnName), columns, rows };
 }
 
-function parseCsvRecords(content: string) {
+function parseCsvRecords(content: string, onProgress?: (fraction: number) => void) {
   const records: string[] = [];
   let current = "";
   let inQuotes = false;
+  const progressInterval = Math.max(1, Math.floor(content.length / 20));
 
   for (let index = 0; index < content.length; index += 1) {
     const char = content[index];
@@ -226,11 +248,15 @@ function parseCsvRecords(content: string) {
       continue;
     }
     current += char;
+    if (index % progressInterval === 0) {
+      onProgress?.(index / Math.max(1, content.length));
+    }
   }
 
   if (current.length > 0) {
     records.push(current);
   }
+  onProgress?.(1);
   return records;
 }
 
@@ -407,6 +433,10 @@ function attachmentFromTable(table: ConversationTempCsvTable, status: ChatCsvUpl
     columns: table.columns,
     createdAt: table.createdAt,
     warnings: warnings.length > 0 ? warnings : undefined,
+    progressPhase: status === "ready" ? "ready" : status === "failed" ? "failed" : undefined,
+    progressPercent: status === "ready" ? 100 : undefined,
+    processedRows: status === "ready" ? table.rowCount : undefined,
+    totalRows: status === "ready" ? table.rowCount : undefined,
   };
 }
 
@@ -438,13 +468,41 @@ export class ConversationTempSourceManager {
     `);
   }
 
-  importCsv(input: ImportConversationCsvInput): ChatCsvAttachment {
+  importCsv(
+    input: ImportConversationCsvInput,
+    onProgress?: (progress: ChatCsvImportProgress) => void,
+  ): ChatCsvAttachment {
+    let lastPercent = -1;
+    const reportProgress = (progress: ChatCsvImportProgress) => {
+      const normalizedPercent = Math.min(100, Math.max(lastPercent, Math.round(progress.percent)));
+      if (
+        normalizedPercent === lastPercent &&
+        progress.processedRows !== progress.totalRows
+      ) {
+        return;
+      }
+      lastPercent = normalizedPercent;
+      try {
+        onProgress?.({ ...progress, percent: normalizedPercent });
+      } catch {
+        // Progress reporting must never interrupt the local import transaction.
+      }
+    };
+
+    reportProgress({ phase: "validating", percent: 20, message: "正在校验 CSV 文件" });
     validateFile(input);
     const content = Buffer.from(input.fileBuffer).toString("utf8");
     if (!content.trim()) {
       fail("CSV_FILE_EMPTY", "CSV 文件不能为空。");
     }
-    const parsed = parseCsv(content);
+    reportProgress({ phase: "parsing", percent: 20, message: "正在解析 CSV 数据" });
+    const parsed = parseCsv(content, (fraction) => {
+      reportProgress({
+        phase: "parsing",
+        percent: 20 + fraction * 20,
+        message: "正在解析 CSV 数据",
+      });
+    });
     const createdAt = nowIso();
     const tempDataSourceId = `chat_csv_${randomUUID()}`;
     const tempTableId = `chat_csv_table_${randomUUID()}`;
@@ -457,11 +515,34 @@ export class ConversationTempSourceManager {
     })`;
     const insertSql = `insert into ${quoteSqliteIdentifier(sqliteTableName)} (__row_index, ${parsed.columns.map((column) => quoteSqliteIdentifier(column.sqliteColumnName)).join(", ")}) values (?, ${parsed.columns.map(() => "?").join(", ")})`;
 
+    reportProgress({
+      phase: "importing",
+      percent: 40,
+      processedRows: 0,
+      totalRows: parsed.rows.length,
+      message: "正在写入本地临时数据库",
+    });
     const transaction = this.db.transaction(() => {
       this.db.prepare(createSql).run();
       const insert = this.db.prepare(insertSql);
       for (const [index, row] of parsed.rows.entries()) {
         insert.run(index + 1, ...parsed.columns.map((column, columnIndex) => sqliteValue(column, row[columnIndex])));
+        reportProgress({
+          phase: "importing",
+          percent: 40 + ((index + 1) / Math.max(1, parsed.rows.length)) * 55,
+          processedRows: index + 1,
+          totalRows: parsed.rows.length,
+          message: "正在写入本地临时数据库",
+        });
+      }
+      if (parsed.rows.length === 0) {
+        reportProgress({
+          phase: "importing",
+          percent: 95,
+          processedRows: 0,
+          totalRows: 0,
+          message: "正在登记临时数据源",
+        });
       }
       this.db
         .prepare(
@@ -501,6 +582,13 @@ export class ConversationTempSourceManager {
       fail("CSV_SQLITE_IMPORT_FAILED", error instanceof Error ? error.message : "CSV 导入 SQLite 失败。");
     }
 
+    reportProgress({
+      phase: "ready",
+      percent: 100,
+      processedRows: parsed.rows.length,
+      totalRows: parsed.rows.length,
+      message: "CSV 已导入",
+    });
     return attachmentFromTable(
       {
         tempTableId,

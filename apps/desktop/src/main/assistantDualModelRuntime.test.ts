@@ -386,6 +386,128 @@ describe("AssistantRuntime dual-model flow", () => {
     expect(responses).toHaveLength(0);
   });
 
+  it("retries SQL parameter generation once after a provider transport failure", async () => {
+    const temp = mkdtempSync(join(tmpdir(), "cycle-probe-sql-provider-retry-"));
+    const runtime = runtimeFor(temp, createCsvMetadataDatabase(temp));
+    const responses: Array<Response | Error> = [
+      toolCallResponse("plan-sql-retry", "submit_agent_execution_plan", {
+        outcome: "execute",
+        summary: "查询数据。",
+        requestedOutputs: ["query"],
+        steps: [
+          {
+            stepId: "query",
+            toolKind: "sql_query",
+            purpose: "查询数据",
+            dependencies: [],
+            inputResolution: "selected_data_source",
+            expectedOutput: "查询 Artifact",
+          },
+        ],
+      }),
+      new TypeError("fetch failed"),
+      new TypeError("fetch failed"),
+      nonStreamToolCallResponse("sql-after-provider-retry", "request_sql_query_execution", {
+        sql: "select 1 as value",
+      }),
+    ];
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      const response = responses.shift();
+      if (!response) throw new Error("unexpected model request");
+      if (response instanceof Error) throw response;
+      return response;
+    }));
+
+    const result = await runtime.sendMessage({
+      userId: "user-1",
+      clientRequestId: "sql-provider-retry",
+      prompt: "查询数据",
+      modelName: "reasoning-model",
+      executionModelName: "execution-model",
+      dualModelOrchestrationEnabled: true,
+      dataSourceLabel: "测试数据源",
+      schemaContextMarkdown: "table test(value integer)",
+      approvalMode: "full_access",
+    });
+    const run = await waitForRun(runtime, "user-1", result.assistantMessage.id, "completed");
+    const records = (await runtime.listConversationToolCalls("user-1", result.conversation.id))
+      .filter((record) => record.messageId === result.assistantMessage.id);
+
+    expect(run.completedStepIds).toEqual(["query"]);
+    expect(run.events).toContainEqual(expect.objectContaining({
+      phase: "fallback",
+      detail: expect.objectContaining({
+        fallbackReason: "sql_query_provider_request_failed",
+        providerErrorCode: "PROVIDER_REQUEST_FAILED",
+        stepId: "query",
+      }),
+    }));
+    expect(records.filter((record) => record.toolKind === "sql_query")).toHaveLength(1);
+    expect(records.find((record) => record.toolKind === "sql_query")?.status).toBe("completed");
+    expect(responses).toHaveLength(0);
+  });
+
+  it("retries SQL parameter generation once when the model returns plain text instead of a tool call", async () => {
+    const temp = mkdtempSync(join(tmpdir(), "cycle-probe-sql-tool-call-retry-"));
+    const runtime = runtimeFor(temp, createCsvMetadataDatabase(temp));
+    const requests: Array<Record<string, unknown>> = [];
+    const responses = [
+      toolCallResponse("plan-sql-tool-call-retry", "submit_agent_execution_plan", {
+        outcome: "execute",
+        summary: "查询数据。",
+        requestedOutputs: ["query"],
+        steps: [{
+          stepId: "query",
+          toolKind: "sql_query",
+          purpose: "查询数据",
+          dependencies: [],
+          inputResolution: "selected_data_source",
+          expectedOutput: "查询 Artifact",
+        }],
+      }),
+      nonStreamTextResponse("我将根据字段生成 SQL 查询。"),
+      nonStreamToolCallResponse("sql-after-tool-call-retry", "request_sql_query_execution", {
+        sql: "select 1 as value",
+      }),
+    ];
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init?: RequestInit) => {
+      requests.push(JSON.parse(String(init?.body ?? "{}")));
+      const response = responses.shift();
+      if (!response) throw new Error("unexpected model request");
+      return response;
+    }));
+
+    const result = await runtime.sendMessage({
+      userId: "user-1",
+      clientRequestId: "sql-tool-call-retry",
+      prompt: "查询数据",
+      modelName: "reasoning-model",
+      executionModelName: "execution-model",
+      dualModelOrchestrationEnabled: true,
+      dataSourceLabel: "测试数据源",
+      schemaContextMarkdown: "table test(value integer)",
+      approvalMode: "full_access",
+    });
+    const run = await waitForRun(runtime, "user-1", result.assistantMessage.id, "completed");
+    const records = (await runtime.listConversationToolCalls("user-1", result.conversation.id))
+      .filter((record) => record.messageId === result.assistantMessage.id);
+
+    expect(run.completedStepIds).toEqual(["query"]);
+    expect(run.events).toContainEqual(expect.objectContaining({
+      phase: "fallback",
+      detail: expect.objectContaining({
+        fallbackReason: "sql_query_tool_call_required",
+        stepId: "query",
+      }),
+    }));
+    expect(requests.slice(1).every((request) =>
+      (request.tool_choice as { function?: { name?: string } } | undefined)?.function?.name ===
+        "request_sql_query_execution"
+    )).toBe(true);
+    expect(records.filter((record) => record.toolKind === "sql_query")).toHaveLength(1);
+    expect(records[0]?.status).toBe("completed");
+  });
+
   it("preserves the provider error when the report retry also fails", async () => {
     const temp = mkdtempSync(join(tmpdir(), "cycle-probe-report-provider-failed-"));
     const runtime = runtimeFor(temp, createCsvMetadataDatabase(temp));
@@ -446,7 +568,7 @@ describe("AssistantRuntime dual-model flow", () => {
 
     expect(run.failedStepIds).toEqual(["report"]);
     expect(reportRecord?.status).toBe("failed");
-    expect(reportRecord?.error?.message).toContain("模型流解析失败");
+    expect(reportRecord?.error?.message).toContain("模型服务请求失败");
     expect(reportRecord?.error?.message).not.toContain("未返回可执行参数");
     expect(responses).toHaveLength(0);
   });
@@ -1219,6 +1341,45 @@ describe("AssistantRuntime dual-model flow", () => {
     expect(context).toContain("当前数据源：latest.csv");
     expect(context).toContain("默认使用最近更新的数据集");
     expect(context).not.toContain("当前数据源：未选择");
+  });
+
+  it("emits conversation-scoped CSV progress using the renderer attachment id", () => {
+    const temp = mkdtempSync(join(tmpdir(), "cycle-probe-csv-progress-"));
+    const events: AssistantStreamEvent[] = [];
+    const runtime = new AssistantRuntime({
+      dbPath: join(temp, "assistant.sqlite"),
+      csvSqlitePath: createCsvMetadataDatabase(temp),
+      toolLogPath: join(temp, "tools.jsonl"),
+      getModelApiKey: async () => "test-key",
+      emit: (event) => events.push(event),
+    });
+    const conversation = runtime.createConversation("user-1");
+
+    const attachment = runtime.importConversationCsv({
+      clientAttachmentId: "local-attachment-1",
+      userId: "user-1",
+      conversationId: conversation.id,
+      fileName: "risk.csv",
+      fileSizeBytes: 24,
+      fileBuffer: new TextEncoder().encode("分类,金额\n正常,10\n关注,20\n"),
+    });
+    const progress = events.filter((event) => event.type === "chat-csv-progress");
+
+    expect(attachment.status).toBe("ready");
+    expect(progress[0]).toMatchObject({
+      type: "chat-csv-progress",
+      userId: "user-1",
+      conversationId: conversation.id,
+      attachmentId: "local-attachment-1",
+      phase: "validating",
+      percent: 20,
+    });
+    expect(progress.at(-1)).toMatchObject({
+      phase: "ready",
+      percent: 100,
+      processedRows: 2,
+      totalRows: 2,
+    });
   });
 
   it("routes an L1 query through Qwen and skips Kimi Thinking", async () => {

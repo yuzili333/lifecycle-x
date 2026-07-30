@@ -114,6 +114,7 @@ export class OpenAICompatibleProvider {
           stream,
           messages: input.messages.map(toProviderMessage),
           tools: input.tools?.length ? input.tools.map(toProviderTool) : undefined,
+          tool_choice: providerToolChoice(requestOptions.toolChoice, input.tools),
           enable_thinking: requestOptions.enableThinking,
           thinking_budget: requestOptions.enableThinking ? requestOptions.thinkingBudget : undefined,
           temperature: requestOptions.temperature,
@@ -128,7 +129,10 @@ export class OpenAICompatibleProvider {
         try {
           response = await this.fetchImpl(endpoint, requestInit);
         } catch (error) {
-          if (signal?.aborted || attempt >= 2) throw error;
+          if (signal?.aborted) throw error;
+          if (attempt >= 2) {
+            throw new ModelAdapterError("PROVIDER_REQUEST_FAILED", "模型服务请求失败。", error);
+          }
           const delayMs = retryDelayMs(attempt);
           yield { type: "request-retry", attempt, reason: "network_error", delayMs };
           await abortableDelay(delayMs, signal);
@@ -148,7 +152,12 @@ export class OpenAICompatibleProvider {
       }
 
       if (!stream) {
-        const body = await response.json() as ChatCompletionResponse;
+        let body: ChatCompletionResponse;
+        try {
+          body = await response.json() as ChatCompletionResponse;
+        } catch (error) {
+          throw new ModelAdapterError("PROVIDER_STREAM_PARSE_FAILED", "模型响应不是有效 JSON。", error);
+        }
         markFirstEvent();
         const choice = body.choices?.[0];
         const reasoning = choice?.message?.reasoning_content;
@@ -254,7 +263,7 @@ export class OpenAICompatibleProvider {
       if (error instanceof ModelAdapterError) {
         throw error;
       }
-      throw new ModelAdapterError("PROVIDER_STREAM_PARSE_FAILED", "模型流解析失败。", error);
+      throw new ModelAdapterError("PROVIDER_REQUEST_FAILED", "模型服务流传输中断。", error);
     } finally {
       if (timeout) {
         clearTimeout(timeout);
@@ -302,6 +311,21 @@ function toProviderTool(tool: ToolDefinition) {
       name: tool.name,
       description: tool.description,
       parameters: tool.inputSchema,
+    },
+  };
+}
+
+function providerToolChoice(
+  toolChoice: { name: string } | undefined,
+  tools: ToolDefinition[] | undefined,
+) {
+  if (!toolChoice || !tools?.some((tool) => tool.name === toolChoice.name)) {
+    return undefined;
+  }
+  return {
+    type: "function",
+    function: {
+      name: toolChoice.name,
     },
   };
 }

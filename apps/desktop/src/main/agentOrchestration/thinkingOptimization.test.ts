@@ -238,6 +238,64 @@ describe("thinking optimization", () => {
     }
   });
 
+  it("forces the sole execution tool and classifies a plain-text response as a protocol failure", async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init?: RequestInit) => {
+      requests.push(JSON.parse(String(init?.body ?? "{}")));
+      return new Response(JSON.stringify({
+        choices: [{
+          message: { content: "我将生成 SQL 查询。" },
+          finish_reason: "stop",
+        }],
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }));
+    const handler = vi.fn(async () => ({ status: "completed" }));
+    const adapter = new ExecutionParameterAdapter({
+      providerName: "siliconflow",
+      baseURL: "https://example.local/v1",
+      apiKey: "test-key",
+      model: "execution-model",
+      timeoutMs: 10_000,
+      requestOptions: { enableThinking: false, stream: false, temperature: 0, maxTokens: 4_096 },
+      profileName: "sql",
+    });
+
+    const output = await adapter.execute({
+      conversationId: "conversation-1",
+      messageId: "message-1",
+      step: {
+        stepId: "query",
+        toolKind: "sql_query",
+        purpose: "查询数据",
+        dependencies: [],
+        inputResolution: "selected_data_source",
+        expectedOutput: "查询数据集",
+      },
+      messages: [{ id: "user-1", role: "user", content: "查询数据", createdAt: new Date().toISOString() }],
+      tool: {
+        name: "request_sql_query_execution",
+        description: "执行 SQL 查询",
+        inputSchema: executionToolSchema("sql_query"),
+        handler,
+      },
+    });
+    vi.unstubAllGlobals();
+
+    expect(requests[0]).toMatchObject({
+      tool_choice: {
+        type: "function",
+        function: { name: "request_sql_query_execution" },
+      },
+    });
+    expect(output).toMatchObject({
+      invoked: false,
+      content: "我将生成 SQL 查询。",
+      errorCode: "TOOL_CALL_REQUIRED",
+      errorStage: "protocol",
+    });
+    expect(handler).not.toHaveBeenCalled();
+  });
+
   it("streams long report Markdown without transporting it in tool-call JSON", async () => {
     const markdown = `# 分行资产质量分析报告\n\n${"报告内容。".repeat(4_000)}`;
     const requests: Array<Record<string, unknown>> = [];
