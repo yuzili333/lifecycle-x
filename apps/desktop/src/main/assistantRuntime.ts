@@ -183,6 +183,7 @@ export type AssistantToolCallMetadata = {
   temporaryDataSourceLabels?: string[];
   selectedTempDataSourceIds?: string[];
   selectedFieldRefs?: ChatCsvSelectedFieldRef[];
+  skillId?: string;
   agentRunId?: string;
   agentStepId?: string;
   orchestrationMode?: "dual_model";
@@ -4966,6 +4967,7 @@ export class AssistantRuntime {
       temporaryDataSourceLabels: tempSources.map((source) => source.fileName),
       selectedTempDataSourceIds: input.selectedTempDataSourceIds ?? [],
       selectedFieldRefs: input.selectedFieldRefs ?? [],
+      skillId: input.skill ?? undefined,
       agentRunId: input.agentRunId,
       agentStepId: input.agentStepId,
       orchestrationMode: input.agentRunId ? "dual_model" : undefined,
@@ -5580,6 +5582,12 @@ export class AssistantRuntime {
     const version = (await this.toolResultRegistry.listByConversation(toolCall.conversationId)).filter((record) => record.toolKind === toolKind).length + 1;
     const createdAt = toolCall.createdAt;
     const completedAt = toolCall.updatedAt;
+    const usedFieldNames = toolKind === "sql_query"
+      ? uniqueValues([
+          ...Object.keys(input.sqlDataset?.schema ?? {}),
+          ...(input.sqlDataset?.profile?.columns.map((column) => column.name) ?? []),
+        ].map((field) => field.trim()).filter(Boolean))
+      : [];
     const record: ToolCallRecord = {
       toolCallId: toolCall.id,
       conversationId: toolCall.conversationId,
@@ -5596,6 +5604,7 @@ export class AssistantRuntime {
         dataSourceLabel: toolCall.metadata?.dataSourceLabel ?? undefined,
         temporaryDataSourceLabels: toolCall.metadata?.temporaryDataSourceLabels ?? [],
         selectedFieldRefs: toolCall.metadata?.selectedFieldRefs ?? [],
+        skillId: toolCall.metadata?.skillId,
       },
       resolvedInput: parent
         ? {
@@ -5619,6 +5628,8 @@ export class AssistantRuntime {
           rowCount: toolCall.kind === "sql" ? input.sqlDataset?.rowCount ?? parseSqlToolRowCount(input.result) ?? undefined : undefined,
           dataSourceLabels: this.toolCallDataSourceLabels(toolCall),
           selectedFieldNames: this.selectedFieldNamesForToolCall(toolCall),
+          skillId: toolCall.metadata?.skillId,
+          usedFieldNames,
           resultPreview: truncateText(input.result, 20_000),
           resultPreviewFormat: isJsonContent(input.result) ? "json" : "text",
         },

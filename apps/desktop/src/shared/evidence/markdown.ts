@@ -92,7 +92,7 @@ export function evidenceCardMarkdown(card: EvidenceCard, sectionNumber?: string)
     markdownFilters(card, heading(3, "筛选条件")),
     markdownFormulas(card, heading(4, "统计公式")),
     markdownExecutions(card, heading(5, "工具执行记录"), executionSectionNumber),
-    markdownArtifactsAndLineage(card, heading(6, "Artifact 与数据血缘")),
+    markdownArtifactsAndLineage(card, heading(6, "源数据与分析产物")),
     markdownValidation(card, heading(7, "结论边界与完整性")),
   ];
   return sections.filter(Boolean).join("\n\n");
@@ -129,7 +129,8 @@ function markdownAnalysisScope(card: EvidenceCard, heading: string) {
     markdownTableRow("分析表", card.analysisScope.tables.map((table) => table.displayName).join("、") || "未登记"),
     markdownTableRow(
       "使用字段",
-      card.analysisScope.selectedFields.map((field) => `${field.displayName}（${fieldRoleLabel(field.role)}）`).join("、") || "未登记",
+      card.analysisScope.selectedFields.map((field) => `${field.displayName}（${fieldRoleLabel(field.role)}）`).join("、")
+        || "未找到可验证的使用字段，无法确认本报告字段范围。",
     ),
     ...(card.analysisScope.timeRange
       ? [markdownTableRow("时间范围", `${card.analysisScope.timeRange.start ?? "未限定"} 至 ${card.analysisScope.timeRange.end ?? "未限定"}`)]
@@ -188,10 +189,6 @@ function markdownExecutions(card: EvidenceCard, heading: string, sectionNumber: 
       "|---|---|",
       markdownTableRow("执行状态", executionStatusLabel(execution.status)),
       markdownTableRow("查询目的", execution.purpose),
-      markdownTableRow("数据表", execution.tableNames.join("、") || "未登记"),
-      markdownTableRow("返回结果", `${execution.resultSummary?.rowCount ?? "未知"} 行 / ${execution.resultSummary?.fieldCount ?? "未知"} 个字段`),
-      markdownTableRow("执行耗时", formatDuration(execution.durationMs)),
-      markdownTableRow("审批状态", approvalLabel(execution.approval)),
       markdownTableRow("SQL Hash", execution.sqlHash.slice(0, 16)),
     );
   });
@@ -204,10 +201,6 @@ function markdownExecutions(card: EvidenceCard, heading: string, sectionNumber: 
       "|---|---|",
       markdownTableRow("执行状态", executionStatusLabel(execution.status)),
       markdownTableRow("分析目的", execution.purpose),
-      markdownTableRow("输入字段", execution.inputFields.join("、") || "未登记"),
-      markdownTableRow("输出指标", execution.outputMetrics.join("、") || "未登记"),
-      markdownTableRow("执行耗时", formatDuration(execution.durationMs)),
-      markdownTableRow("审批状态", approvalLabel(execution.approval)),
       markdownTableRow("脚本 Hash", execution.scriptHash.slice(0, 16)),
     );
   });
@@ -215,31 +208,71 @@ function markdownExecutions(card: EvidenceCard, heading: string, sectionNumber: 
 }
 
 function markdownArtifactsAndLineage(card: EvidenceCard, heading: string) {
-  const artifactRows = [
-    ...card.upstreamArtifacts.map((artifact) => ({ artifact, relation: "上游" })),
-    ...card.downstreamArtifacts.map((artifact) => ({ artifact, relation: "当前/下游" })),
-  ].sort((left, right) => {
-    const leftCreatedAt = artifactCreatedAt(left.artifact.createdAt);
-    const rightCreatedAt = artifactCreatedAt(right.artifact.createdAt);
+  const artifactsById = new Map<string, EvidenceCard["upstreamArtifacts"][number]>();
+  for (const artifact of [...card.upstreamArtifacts, ...card.downstreamArtifacts]) {
+    if (!artifactsById.has(artifact.artifactId)) artifactsById.set(artifact.artifactId, artifact);
+  }
+  const artifacts = [...artifactsById.values()].sort((left, right) => {
+    const leftCreatedAt = artifactCreatedAt(left.createdAt);
+    const rightCreatedAt = artifactCreatedAt(right.createdAt);
     if (leftCreatedAt !== undefined && rightCreatedAt !== undefined && leftCreatedAt !== rightCreatedAt) {
       return leftCreatedAt - rightCreatedAt;
     }
-    return artifactOrder(left.artifact.type) - artifactOrder(right.artifact.type);
+    return artifactOrder(left.type) - artifactOrder(right.type);
   });
+  const artifactNames = new Map(artifacts.map((artifact) => [
+    artifact.artifactId,
+    artifact.title ?? artifactTypeLabel(artifact.type),
+  ]));
+  const artifactTypes = new Map(artifacts.map((artifact) => [artifact.artifactId, artifact.type]));
+  const dataSourceNamesById = new Map(card.dataSources.map((source) => [source.dataSourceId, source.displayName]));
+  const sqlSourceNamesByToolCallId = new Map(card.sqlExecutions.map((execution) => [
+    execution.toolCallId,
+    dataSourceNamesById.get(execution.dataSourceId),
+  ]));
+  const sourceNames = card.dataSources.map((source) => source.displayName);
+  const rows = [
+    ...card.dataSources.map((source) => [
+      source.displayName,
+      dataSourceTypeLabel(source.type),
+      "-",
+      "作为本次分析源数据",
+      "可用",
+    ]),
+    ...artifacts.map((artifact) => {
+      const directSources = uniqueText(artifact.sourceArtifactIds
+        .map((sourceArtifactId) => artifactNames.get(sourceArtifactId))
+        .filter((value): value is string => Boolean(value)));
+      const directSourceTypes = uniqueText(artifact.sourceArtifactIds
+        .map((sourceArtifactId) => artifactTypes.get(sourceArtifactId))
+        .filter(isDefined));
+      if (directSources.length === 0 && artifact.type === "sql_dataset") {
+        const executionSource = artifact.createdByToolCallId
+          ? sqlSourceNamesByToolCallId.get(artifact.createdByToolCallId)
+          : undefined;
+        if (executionSource) {
+          directSources.push(executionSource);
+        } else if (sourceNames.length === 1) {
+          directSources.push(sourceNames[0]);
+        }
+      }
+      return [
+        artifact.title ?? artifactTypeLabel(artifact.type),
+        artifactTypeLabel(artifact.type),
+        directSources.join("、") || "未找到可核对的直接来源",
+        artifactFormationLabel(artifact.type, directSourceTypes),
+        executionStatusLabel(artifact.status),
+      ];
+    }),
+  ];
   return [
     heading,
     "",
-    "| Artifact | 关系 | 类型 | 版本 | 状态 |",
-    "|---|---|---|---:|---|",
-    ...(artifactRows.length
-      ? artifactRows.map(({ artifact, relation }) => `| ${[
-          artifact.title ?? artifactTypeLabel(artifact.type),
-          relation,
-          artifactTypeLabel(artifact.type),
-          artifact.version !== undefined ? `v${artifact.version}` : "未登记",
-          executionStatusLabel(artifact.status),
-        ].map(markdownCell).join(" | ")} |`)
-      : ["| 未登记 | - | - | - | 缺失 |"]),
+    "| 数据或产物 | 类型 | 直接来源 | 形成方式 | 状态 |",
+    "|---|---|---|---|---|",
+    ...(rows.length
+      ? rows.map((row) => `| ${row.map(markdownCell).join(" | ")} |`)
+      : ["| 未找到可核对的记录 | - | - | - | 缺失 |"]),
   ].join("\n");
 }
 
@@ -258,9 +291,9 @@ function markdownValidation(card: EvidenceCard, heading: string) {
     "| 校验项 | 状态 | 说明 |",
     "|---|---|---|",
     ...card.validation.checks.map((check) => `| ${[
-      check.label,
+      validationCheckLabel(check.code, check.label),
       validationStatusLabel(check.status),
-      check.message ?? "",
+      validationCheckMessage(check),
     ].map(markdownCell).join(" | ")} |`),
     ...(card.limitations.length
       ? ["", "**数据限制**", "", ...card.limitations.map((limitation) => `- ${markdownInline(limitation.message)}`)]
@@ -316,8 +349,35 @@ function artifactTypeLabel(type: EvidenceCard["upstreamArtifacts"][number]["type
   return ({ sql_dataset: "SQL 数据集", python_analysis: "Python 分析", visualization: "可视化", markdown_report: "Markdown 报告", table: "数据表", file: "文件", other: "其他" })[type];
 }
 
+function artifactFormationLabel(
+  type: EvidenceCard["upstreamArtifacts"][number]["type"],
+  sourceTypes: string[],
+) {
+  if (type === "visualization") {
+    return sourceTypes.includes("python_analysis") ? "基于分析结果绘制" : "基于查询结果绘制";
+  }
+  if (type === "markdown_report") {
+    return sourceTypes.includes("visualization") ? "汇总分析结果和图表生成" : "汇总查询和分析结果生成";
+  }
+  return ({
+    sql_dataset: "SQL 查询生成",
+    python_analysis: "基于查询结果统计分析",
+    table: "作为结构化数据使用",
+    file: "作为输入文件使用",
+    other: "由上游处理生成",
+  } as const)[type];
+}
+
 function artifactOrder(type: EvidenceCard["upstreamArtifacts"][number]["type"]) {
   return ({ sql_dataset: 0, table: 0, python_analysis: 1, visualization: 2, markdown_report: 3, file: 4, other: 5 })[type];
+}
+
+function uniqueText(values: string[]) {
+  return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
+}
+
+function isDefined<T>(value: T | undefined): value is T {
+  return value !== undefined;
 }
 
 function artifactCreatedAt(createdAt?: string) {
@@ -333,14 +393,32 @@ function validationStatusLabel(status: EvidenceCard["validation"]["checks"][numb
   return status === "passed" ? "通过" : status === "warning" ? "警告" : "失败";
 }
 
-function approvalLabel(approval?: { required: boolean; status: "approved" | "rejected" | "not_required" }) {
-  if (!approval || !approval.required || approval.status === "not_required") return "无需审批";
-  return approval.status === "approved" ? "已批准" : "已拒绝";
+function validationCheckLabel(code: string, fallback: string) {
+  return ({
+    DATA_SOURCE_PRESENT: "数据来源可核对",
+    ANALYSIS_FIELDS_PRESENT: "分析字段范围可核对",
+    SQL_EXECUTION_PRESENT: "数据查询已完成",
+    NUMERIC_EVIDENCE_PRESENT: "统计结果有计算依据",
+    FORMULA_TRACEABLE: "统计口径可核对",
+    ARTIFACTS_AVAILABLE: "报告引用内容当前可用",
+    LINEAGE_COMPLETE: "源数据至报告的关联完整",
+  } as Record<string, string>)[code] ?? fallback;
 }
 
-function formatDuration(durationMs?: number) {
-  if (durationMs === undefined) return "耗时未知";
-  return durationMs < 1000 ? `${durationMs}ms` : `${(durationMs / 1000).toFixed(1)}s`;
+function validationCheckMessage(check: EvidenceCard["validation"]["checks"][number]) {
+  if (check.status === "passed") return "";
+  if (check.code === "ARTIFACTS_AVAILABLE") {
+    const count = check.message?.match(/(\d+)/)?.[1];
+    return count ? `有 ${count} 项报告引用内容已失效。` : "有报告引用内容已失效。";
+  }
+  return ({
+    DATA_SOURCE_PRESENT: "未找到可核对的数据来源记录。",
+    ANALYSIS_FIELDS_PRESENT: "未找到可验证的使用字段，无法确认本报告字段范围。",
+    SQL_EXECUTION_PRESENT: "未找到成功的数据查询记录。",
+    NUMERIC_EVIDENCE_PRESENT: "未找到可支撑统计结果的成功查询或分析记录。",
+    FORMULA_TRACEABLE: "统计公式未能全部对应到实际工具执行记录。",
+    LINEAGE_COMPLETE: "源数据、分析结果与报告之间的关联记录不完整。",
+  } as Record<string, string>)[check.code] ?? check.message ?? "";
 }
 
 function attributeValue(attributes: string, name: string) {

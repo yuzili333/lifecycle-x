@@ -89,6 +89,84 @@ describe("report evidence card", () => {
     expect(card.validation.missingEvidence.length).toBeGreaterThan(0);
   });
 
+  it("orders valid user fields before actual Skill output fields and excludes invalid references", async () => {
+    const records = completeRecords();
+    const sql = records.find((record) => record.toolKind === "sql_query") as ToolCallRecord;
+    const refs = sql.request.selectedFieldRefs as Array<Record<string, unknown>>;
+    refs[0].status = "valid";
+    refs[1].status = "missing";
+    refs.push({
+      ...refs[1],
+      fieldId: "field-expired",
+      displayName: "已失效字段",
+      physicalName: "expired_field",
+      status: "expired",
+    });
+    sql.request.skillId = "branch-asset-quality-report";
+    sql.result!.metadata = {
+      ...sql.result?.metadata,
+      skillId: "branch-asset-quality-report",
+      usedFieldNames: ["industry_name", "贷款余额（万）", "风险分类"],
+      selectedFieldNames: ["行业名称"],
+    };
+    const card = await new EvidenceCardBuilder(
+      new MemoryRegistry(records),
+      new MemoryArtifacts([
+        artifact("analysis-1", "analysis", "# 分析"),
+        artifact("chart-1", "visualization_spec", { type: "bar" }),
+        artifact("report-1", "report_markdown", "# 报告"),
+      ]),
+    ).build({
+      reportArtifactId: "report-1",
+      reportVersion: 4,
+      conversationId: "conversation-1",
+      sourceToolCallIds: ["report-call"],
+      sourceArtifactIds: ["analysis-1", "chart-1"],
+    });
+
+    expect(card.analysisScope.selectedFields.map((field) => field.displayName)).toEqual([
+      "行业名称",
+      "贷款余额（万）",
+      "风险分类",
+    ]);
+    expect(card.analysisScope.selectedFields.some((field) => field.displayName === "已失效字段")).toBe(false);
+    expect(card.validation.checks.find((check) => check.code === "ANALYSIS_FIELDS_PRESENT")).toMatchObject({
+      label: "分析字段范围可核对",
+      status: "passed",
+    });
+  });
+
+  it("marks a new report partial when no verifiable analysis fields were recorded", async () => {
+    const records = completeRecords();
+    for (const record of records) {
+      record.request.selectedFieldRefs = [];
+      if (record.result?.metadata) {
+        record.result.metadata.selectedFieldNames = [];
+        record.result.metadata.usedFieldNames = [];
+      }
+    }
+    const card = await new EvidenceCardBuilder(
+      new MemoryRegistry(records),
+      new MemoryArtifacts([
+        artifact("analysis-1", "analysis", "# 分析"),
+        artifact("chart-1", "visualization_spec", { type: "bar" }),
+        artifact("report-1", "report_markdown", "# 报告"),
+      ]),
+    ).build({
+      reportArtifactId: "report-1",
+      reportVersion: 4,
+      conversationId: "conversation-1",
+      sourceToolCallIds: ["report-call"],
+      sourceArtifactIds: ["analysis-1", "chart-1"],
+    });
+
+    expect(card.status).toBe("partial");
+    expect(card.validation.checks.find((check) => check.code === "ANALYSIS_FIELDS_PRESENT")).toMatchObject({
+      status: "warning",
+      message: "未找到可验证的使用字段，无法确认本报告字段范围。",
+    });
+  });
+
   it("keeps multiple execution records, breaks lineage cycles safely, and marks missing artifacts partial", async () => {
     const records = completeRecords();
     const secondSql = toolRecord({
@@ -257,11 +335,11 @@ describe("report evidence card", () => {
     expect(readyMarkdown).toContain("### 7.1 数据来源");
     expect(readyMarkdown).toContain("| 数据源 | 类型 | 数据表 | 数据规模 | 访问方式 |");
     expect(readyMarkdown).toContain("### 7.4 统计公式");
-    expect(readyMarkdown).toContain("### 7.6 Artifact 与数据血缘");
+    expect(readyMarkdown).toContain("### 7.6 源数据与分析产物");
     expect(readyMarkdown).not.toContain("范围说明");
     expect(readyMarkdown).not.toContain("样本范围");
     expect(readyMarkdown).not.toContain("**数据血缘**");
-    expect(readyMarkdown).toContain("| 存在数据来源证据 | 通过 |  |");
+    expect(readyMarkdown).toContain("| 数据来源可核对 | 通过 |  |");
     expect(unavailableMarkdown).toContain("> **证据不可用**");
     expect(readyHtml).toContain('data-evidence-state="complete"');
     expect(readyHtml).not.toContain("受控分析证据");
@@ -313,6 +391,12 @@ describe("report evidence card", () => {
     expect(markdown).toContain("| 执行状态 | 已完成 |");
     expect(markdown).toContain("| 查询目的 | 查询风险分类。 |");
     expect(markdown).toContain("| 分析目的 | 计算风险分类占比。 |");
+    expect(markdown).not.toContain("| 数据表 | 信贷风险.csv |");
+    expect(markdown).not.toContain("| 返回结果 |");
+    expect(markdown).not.toContain("| 执行耗时 |");
+    expect(markdown).not.toContain("| 审批状态 |");
+    expect(markdown).not.toContain("| 输入字段 |");
+    expect(markdown).not.toContain("| 输出指标 |");
     expect(markdown).not.toContain("脱敏 SQL");
     expect(markdown).not.toContain("```sql");
     expect(markdown).not.toContain("SELECT risk_class");
@@ -325,16 +409,27 @@ describe("report evidence card", () => {
   it("orders Artifact rows by execution time and omits the lineage subsection", () => {
     const card = sampleCard();
     card.upstreamArtifacts = [
-      evidenceArtifact("report-1", "markdown_report", "分析报告", "2026-07-23T00:00:04.000Z"),
-      evidenceArtifact("chart-1", "visualization", "绘制可视化图表", "2026-07-23T00:00:03.000Z"),
-      evidenceArtifact("analysis-1", "python_analysis", "Python分析结果", "2026-07-23T00:00:02.000Z"),
+      evidenceArtifact("chart-1", "visualization", "绘制可视化图表", "2026-07-23T00:00:03.000Z", ["analysis-1"]),
+      evidenceArtifact("analysis-1", "python_analysis", "Python分析结果", "2026-07-23T00:00:02.000Z", ["dataset-1"]),
       evidenceArtifact("dataset-1", "sql_dataset", "SQL查询数据集", "2026-07-23T00:00:01.000Z"),
+    ];
+    card.downstreamArtifacts = [
+      evidenceArtifact("report-1", "markdown_report", "分析报告", "2026-07-23T00:00:04.000Z", ["analysis-1", "chart-1"]),
     ];
     const markdown = evidenceCardMarkdown(card, "7");
 
+    expect(markdown).toContain("| 数据或产物 | 类型 | 直接来源 | 形成方式 | 状态 |");
+    expect(markdown).toContain("| 信贷风险.csv | 会话 CSV | - | 作为本次分析源数据 | 可用 |");
+    expect(markdown).toContain("| SQL查询数据集 | SQL 数据集 | 信贷风险.csv | SQL 查询生成 | 可用 |");
+    expect(markdown).toContain("| Python分析结果 | Python 分析 | SQL查询数据集 | 基于查询结果统计分析 | 可用 |");
+    expect(markdown).toContain("| 绘制可视化图表 | 可视化 | Python分析结果 | 基于分析结果绘制 | 可用 |");
+    expect(markdown).toContain("| 分析报告 | Markdown 报告 | Python分析结果、绘制可视化图表 | 汇总分析结果和图表生成 | 可用 |");
     expect(markdown.indexOf("SQL查询数据集")).toBeLessThan(markdown.indexOf("Python分析结果"));
     expect(markdown.indexOf("Python分析结果")).toBeLessThan(markdown.indexOf("绘制可视化图表"));
     expect(markdown.indexOf("绘制可视化图表")).toBeLessThan(markdown.indexOf("分析报告"));
+    expect(markdown).not.toContain("| 版本 |");
+    expect(markdown).not.toContain("| 上游 |");
+    expect(markdown).not.toContain("| 当前/下游 |");
     expect(markdown).not.toContain("**数据血缘**");
   });
 
@@ -343,6 +438,22 @@ describe("report evidence card", () => {
     const html = renderToString(<ReportEvidenceCardContent state={{ status: "ready", card }} />);
     expect(html).toContain(`data-evidence-state="${status}"`);
     expect(html).not.toContain("证据状态");
+  });
+
+  it("renders historical validation codes with current business labels and messages without rebuilding the card", () => {
+    const card = sampleCard();
+    card.validation.checks = [{
+      code: "SQL_EXECUTION_PRESENT",
+      label: "存在成功 SQL 执行",
+      status: "failed",
+      message: "存在成功 SQL 执行缺失或无法验证。",
+    }];
+
+    const markdown = evidenceCardMarkdown(card, "7");
+
+    expect(markdown).toContain("| 数据查询已完成 | 失败 | 未找到成功的数据查询记录。 |");
+    expect(markdown).not.toContain("存在成功 SQL 执行");
+    expect(markdown).not.toContain("缺失或无法验证");
   });
 });
 
@@ -454,13 +565,14 @@ function evidenceArtifact(
   type: EvidenceCard["upstreamArtifacts"][number]["type"],
   title: string,
   createdAt: string,
+  sourceArtifactIds: string[] = [],
 ): EvidenceCard["upstreamArtifacts"][number] {
   return {
     artifactId,
     type,
     title,
     status: "ready",
-    sourceArtifactIds: [],
+    sourceArtifactIds,
     downstreamArtifactIds: [],
     createdAt,
   };

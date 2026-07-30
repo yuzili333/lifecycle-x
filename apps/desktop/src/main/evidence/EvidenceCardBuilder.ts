@@ -54,6 +54,7 @@ export class EvidenceCardBuilder {
     const lineage = buildLineage(input, records, dataSources, [...upstreamArtifacts, reportArtifact]);
     const validation = validateEvidence({
       dataSources,
+      analysisFieldCount: analysisScope.selectedFields.length,
       sqlExecutions,
       pythonExecutions,
       formulas,
@@ -162,21 +163,64 @@ function buildAnalysisScope(
   reportRequest?: EvidenceCardBuildInput["reportRequest"],
 ): EvidenceAnalysisScope {
   const fields = new Map<string, EvidenceAnalysisScope["selectedFields"][number]>();
+  const fieldAliases = new Set<string>();
+  const addField = (input: {
+    fieldId?: string;
+    displayName?: string;
+    physicalName?: string;
+    logicalType?: string;
+  }) => {
+    const rawDisplayName = input.displayName ?? input.physicalName;
+    if (!rawDisplayName) return;
+    const displayName = safeDisplayName(rawDisplayName);
+    const aliases = unique([input.fieldId, displayName, input.physicalName]
+      .filter(isString)
+      .map(normalizeFieldIdentity));
+    if (aliases.some((alias) => fieldAliases.has(alias))) return;
+    const key = input.fieldId ?? normalizeFieldIdentity(displayName);
+    fields.set(key, {
+      fieldId: input.fieldId,
+      displayName,
+      physicalName: safeOptionalName(input.physicalName),
+      logicalType: safeOptionalName(input.logicalType),
+      role: inferFieldRole(displayName, input.logicalType),
+    });
+    aliases.forEach((alias) => fieldAliases.add(alias));
+  };
+
+  // Keep explicit user selections first and ignore expired or missing tokens.
   for (const record of records) {
-    for (const ref of selectedFieldRefs(record.request)) {
-      const displayName = safeDisplayName(ref.displayName ?? ref.sourceHeader ?? ref.physicalName ?? "字段");
-      fields.set(ref.fieldId ?? displayName, {
+    for (const ref of selectedFieldRefs(record.request).filter((candidate) => candidate.status === undefined || candidate.status === "valid")) {
+      addField({
         fieldId: ref.fieldId,
-        displayName,
-        physicalName: safeOptionalName(ref.physicalName),
-        logicalType: safeOptionalName(ref.logicalType),
-        role: inferFieldRole(displayName, ref.logicalType),
+        displayName: ref.displayName ?? ref.sourceHeader ?? ref.physicalName,
+        physicalName: ref.physicalName,
+        logicalType: ref.logicalType,
       });
     }
-    for (const name of stringArray(record.result?.metadata?.selectedFieldNames)) {
-      if (![...fields.values()].some((field) => field.displayName === name)) {
-        fields.set(name, { displayName: safeDisplayName(name), role: inferFieldRole(name) });
+  }
+
+  // A selected Skill may use fields beyond explicit # references. Accept only
+  // actual SQL output schema names persisted by the controlled runtime.
+  const hasSelectedSkill = records.some((record) => Boolean(
+    stringValue(record.request.skillId)
+      ?? stringValue(record.result?.metadata?.skillId),
+  ));
+  if (hasSelectedSkill) {
+    for (const record of records.filter((candidate) => candidate.toolKind === "sql_query")) {
+      for (const name of unique([
+        ...stringArray(record.result?.metadata?.usedFieldNames),
+      ])) {
+        addField({ displayName: name, physicalName: name });
       }
+    }
+  }
+
+  // Preserve compatibility with existing Python, report, and historical
+  // result metadata after the stronger sources above have been applied.
+  for (const record of records) {
+    for (const name of stringArray(record.result?.metadata?.selectedFieldNames)) {
+      addField({ displayName: name });
     }
   }
   const sqlRecords = records.filter((record) => record.toolKind === "sql_query");
@@ -468,6 +512,7 @@ function buildLineage(
 
 function validateEvidence(input: {
   dataSources: EvidenceDataSource[];
+  analysisFieldCount: number;
   sqlExecutions: EvidenceSqlExecution[];
   pythonExecutions: EvidencePythonExecution[];
   formulas: EvidenceFormula[];
@@ -479,12 +524,13 @@ function validateEvidence(input: {
   const successfulAnalysis = successfulSql || input.pythonExecutions.some((execution) => execution.status === "completed");
   const missingArtifacts = input.artifactRefs.filter((artifact) => artifact.status !== "ready");
   const checks: EvidenceCard["validation"]["checks"] = [
-    check("DATA_SOURCE_PRESENT", "存在数据来源证据", input.dataSources.length > 0, true),
-    check("SQL_EXECUTION_PRESENT", "存在成功 SQL 执行", successfulSql, true),
-    check("NUMERIC_EVIDENCE_PRESENT", "统计结论具备工具来源", successfulAnalysis, true),
-    check("FORMULA_TRACEABLE", "统计公式关联实际执行", input.formulas.length > 0 && input.formulas.every((formula) => formula.verificationStatus === "verified"), false),
-    check("ARTIFACTS_AVAILABLE", "引用 Artifact 可用", missingArtifacts.length === 0, false, missingArtifacts.length ? `${missingArtifacts.length} 个 Artifact 不可用。` : undefined),
-    check("LINEAGE_COMPLETE", "Artifact 血缘完整", input.lineageComplete, false),
+    check("DATA_SOURCE_PRESENT", "数据来源可核对", input.dataSources.length > 0, true, "未找到可核对的数据来源记录。"),
+    check("ANALYSIS_FIELDS_PRESENT", "分析字段范围可核对", input.analysisFieldCount > 0, false, "未找到可验证的使用字段，无法确认本报告字段范围。"),
+    check("SQL_EXECUTION_PRESENT", "数据查询已完成", successfulSql, true, "未找到成功的数据查询记录。"),
+    check("NUMERIC_EVIDENCE_PRESENT", "统计结果有计算依据", successfulAnalysis, true, "未找到可支撑统计结果的成功查询或分析记录。"),
+    check("FORMULA_TRACEABLE", "统计口径可核对", input.formulas.length > 0 && input.formulas.every((formula) => formula.verificationStatus === "verified"), false, "统计公式未能全部对应到实际工具执行记录。"),
+    check("ARTIFACTS_AVAILABLE", "报告引用内容当前可用", missingArtifacts.length === 0, false, missingArtifacts.length ? `有 ${missingArtifacts.length} 项报告引用内容已失效。` : undefined),
+    check("LINEAGE_COMPLETE", "源数据至报告的关联完整", input.lineageComplete, false, "源数据、分析结果与报告之间的关联记录不完整。"),
   ];
   const missingEvidence = checks.filter((item) => item.status !== "passed").map((item) => item.message ?? item.label);
   const passed = checks.filter((item) => item.status === "passed").length;
@@ -511,7 +557,12 @@ function selectedFieldRefs(request: Record<string, unknown>) {
       logicalType: stringValue(ref.logicalType),
       tempDataSourceId: stringValue(ref.tempDataSourceId),
       tempTableId: stringValue(ref.tempTableId),
+      status: stringValue(ref.status),
     }));
+}
+
+function normalizeFieldIdentity(value: string) {
+  return value.trim().toLocaleLowerCase();
 }
 
 function sqlScript(record: ToolCallRecord) {
