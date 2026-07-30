@@ -194,6 +194,73 @@ describe("Skill package validation", () => {
     }));
   });
 
+  it("loads the built-in key risk customer report without fixed field mappings", async () => {
+    const root = resolve(
+      dirname(fileURLToPath(import.meta.url)),
+      "../../../../../skill/key-risk-customer-analysis-report",
+    );
+    const validated = await validateSkillDirectory({
+      root,
+      origin: "system",
+      traceId: "trace-key-risk-customer",
+    });
+    const packageText = await Promise.all([
+      "manifest.json",
+      "SKILL.md",
+      "report-template.md",
+      "schemas/skill-input.schema.json",
+      "schemas/report-data.schema.json",
+      "tool-policy.json",
+    ].map((relativePath) => readFile(join(root, relativePath), "utf8")));
+
+    expect(validated.loaded.summary).toMatchObject({
+      skillId: "key-risk-customer-analysis-report",
+      displayName: "重点风险客户分析报告",
+      version: "1.0.0",
+      origin: "system",
+      enabled: true,
+      canToggle: false,
+      canDelete: false,
+    });
+    expect(validated.loaded.requiredTools).toEqual([
+      "request_sql_query_execution",
+      "request_python_analysis_execution",
+      "request_markdown_report_generation",
+    ]);
+    expect(validated.loaded.requiredTools).not.toContain("request_chart_rendering");
+    expect(validated.loaded.instructions).toContain("重点风险客户指最新风险分类为关注或不良");
+    expect(validated.loaded.instructions).toContain("不得先按最新风险分类过滤");
+    expect(validated.loaded.instructions).toContain("按合同流水号去重");
+    expect(validated.loaded.instructions).toContain("同一客户存在多笔合同时不合并为一个客户");
+    expect(validated.loaded.instructions).toContain("10,000万 = 1亿");
+    expect(validated.loaded.instructions).toContain("“省份”对应当前数据源中的真实字段“客户所属省/市”");
+    expect(validated.loaded.instructions).toContain("“行业”对应当前数据源中的真实字段“国标行业投向名称”");
+    expect(validated.loaded.instructions).toContain("不得根据分行名称、客户名称或地址文本推断省份");
+    expect(validated.loaded.instructions).toContain("禁止 Top N 截断");
+    expect(validated.loaded.reportTemplate).toContain("{{risk_customer_rows}}");
+    expect(validated.loaded.reportTemplate).toContain("{{numbered_feature_conclusions}}");
+    expect(validated.loaded.reportTemplate).toContain("{{non_normal_loan_balance_display}}");
+    expect(JSON.stringify(validated.loaded.outputSchema)).toContain("nonNormalCountRate");
+    expect(JSON.stringify(validated.loaded.outputSchema)).toContain("loanBalanceShare");
+    expect(JSON.stringify(validated.loaded.outputSchema)).toContain("deteriorationCount");
+    expect(JSON.stringify(validated.loaded.outputSchema)).toContain("provinceName");
+    expect(JSON.stringify(validated.loaded.outputSchema)).toContain("sequenceContinuous");
+    expect(packageText.join("\n")).not.toMatch(
+      /福建墨砾|大连财神岛|山西全球蛙|latest_five_level_risk|latest_risk_result|loan_balance_10k|contract_amount_10k|businessFieldId|十二级分类/,
+    );
+
+    const manager = new LocalSkillManager({
+      userDataRoot: temporaryDirectory("skill-key-risk-customer-catalog-"),
+      systemRoot: resolve(root, ".."),
+    });
+    expect(await manager.list("user-1")).toContainEqual(expect.objectContaining({
+      skillId: "key-risk-customer-analysis-report",
+      origin: "system",
+      availability: "ready",
+      enabled: true,
+    }));
+  });
+
   it("does not expose local paths through generic IPC errors", () => {
     const result = asSkillOperationError(
       new Error("ENOENT: /Users/example/private/package.zip"),

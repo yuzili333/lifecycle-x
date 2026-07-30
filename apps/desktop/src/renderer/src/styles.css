@@ -614,10 +614,20 @@ button {
   flex: 1 1 auto;
   min-width: 0;
   min-height: 0;
+  scrollbar-gutter: stable;
   color: var(--workbench-foreground, #e6edf6);
   background:
     linear-gradient(180deg, color-mix(in srgb, var(--workbench-foreground, #e6edf6) 4%, transparent), transparent 220px),
     color-mix(in srgb, var(--workbench-background, #0f1724) 90%, #000000);
+}
+
+.assistant-chat-layout.is-streaming {
+  scrollbar-color: transparent transparent;
+}
+
+.assistant-chat-layout.is-streaming::-webkit-scrollbar-thumb,
+.assistant-chat-layout.is-streaming::-webkit-scrollbar-track {
+  background: transparent;
 }
 
 .assistant-chat-shell.with-artifact .assistant-chat-layout {

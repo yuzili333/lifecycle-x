@@ -1384,13 +1384,27 @@ export function validatePythonScriptSyntax(script: string, signal?: AbortSignal)
       return;
     }
     const validator = [
-      "import ast, sys",
+      "import ast, re, sys",
       "try:",
-      "    ast.parse(sys.stdin.read())",
+      "    source = sys.stdin.read()",
+      "    tree = ast.parse(source)",
       "except SyntaxError as error:",
       "    line = error.lineno or 0",
       "    print(f'第{line}行：{error.msg}', file=sys.stderr)",
       "    raise SystemExit(1)",
+      "if 'Decimal' in source:",
+      "    count_name = re.compile(r'(?:^|_)(?:count|rows?|records?|size|length|number)$', re.I)",
+      "    def is_integer_count(node):",
+      "        if isinstance(node, ast.Name):",
+      "            return bool(count_name.search(node.id))",
+      "        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):",
+      "            return node.func.id in {'len', 'int'}",
+      "        return isinstance(node, ast.Constant) and isinstance(node.value, int) and not isinstance(node.value, bool)",
+      "    for node in ast.walk(tree):",
+      "        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div) and is_integer_count(node.left) and is_integer_count(node.right):",
+      "            line = getattr(node, 'lineno', 0)",
+      "            print(f'第{line}行：Decimal 脚本中的笔数或行数占比必须使用 Decimal(count) / Decimal(total)，禁止整数直接相除后产生 float。', file=sys.stderr)",
+      "            raise SystemExit(1)",
     ].join("\n");
     const child = spawn("python3", ["-I", "-S", "-c", validator], {
       env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
@@ -7440,17 +7454,17 @@ export class AssistantRuntime {
       if (
         step.toolKind === "python_analysis" &&
         !localToolCall &&
-        parameterIssues.some((issue) => /Python.*语法|语法.*Python|SyntaxError|unmatched/i.test(issue))
+        parameterIssues.some((issue) => /Python.*(?:语法|预检)|(?:语法|预检).*Python|SyntaxError|unmatched/i.test(issue))
       ) {
-        this.agentTurnOrchestrator.fallback(runId, "Python 脚本未通过本地语法校验，正在修复一次。", {
+        this.agentTurnOrchestrator.fallback(runId, "Python 脚本未通过本地预检，正在修复一次。", {
           fallbackReason: "python_syntax_preflight_failed",
           stepId: step.stepId,
         });
         context = [
           context,
-          "上一次 Python 参数未通过本地 ast.parse 语法校验。",
+          "上一次 Python 参数未通过本地脚本预检。",
           `校验错误：${truncateText(parameterIssues[0], 500)}`,
-          "请重新生成完整、简洁且语法合法的 script。所有字段名称必须从上游结果字段清单逐字符复制，尤其不要把字段名称中的中英文括号写到字符串引号之外。不得改变用户目标。",
+          "请重新生成完整、简洁且可通过预检的 script。所有字段名称必须从上游结果字段清单逐字符复制；使用 Decimal 时，金额和笔数占比的分子与分母必须保持 Decimal，尤其不要先用整数相除生成 float。不得改变用户目标。",
         ].join("\n\n");
         this.agentTurnOrchestrator.preparingStep(runId, step);
         execution = await this.executeDualModelStep({
@@ -8262,7 +8276,7 @@ export class AssistantRuntime {
       "上一次 Python 脚本已通过语法、安全和审批校验，但在本地运行时失败。",
       `运行时错误：${truncateText(errorMessage ?? "未知 Python 运行时错误", 1_000)}`,
       "请只修复脚本中的类型或数据处理错误，不得改变用户目标、统计口径、字段映射或输出结构。",
-      "金额计算规则：一旦金额解析为 Decimal，分类金额、累计值、分子、分母、占比和单位换算必须全部保持 Decimal；使用 float(decimal_numerator / decimal_denominator)，禁止 float_value / Decimal_value；只在最终 JSON 序列化字段时转换为 float。",
+      "比例计算规则：一旦脚本使用 Decimal，金额和笔数的累计值、分子、分母、占比及单位换算必须全部保持 Decimal；整数笔数占比必须使用 Decimal(count) / Decimal(total)。使用 float(decimal_numerator / decimal_denominator)，禁止 count / total 先产生 float，也禁止 float_value / Decimal_value；只在最终 JSON 序列化字段时转换为 float。",
     ].join("\n\n");
   }
 
@@ -9018,7 +9032,7 @@ export class AssistantRuntime {
           parameterName: "script",
           value: undefined,
           reason: "incompatible",
-          message: `Python 脚本语法校验失败：${syntaxCheck.message ?? "语法不合法。"}`,
+          message: `Python 脚本本地预检失败：${syntaxCheck.message ?? "脚本不合法。"}`,
         }],
         latestToolState: toolState,
       });

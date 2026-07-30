@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cycle-probe.local/schemas/key-risk-customer-analysis-report-input.schema.json",
+  "title": "KeyRiskCustomerAnalysisReportInput",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "dataSourceId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "当前会话选择的数据源 ID；未提供时从会话上下文解析。"
+    },
+    "fieldBindings": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "仅保存当前数据源 Schema 中已确认存在的真实字段名称。",
+      "properties": {
+        "contractSerial": {
+          "$ref": "#/$defs/actualField"
+        },
+        "customerName": {
+          "$ref": "#/$defs/actualField"
+        },
+        "branch": {
+          "$ref": "#/$defs/actualField"
+        },
+        "province": {
+          "$ref": "#/$defs/actualField",
+          "description": "省份业务角色只绑定真实字段“客户所属省/市”。"
+        },
+        "beginningRiskClassification": {
+          "$ref": "#/$defs/actualField"
+        },
+        "latestRiskClassification": {
+          "$ref": "#/$defs/actualField"
+        },
+        "latestRiskResult": {
+          "$ref": "#/$defs/actualField"
+        },
+        "guaranteeMethod": {
+          "$ref": "#/$defs/actualField"
+        },
+        "industryName": {
+          "$ref": "#/$defs/actualField",
+          "description": "行业业务角色只绑定真实字段“国标行业投向名称”。"
+        },
+        "businessProduct": {
+          "$ref": "#/$defs/actualField"
+        },
+        "loanTerm": {
+          "$ref": "#/$defs/actualField"
+        },
+        "loanBalance": {
+          "$ref": "#/$defs/amountField"
+        },
+        "contractAmount": {
+          "$ref": "#/$defs/amountField"
+        }
+      }
+    },
+    "filters": {
+      "type": "object",
+      "description": "用户明确指定的筛选条件；未指定时分析所选数据源的全部有效样本。",
+      "additionalProperties": true
+    }
+  },
+  "$defs": {
+    "actualField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "actualName"
+      ],
+      "properties": {
+        "actualName": {
+          "type": "string",
+          "minLength": 1
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1
+        },
+        "selectedByUser": {
+          "type": "boolean"
+        }
+      }
+    },
+    "amountField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "actualName"
+      ],
+      "properties": {
+        "actualName": {
+          "type": "string",
+          "minLength": 1
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sourceUnit": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "只保存从真实字段名称或 Schema 单位信息识别出的元、万、万元、亿或亿元。"
+        },
+        "businessName": {
+          "type": "string",
+          "minLength": 1,
+          "description": "去除单位后的真实业务指标名称。"
+        },
+        "selectedByUser": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

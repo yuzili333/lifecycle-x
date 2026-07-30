@@ -4014,7 +4014,7 @@ export function DataAssistantWorkspace({
         <div className="assistant-chat-main">
           <ChatLayout
             density="compact"
-            className="assistant-chat-layout"
+            className={`assistant-chat-layout ${isStreaming ? "is-streaming" : ""}`}
             emptyState={<AssistantLanding userName={landingUserName} />}
             composer={
               <div

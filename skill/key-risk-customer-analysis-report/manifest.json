@@ -1,0 +1,42 @@
+{
+  "skillId": "key-risk-customer-analysis-report",
+  "name": "key-risk-customer-analysis-report",
+  "displayName": "重点风险客户分析报告",
+  "description": "筛选关注及不良类合同，分析客户笔数、贷款余额占比、风险迁徙和业务特征，生成重点风险客户分析报告。",
+  "version": "1.0.0",
+  "category": "credit-risk-analysis",
+  "tags": [
+    "信贷资产",
+    "重点风险客户",
+    "非正常类",
+    "风险迁徙",
+    "金额占比"
+  ],
+  "keywords": [
+    "重点风险客户分析",
+    "非正常类客户",
+    "关注客户",
+    "不良客户",
+    "风险劣变客户",
+    "客户风险明细"
+  ],
+  "sourceType": "local_builtin",
+  "runtime": "cycle-probe-client",
+  "clientOnly": true,
+  "enabled": true,
+  "requiredTools": [
+    "request_sql_query_execution",
+    "request_python_analysis_execution",
+    "request_markdown_report_generation"
+  ],
+  "entryFile": "SKILL.md",
+  "templateFile": "report-template.md",
+  "inputSchemaFile": "schemas/skill-input.schema.json",
+  "reportDataSchemaFile": "schemas/report-data.schema.json",
+  "toolPolicyFile": "tool-policy.json",
+  "aliases": [
+    "@重点风险客户",
+    "@风险客户分析",
+    "@非正常类客户分析"
+  ]
+}

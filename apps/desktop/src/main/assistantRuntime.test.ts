@@ -27,6 +27,26 @@ describe("AssistantRuntime workflow intent", () => {
     )).resolves.toEqual({ valid: true });
   });
 
+  it("rejects count ratios that introduce float values into Decimal analysis", async () => {
+    await expect(validatePythonScriptSyntax([
+      "from decimal import Decimal",
+      "deterioration_count = 2",
+      "sample_count = 200",
+      "deterioration_rate = deterioration_count / sample_count",
+      "print(deterioration_rate * Decimal('100'))",
+    ].join("\n"))).resolves.toMatchObject({
+      valid: false,
+      message: expect.stringContaining("Decimal(count) / Decimal(total)"),
+    });
+    await expect(validatePythonScriptSyntax([
+      "from decimal import Decimal",
+      "deterioration_count = 2",
+      "sample_count = 200",
+      "deterioration_rate = Decimal(deterioration_count) / Decimal(sample_count)",
+      "print(deterioration_rate * Decimal('100'))",
+    ].join("\n"))).resolves.toEqual({ valid: true });
+  });
+
   it("classifies Python calculation errors as recoverable without retrying infrastructure failures", () => {
     expect(isRepairablePythonRuntimeError(
       "TypeError: unsupported operand type(s) for /: 'float' and 'decimal.Decimal'",
