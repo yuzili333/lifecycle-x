@@ -216,7 +216,7 @@ describe("Skill package validation", () => {
     expect(validated.loaded.summary).toMatchObject({
       skillId: "key-risk-customer-analysis-report",
       displayName: "重点风险客户分析报告",
-      version: "1.0.0",
+      version: "1.1.0",
       origin: "system",
       enabled: true,
       canToggle: false,
@@ -237,14 +237,18 @@ describe("Skill package validation", () => {
     expect(validated.loaded.instructions).toContain("“行业”对应当前数据源中的真实字段“国标行业投向名称”");
     expect(validated.loaded.instructions).toContain("不得根据分行名称、客户名称或地址文本推断省份");
     expect(validated.loaded.instructions).toContain("禁止 Top N 截断");
+    expect(validated.loaded.instructions).toContain("表格行数必须与不良笔数一致");
     expect(validated.loaded.reportTemplate).toContain("{{risk_customer_rows}}");
-    expect(validated.loaded.reportTemplate).toContain("{{numbered_feature_conclusions}}");
+    expect(validated.loaded.reportTemplate).toContain("{{nonperforming_customer_rows}}");
+    expect(validated.loaded.reportTemplate).toContain("| `{{customer_name_field}}` | `{{branch_field}}`");
     expect(validated.loaded.reportTemplate).toContain("{{non_normal_loan_balance_display}}");
     expect(JSON.stringify(validated.loaded.outputSchema)).toContain("nonNormalCountRate");
     expect(JSON.stringify(validated.loaded.outputSchema)).toContain("loanBalanceShare");
     expect(JSON.stringify(validated.loaded.outputSchema)).toContain("deteriorationCount");
     expect(JSON.stringify(validated.loaded.outputSchema)).toContain("provinceName");
     expect(JSON.stringify(validated.loaded.outputSchema)).toContain("sequenceContinuous");
+    expect(JSON.stringify(validated.loaded.outputSchema)).toContain("nonperformingCustomers");
+    expect(JSON.stringify(validated.loaded.outputSchema)).toContain("nonperformingDetailsReconciled");
     expect(packageText.join("\n")).not.toMatch(
       /福建墨砾|大连财神岛|山西全球蛙|latest_five_level_risk|latest_risk_result|loan_balance_10k|contract_amount_10k|businessFieldId|十二级分类/,
     );

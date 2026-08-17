@@ -3,7 +3,7 @@
   "name": "key-risk-customer-analysis-report",
   "displayName": "重点风险客户分析报告",
   "description": "筛选关注及不良类合同，分析客户笔数、贷款余额占比、风险迁徙和业务特征，生成重点风险客户分析报告。",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "category": "credit-risk-analysis",
   "tags": [
     "信贷资产",

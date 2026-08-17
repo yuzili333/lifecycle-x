@@ -6,6 +6,7 @@ import {
   buildAnalysisPlanSystemPrompt,
   compressReasoningContext,
   conservativeTaskRoute,
+  executionToolDescription,
   executionToolSchema,
   extractPartialJsonStringField,
   isOptimizationEnabledForScope,
@@ -231,6 +232,7 @@ describe("thinking optimization", () => {
     expect(chart.required).toEqual(["title", "chartType", "dimensionFields", "measureFields"]);
     expect(chart.properties).not.toHaveProperty("visualizationSpec");
     expect(report.required).toEqual(["title", "markdown"]);
+    expect(executionToolDescription("sql_query")).toContain("禁止用 GROUP BY、COUNT、SUM、AVG、MIN、MAX 或 DISTINCT 提前聚合");
     for (const schema of [sql, python, chart, report]) {
       expect(schema.properties).not.toHaveProperty("userRequest");
       expect(schema.properties).not.toHaveProperty("purpose");
@@ -293,6 +295,63 @@ describe("thinking optimization", () => {
       errorCode: "TOOL_CALL_REQUIRED",
       errorStage: "protocol",
     });
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("does not execute truncated tool-call JSON and classifies it as provider output truncation", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+      choices: [{
+        message: {
+          content: "",
+          tool_calls: [{
+            id: "python-truncated",
+            function: {
+              name: "request_python_analysis_execution",
+              arguments: '{"script":"import json, sys\\nrows = json.load(sys.stdin)',
+            },
+          }],
+        },
+        finish_reason: "length",
+      }],
+      usage: { prompt_tokens: 8_000, completion_tokens: 8_192, total_tokens: 16_192 },
+    }), { status: 200, headers: { "content-type": "application/json" } })));
+    const handler = vi.fn(async () => ({ status: "completed" }));
+    const adapter = new ExecutionParameterAdapter({
+      providerName: "siliconflow",
+      baseURL: "https://example.local/v1",
+      apiKey: "test-key",
+      model: "execution-model",
+      timeoutMs: 10_000,
+      requestOptions: { enableThinking: false, stream: false, temperature: 0, maxTokens: 8_192 },
+      profileName: "python",
+    });
+
+    const output = await adapter.execute({
+      conversationId: "conversation-1",
+      messageId: "message-1",
+      step: {
+        stepId: "analysis",
+        toolKind: "python_analysis",
+        purpose: "统计合同数量",
+        dependencies: ["query"],
+        inputResolution: "current_run",
+        expectedOutput: "分析结果",
+      },
+      messages: [{ id: "user-1", role: "user", content: "统计合同数量", createdAt: new Date().toISOString() }],
+      tool: {
+        name: "request_python_analysis_execution",
+        description: "执行 Python 分析",
+        inputSchema: executionToolSchema("python_analysis"),
+        handler,
+      },
+    });
+    vi.unstubAllGlobals();
+
+    expect(output).toMatchObject({
+      errorCode: "PROVIDER_OUTPUT_TRUNCATED",
+      errorStage: "provider",
+    });
+    expect(output.error).toContain("未执行不完整参数");
     expect(handler).not.toHaveBeenCalled();
   });
 

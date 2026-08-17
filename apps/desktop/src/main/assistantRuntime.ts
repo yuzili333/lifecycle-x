@@ -830,6 +830,12 @@ export function shouldRequireDetailSqlForCompositeAnalysis(input: { request?: Re
   return hasDataPreparationIntentText(text) && hasAnalysisIntentText(text);
 }
 
+export function isDetailSqlRequiredParameterIssue(output: unknown) {
+  return isPlainRecordValue(output) &&
+    output.status === "waiting_input" &&
+    output.reason === "sql_must_return_detail_rows_for_analysis";
+}
+
 export function shouldDeferChartUntilUpstreamTools(input: {
   request: Record<string, unknown>;
   prompt?: string;
@@ -7478,6 +7484,36 @@ export class AssistantRuntime {
       let parameterIssues = this.executionParameterIssues(execution);
 
       if (
+        step.toolKind === "sql_query" &&
+        !localToolCall &&
+        isDetailSqlRequiredParameterIssue(execution.output) &&
+        !signal.aborted
+      ) {
+        this.agentTurnOrchestrator.fallback(runId, "SQL 参数使用了聚合查询，正在按明细数据口径修复一次。", {
+          fallbackReason: "sql_aggregate_parameter_rejected",
+          stepId: step.stepId,
+        });
+        context = [
+          context,
+          "上一次 SQL 参数被本地业务校验拒绝：当前复合任务必须先查询真实明细，再由 Python 完成统计计算。",
+          "请重新调用唯一允许的 SQL 工具。保留用户筛选条件，SELECT 后续分析所需的原始字段和合同标识；禁止 GROUP BY、COUNT、SUM、AVG、MIN、MAX、SELECT DISTINCT 及其他聚合。不得改变数据源、用户目标或字段映射。",
+        ].join("\n\n");
+        this.agentTurnOrchestrator.preparingStep(runId, step);
+        execution = await this.executeDualModelStep({
+          runId,
+          step,
+          input: executionInput,
+          tool,
+          context,
+          modelName: run.executionModelName,
+          apiKey,
+          signal,
+        });
+        localToolCall = this.findAgentToolCall(run.messageId, runId, step.stepId);
+        parameterIssues = this.executionParameterIssues(execution);
+      }
+
+      if (
         step.toolKind !== "report_generation" &&
         !localToolCall &&
         execution.errorStage === "protocol" &&
@@ -7493,6 +7529,37 @@ export class AssistantRuntime {
           context,
           `上一次${toolLabel}参数生成响应错误地使用了普通文本，没有调用唯一允许的工具 ${tool.name}。`,
           `本次必须调用 ${tool.name} 且只调用一次，参数严格符合其 Schema；禁止输出普通文本、代码围栏或解释。`,
+        ].join("\n\n");
+        this.agentTurnOrchestrator.preparingStep(runId, step);
+        execution = await this.executeDualModelStep({
+          runId,
+          step,
+          input: executionInput,
+          tool,
+          context,
+          modelName: run.executionModelName,
+          apiKey,
+          signal,
+        });
+        localToolCall = this.findAgentToolCall(run.messageId, runId, step.stepId);
+        parameterIssues = this.executionParameterIssues(execution);
+      }
+
+      if (
+        step.toolKind === "python_analysis" &&
+        !localToolCall &&
+        execution.errorStage === "provider" &&
+        execution.errorCode === "PROVIDER_OUTPUT_TRUNCATED" &&
+        !signal.aborted
+      ) {
+        this.agentTurnOrchestrator.fallback(runId, "Python 参数输出过长，正在精简后重新生成一次。", {
+          fallbackReason: "python_parameter_output_truncated",
+          stepId: step.stepId,
+        });
+        context = [
+          context,
+          "上一次 Python 工具参数达到模型输出长度上限，响应已被丢弃且没有执行。",
+          "请重新调用唯一允许的 Python 工具并返回完整 JSON。script 必须控制在 12000 个字符以内；删除注释、重复分支和逐项硬编码，优先使用短小的辅助函数、映射表、循环与数据驱动统计。只计算当前步骤明确要求的指标，不得减少用户要求的结果字段，也不得改变数据源、统计口径或字段映射。",
         ].join("\n\n");
         this.agentTurnOrchestrator.preparingStep(runId, step);
         execution = await this.executeDualModelStep({
@@ -9051,7 +9118,7 @@ export class AssistantRuntime {
         message: [
           "request_sql_query_execution 收到的是聚合 SQL，但当前用户需求是先查询真实样本，再由 Python 完成占比、拆分、排序和图表数据计算。",
           "请重新调用 request_sql_query_execution，SQL 只做明细行提取：保留筛选条件，选择后续分析所需的原始字段，不要使用 GROUP BY、COUNT、SUM、AVG、DISTINCT 等聚合。",
-          "SQL 完成后再调用 request_python_analysis_execution 计算汇总指标，最后调用 request_chart_rendering 绘制图表。",
+          "SQL 完成后按既定计划调用 request_python_analysis_execution 计算汇总指标，并基于分析结果继续生成用户要求的产物。",
         ].join(" "),
       };
     }

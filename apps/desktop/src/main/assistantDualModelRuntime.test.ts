@@ -508,6 +508,64 @@ describe("AssistantRuntime dual-model flow", () => {
     expect(records[0]?.status).toBe("completed");
   });
 
+  it("regenerates detail SQL once when aggregate SQL is rejected for composite analysis", async () => {
+    const temp = mkdtempSync(join(tmpdir(), "cycle-probe-sql-detail-repair-"));
+    const runtime = runtimeFor(temp, createCsvMetadataDatabase(temp));
+    const responses = [
+      toolCallResponse("plan-sql-detail-repair", "submit_agent_execution_plan", {
+        outcome: "execute",
+        summary: "查询真实样本供后续分析。",
+        requestedOutputs: ["query"],
+        steps: [{
+          stepId: "query",
+          toolKind: "sql_query",
+          purpose: "查询真实样本明细",
+          dependencies: [],
+          inputResolution: "selected_data_source",
+          expectedOutput: "明细查询 Artifact",
+        }],
+      }),
+      nonStreamToolCallResponse("sql-aggregate-rejected", "request_sql_query_execution", {
+        sql: 'select "category", count(*) as "count" from "test" group by "category"',
+      }),
+      nonStreamToolCallResponse("sql-detail-corrected", "request_sql_query_execution", {
+        sql: 'select \'A\' as "category", 1 as "value"',
+      }),
+    ];
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      const response = responses.shift();
+      if (!response) throw new Error("unexpected model request");
+      return response;
+    }));
+
+    const result = await runtime.sendMessage({
+      userId: "user-1",
+      clientRequestId: "sql-detail-repair",
+      prompt: "查询真实样本，再分析各分类占比并生成报告",
+      modelName: "reasoning-model",
+      executionModelName: "execution-model",
+      dualModelOrchestrationEnabled: true,
+      dataSourceLabel: "测试数据源",
+      schemaContextMarkdown: "table test(category text, value integer)",
+      approvalMode: "full_access",
+    });
+    const run = await waitForRun(runtime, "user-1", result.assistantMessage.id, "completed");
+    const records = (await runtime.listConversationToolCalls("user-1", result.conversation.id))
+      .filter((record) => record.messageId === result.assistantMessage.id);
+
+    expect(run.completedStepIds).toEqual(["query"]);
+    expect(run.events).toContainEqual(expect.objectContaining({
+      phase: "fallback",
+      detail: expect.objectContaining({
+        fallbackReason: "sql_aggregate_parameter_rejected",
+        stepId: "query",
+      }),
+    }));
+    expect(records.filter((record) => record.toolKind === "sql_query")).toHaveLength(1);
+    expect(records[0]?.status).toBe("completed");
+    expect(responses).toHaveLength(0);
+  });
+
   it("preserves the provider error when the report retry also fails", async () => {
     const temp = mkdtempSync(join(tmpdir(), "cycle-probe-report-provider-failed-"));
     const runtime = runtimeFor(temp, createCsvMetadataDatabase(temp));
@@ -749,6 +807,89 @@ describe("AssistantRuntime dual-model flow", () => {
     const parameterLogs = logs.filter((log) => log.phase === "tool-parameter-validation");
     expect(parameterLogs.filter((log) => log.status === "success")).toHaveLength(3);
     expect(JSON.stringify(parameterLogs)).not.toContain("select 'A'");
+  });
+
+  it("regenerates truncated Python parameters once without executing the partial script", async () => {
+    const temp = mkdtempSync(join(tmpdir(), "cycle-probe-dual-model-python-truncated-"));
+    const csvPath = createCsvMetadataDatabase(temp);
+    const toolLogPath = join(temp, "tools.jsonl");
+    const requests: Array<Record<string, unknown>> = [];
+    const responses = [
+      toolCallResponse("plan", "submit_agent_execution_plan", {
+        outcome: "execute",
+        summary: "查询并统计合同数量。",
+        requestedOutputs: ["query", "analysis"],
+        steps: [
+          {
+            stepId: "query",
+            toolKind: "sql_query",
+            purpose: "查询合同明细",
+            dependencies: [],
+            inputResolution: "selected_data_source",
+            expectedOutput: "查询 Artifact",
+          },
+          {
+            stepId: "analysis",
+            toolKind: "python_analysis",
+            purpose: "统计合同数量",
+            dependencies: ["query"],
+            inputResolution: "current_run",
+            expectedOutput: "分析 Artifact",
+          },
+        ],
+      }),
+      nonStreamToolCallResponse("sql", "request_sql_query_execution", {
+        sql: "select 1 as contract_id",
+      }),
+      nonStreamTruncatedToolCallResponse(
+        "python-truncated",
+        "request_python_analysis_execution",
+        '{"script":"import json, sys\\nrows = json.load(sys.stdin)',
+      ),
+      nonStreamToolCallResponse("python-repaired", "request_python_analysis_execution", {
+        script: "import json, sys\nrows = json.load(sys.stdin)\nprint(json.dumps({'contractCount': len(rows)}, ensure_ascii=False))",
+      }),
+    ];
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init?: RequestInit) => {
+      requests.push(JSON.parse(String(init?.body ?? "{}")));
+      const response = responses.shift();
+      if (!response) throw new Error("unexpected model request");
+      return response;
+    }));
+    const runtime = new AssistantRuntime({
+      dbPath: join(temp, "assistant.sqlite"),
+      csvSqlitePath: csvPath,
+      toolLogPath,
+      getModelApiKey: async () => "test-key",
+      emit: () => undefined,
+    });
+    const result = await runtime.sendMessage({
+      userId: "user-1",
+      clientRequestId: "python-truncated-repair",
+      prompt: "查询并统计合同数量",
+      modelName: "reasoning-model",
+      executionModelName: "execution-model",
+      dualModelOrchestrationEnabled: true,
+      dataSourceLabel: "测试数据源",
+      schemaContextMarkdown: "table test(contract_id integer)",
+      approvalMode: "full_access",
+    });
+
+    const run = await waitForRun(runtime, "user-1", result.assistantMessage.id, "completed");
+    expect(run.completedStepIds).toEqual(["query", "analysis"]);
+    expect(run.events).toContainEqual(expect.objectContaining({
+      phase: "fallback",
+      detail: expect.objectContaining({
+        fallbackReason: "python_parameter_output_truncated",
+        stepId: "analysis",
+      }),
+    }));
+    expect(requests).toHaveLength(4);
+    const retrySystemPrompt = ((requests[3].messages as Array<{ content?: string }>)[0]?.content ?? "");
+    expect(retrySystemPrompt).toContain("script 必须控制在 12000 个字符以内");
+    const logs = readFileSync(toolLogPath, "utf8").trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(logs.filter((log) => log.kind === "python" && log.phase === "execution-start")).toHaveLength(1);
+    expect(JSON.stringify(logs)).not.toContain("工具参数不是有效 JSON：request_python_analysis_execution");
   });
 
   it("repairs Python syntax once before creating or executing the tool call", async () => {
@@ -1974,6 +2115,19 @@ function nonStreamToolCallResponse(id: string, name: string, input: Record<strin
       finish_reason: "tool_calls",
     }],
     usage: { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 },
+  }), { status: 200, headers: { "content-type": "application/json" } });
+}
+
+function nonStreamTruncatedToolCallResponse(id: string, name: string, argumentsText: string) {
+  return new Response(JSON.stringify({
+    choices: [{
+      message: {
+        content: "",
+        tool_calls: [{ id, function: { name, arguments: argumentsText } }],
+      },
+      finish_reason: "length",
+    }],
+    usage: { prompt_tokens: 8_000, completion_tokens: 8_192, total_tokens: 16_192 },
   }), { status: 200, headers: { "content-type": "application/json" } });
 }
 

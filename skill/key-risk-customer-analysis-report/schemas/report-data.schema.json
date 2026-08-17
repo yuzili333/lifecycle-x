@@ -15,7 +15,7 @@
     "totals",
     "riskCustomers",
     "validation",
-    "featureConclusions",
+    "featureAnalysis",
     "dataQualityNote"
   ],
   "properties": {
@@ -295,7 +295,8 @@
         "countReconciled",
         "balanceReconciled",
         "sharesReconciled",
-        "sequenceContinuous"
+        "sequenceContinuous",
+        "nonperformingDetailsReconciled"
       ],
       "properties": {
         "sampleCount": {
@@ -325,17 +326,54 @@
         "sequenceContinuous": {
           "const": true,
           "description": "风险客户表序号从 1 开始连续，且每行字段来自同一合同记录。"
+        },
+        "nonperformingDetailsReconciled": {
+          "const": true,
+          "description": "特征分析中的不良客户表包含全部且仅有的不良合同，行数和贷款余额与不良类汇总一致。"
         }
       }
     },
-    "featureConclusions": {
-      "type": "array",
-      "minItems": 1,
-      "maxItems": 5,
-      "description": "只包含可由结构化统计结果证明的编号结论。",
-      "items": {
-        "type": "string",
-        "minLength": 1
+    "featureAnalysis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "businessTermSummary",
+        "nonperformingSummary",
+        "nonperformingCustomers",
+        "attentionSummary",
+        "migrationSummary",
+        "distributionSummary"
+      ],
+      "properties": {
+        "businessTermSummary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "nonperformingSummary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "nonperformingCustomers": {
+          "type": "array",
+          "description": "全部且仅有的不良合同，用于特征分析第（2）项 Markdown 表格；顺序与风险客户主表中的不良记录一致。",
+          "items": {
+            "$ref": "#/$defs/nonperformingCustomer"
+          }
+        },
+        "attentionSummary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "migrationSummary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "distributionSummary": {
+          "type": "string",
+          "minLength": 1
+        }
       }
     },
     "dataQualityNote": {
@@ -350,6 +388,49 @@
     "percentageDisplay": {
       "type": "string",
       "pattern": "^(--|\\d+\\.\\d{2}%)$"
+    },
+    "nonperformingCustomer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "customerName",
+        "branchName",
+        "guaranteeMethod",
+        "industryName",
+        "loanBalanceWan",
+        "loanBalanceDisplay"
+      ],
+      "properties": {
+        "customerName": {
+          "type": "string",
+          "minLength": 1
+        },
+        "branchName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "guaranteeMethod": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "industryName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "loanBalanceWan": {
+          "type": "number"
+        },
+        "loanBalanceDisplay": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
     },
     "riskCustomer": {
       "type": "object",

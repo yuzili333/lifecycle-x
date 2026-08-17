@@ -312,37 +312,52 @@ export class StreamingModelAdapter {
       }
     }
 
-    yield this.modelObservationEvent(input, traceId, "provider-round-complete", "success", "模型请求完成。", {
-      roundIndex,
-      allowTools,
-      ...requestSummary,
-      durationMs: Date.now() - requestedAtMs,
-      firstModelEventMs,
-      firstTokenMs,
-      firstReasoningTokenMs,
-      firstContentTokenMs,
-      firstToolCallMs,
-      returnedToolCalls: toolCalls.size > 0,
-      toolCallCount: toolCalls.size,
-      toolCallNames: Array.from(toolCalls.values()).map((toolCall) => toolCall.name).filter(Boolean),
-      toolCallParameterShapes: Array.from(toolCalls.values()).map(summarizeAggregatedToolCall),
-      contentDeltaChars,
-      reasoningDeltaChars,
-      usage,
-      finishReason: finishReason ?? "unknown",
-      ...standardTelemetry({
-        modelRole,
-        orchestrationPhase,
-        toolKind,
+    const outputTruncated = finishReason === "length";
+    yield this.modelObservationEvent(
+      input,
+      traceId,
+      "provider-round-complete",
+      outputTruncated ? "error" : "success",
+      outputTruncated ? "模型输出达到长度上限，响应不完整。" : "模型请求完成。",
+      {
+        roundIndex,
+        allowTools,
+        ...requestSummary,
         durationMs: Date.now() - requestedAtMs,
         firstModelEventMs,
+        firstTokenMs,
+        firstReasoningTokenMs,
         firstContentTokenMs,
         firstToolCallMs,
+        returnedToolCalls: toolCalls.size > 0,
+        toolCallCount: toolCalls.size,
+        toolCallNames: Array.from(toolCalls.values()).map((toolCall) => toolCall.name).filter(Boolean),
+        toolCallParameterShapes: Array.from(toolCalls.values()).map(summarizeAggregatedToolCall),
+        contentDeltaChars,
         reasoningDeltaChars,
-        requestOptions,
         usage,
-      }),
-    });
+        finishReason: finishReason ?? "unknown",
+        ...standardTelemetry({
+          modelRole,
+          orchestrationPhase,
+          toolKind,
+          durationMs: Date.now() - requestedAtMs,
+          firstModelEventMs,
+          firstContentTokenMs,
+          firstToolCallMs,
+          reasoningDeltaChars,
+          requestOptions,
+          usage,
+        }),
+      },
+    );
+
+    if (outputTruncated && toolCalls.size > 0) {
+      throw new ModelAdapterError(
+        "PROVIDER_OUTPUT_TRUNCATED",
+        "模型生成的工具参数达到输出长度上限，未执行不完整参数。",
+      );
+    }
 
     return Array.from(toolCalls.values()).filter((toolCall) => toolCall.name);
   }

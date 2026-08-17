@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { appendVisualizationReferencesToReport, buildFallbackTempCsvSqlForAnalysisRequest, buildGenericSqlResultAnalysisPythonScript, buildModelToolParameterIssueFeedback, completedChartLineageForMessage, detectToolFromAssistantOutput, filterReportVisualizationsToArtifacts, formatStoppedGenerationMessage, generalStreamSegmentId, generalTextStreamSegmentId, generatedReportArtifactId, generatedReportToolCallId, inferReportTitle, isPreToolTextGuidanceRequiredInputs, isPythonReportCardContent, isRepairablePythonRuntimeError, isReportGenerationContent, mergeReportChartSections, normalizeAnalysisReportMarkdown, normalizeAnalysisReportTitle, normalizeChartVisualizationSpec, normalizePythonScriptParameter, providerToolFallbackText, pythonScriptReadsStdin, renderLocalToolPlanContext, reportStreamSegmentId, selectedFieldReferencesMarkdown, shouldAnalyzePriorSqlResult, shouldAutoStartPythonReport, shouldBypassBlockingGuidanceForModelIntent, shouldDeferChartUntilUpstreamTools, shouldDeferReportUntilChartTool, shouldEagerStartToolFromAssistantStream, shouldForceGenericSqlResultAnalysisScript, shouldGenerateReportFromAnalysisResult, shouldKeepProviderToolActivityMessage, shouldRegisterAssistantGeneratedArtifacts, shouldRequireDetailSqlForCompositeAnalysis, shouldRouteDeterministicTempCsvToolPlan, shouldUseModelForPriorResultVisualization, shouldUseModelForUnclearTaskGoal, summarizeToolArguments, validatePythonScriptSyntax } from "./assistantRuntime";
+import { appendVisualizationReferencesToReport, buildFallbackTempCsvSqlForAnalysisRequest, buildGenericSqlResultAnalysisPythonScript, buildModelToolParameterIssueFeedback, completedChartLineageForMessage, detectToolFromAssistantOutput, filterReportVisualizationsToArtifacts, formatStoppedGenerationMessage, generalStreamSegmentId, generalTextStreamSegmentId, generatedReportArtifactId, generatedReportToolCallId, inferReportTitle, isDetailSqlRequiredParameterIssue, isPreToolTextGuidanceRequiredInputs, isPythonReportCardContent, isRepairablePythonRuntimeError, isReportGenerationContent, mergeReportChartSections, normalizeAnalysisReportMarkdown, normalizeAnalysisReportTitle, normalizeChartVisualizationSpec, normalizePythonScriptParameter, providerToolFallbackText, pythonScriptReadsStdin, renderLocalToolPlanContext, reportStreamSegmentId, selectedFieldReferencesMarkdown, shouldAnalyzePriorSqlResult, shouldAutoStartPythonReport, shouldBypassBlockingGuidanceForModelIntent, shouldDeferChartUntilUpstreamTools, shouldDeferReportUntilChartTool, shouldEagerStartToolFromAssistantStream, shouldForceGenericSqlResultAnalysisScript, shouldGenerateReportFromAnalysisResult, shouldKeepProviderToolActivityMessage, shouldRegisterAssistantGeneratedArtifacts, shouldRequireDetailSqlForCompositeAnalysis, shouldRouteDeterministicTempCsvToolPlan, shouldUseModelForPriorResultVisualization, shouldUseModelForUnclearTaskGoal, summarizeToolArguments, validatePythonScriptSyntax } from "./assistantRuntime";
 import { TOOL_NAMES, type ToolExecutionPlan } from "./toolOrchestration";
 import { MissingInputDetector } from "./agentGuidance";
 import { buildTaskRouterSystemPrompt, executionToolSchema } from "./agentOrchestration/modelAdapters";
@@ -248,6 +248,14 @@ describe("AssistantRuntime workflow intent", () => {
     expect(shouldRequireDetailSqlForCompositeAnalysis({
       prompt: "仅需 SQL 直接返回汇总统计。",
       sql: 'select "行业", count(*) as "合同数" from "loans" group by "行业"',
+    })).toBe(false);
+    expect(isDetailSqlRequiredParameterIssue({
+      status: "waiting_input",
+      reason: "sql_must_return_detail_rows_for_analysis",
+    })).toBe(true);
+    expect(isDetailSqlRequiredParameterIssue({
+      status: "parameter_issue",
+      reason: "missing_sql",
     })).toBe(false);
   });
 

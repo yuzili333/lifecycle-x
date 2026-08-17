@@ -14,4 +14,18 @@
 
 ## 重点风险客户特征分析
 
-{{numbered_feature_conclusions}}
+（1）{{business_term_summary}}
+
+（2）{{nonperforming_summary}}
+
+{{#if_nonperforming_customers}}
+| `{{customer_name_field}}` | `{{branch_field}}` | `{{guarantee_method_field}}` | `{{industry_field}}` | `{{loan_balance_business_name}}({{amount_unit_label}})` |
+|---|---|---|---|---:|
+{{nonperforming_customer_rows}}
+{{/if_nonperforming_customers}}
+
+（3）{{attention_summary}}
+
+{{#if_migration_summary}}（4）{{migration_summary}}{{/if_migration_summary}}
+
+（5）{{distribution_summary}}

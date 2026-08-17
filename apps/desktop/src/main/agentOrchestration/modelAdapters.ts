@@ -467,7 +467,7 @@ export function executionToolSchema(toolKind: ToolKind) {
 
 export function executionToolDescription(toolKind: ToolKind) {
   if (toolKind === "sql_query") {
-    return "为当前步骤提交一条只读 SQL。只生成 sql；用户需求、步骤目的、数据源和审批上下文由客户端注入。";
+    return "为当前步骤提交一条只读 SQL。只生成 sql；用户需求、步骤目的、数据源和审批上下文由客户端注入。复合分析中若上下文要求先查询明细，必须选择后续 Python 所需原始字段，禁止用 GROUP BY、COUNT、SUM、AVG、MIN、MAX 或 DISTINCT 提前聚合。";
   }
   if (toolKind === "python_analysis") {
     return "为当前步骤提交受控 Python 脚本。只生成 script；数据与 Artifact 血缘由客户端注入。";
@@ -607,7 +607,7 @@ export function buildExecutionSystemPrompt(step: PlannerStep, tool: ToolDefiniti
   const canonicalParameterRule = step.toolKind === "sql_query"
     ? "只生成非空 sql；userRequest、purpose、数据源和血缘参数由客户端注入，不要输出这些字段。"
     : step.toolKind === "python_analysis"
-      ? "只生成非空、简洁且语法完整的 script，并仅使用上游结果摘要中存在的真实字段；字段名称必须从上游结果字段清单逐字符复制，包含单位的中英文括号必须完整保留在字符串引号内，不得手工改写。金额一旦解析为 Decimal，累计、分子、分母、占比和单位换算必须始终使用 Decimal；笔数、行数等整数计算占比时也必须先执行 Decimal(count) / Decimal(total)，禁止 count / total 先产生 float。只在最终 JSON 序列化时转换为 float；正确形式是 float(decimal_numerator / decimal_denominator)，禁止 float_value / Decimal_value，也不得把 float 传给使用 Decimal 常量的格式化函数。Artifact 血缘由客户端注入。运行时会把已授权 SQL Artifact 的完整数据行作为 JSON 数组写入 stdin，使用 `import json, sys` 和 `rows = json.load(sys.stdin)` 读取；不要输出推测性长注释，不要猜测 artifact_data、df_data 等全局变量，不要读取本地路径，也不要用 Markdown 围栏、<script> 或其他包装标签包裹脚本。"
+      ? "只生成非空、简洁且语法完整的 script，并仅使用上游结果摘要中存在的真实字段；script 必须控制在 12000 个字符以内，删除长注释、重复分支和逐项硬编码，优先使用辅助函数、映射表与循环。字段名称必须从上游结果字段清单逐字符复制，包含单位的中英文括号必须完整保留在字符串引号内，不得手工改写。金额一旦解析为 Decimal，累计、分子、分母、占比和单位换算必须始终使用 Decimal；笔数、行数等整数计算占比时也必须先执行 Decimal(count) / Decimal(total)，禁止 count / total 先产生 float。只在最终 JSON 序列化时转换为 float；正确形式是 float(decimal_numerator / decimal_denominator)，禁止 float_value / Decimal_value，也不得把 float 传给使用 Decimal 常量的格式化函数。Artifact 血缘由客户端注入。运行时会把已授权 SQL Artifact 的完整数据行作为 JSON 数组写入 stdin，使用 `import json, sys` 和 `rows = json.load(sys.stdin)` 读取；不要输出推测性长注释，不要猜测 artifact_data、df_data 等全局变量，不要读取本地路径，也不要用 Markdown 围栏、<script> 或其他包装标签包裹脚本。"
       : step.toolKind === "chart_rendering"
         ? "只提供 title、chartType、dimensionFields、measureFields 及可选 dimensionLabels、measureLabels、排序/颜色字段；禁止生成 visualizationSpec、ECharts option 或内联数据。维度和指标必须来自上游结果摘要，标签只用于展示且映射键必须是对应字段。"
         : "直接输出非空、完整的 Markdown 正文，一级标题作为报告标题；正文只能使用上游分析摘要和 Artifact 中已经存在的结论，引用关系由客户端注入。只允许展示当前轮成功生成的图表；图表步骤失败或没有可用图表时继续生成文本报告并省略可视化章节，不得引用历史图表补位。正文不得显示 Artifact ID、toolCallId、内部工具名称或“上游 Python 分析结果”等内部血缘信息。禁止使用 Markdown 图片语法或 HTML img 标签表示图表，图表仅由客户端注入的受控可视化节点展示。";
