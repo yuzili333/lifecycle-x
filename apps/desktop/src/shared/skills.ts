@@ -20,6 +20,7 @@ export type SkillManifest = {
   inputSchemaFile?: string;
   reportDataSchemaFile?: string;
   toolPolicyFile?: string;
+  analysisRecipeFile?: string;
   aliases?: string[];
 };
 
@@ -48,6 +49,7 @@ export type LoadedSkill = {
   inputSchema?: Record<string, unknown>;
   outputSchema?: Record<string, unknown>;
   toolPolicy?: Record<string, unknown>;
+  analysisRecipe?: Record<string, unknown>;
   contentHash: string;
   loadedAt: string;
 };

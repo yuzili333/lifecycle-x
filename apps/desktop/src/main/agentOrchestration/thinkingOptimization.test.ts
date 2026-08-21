@@ -4,9 +4,11 @@ import {
   ExecutionParameterAdapter,
   analysisPlanToPlannerDecision,
   buildAnalysisPlanSystemPrompt,
+  buildExecutionSystemPrompt,
   compressReasoningContext,
   conservativeTaskRoute,
   executionToolDescription,
+  executionMessages,
   executionToolSchema,
   extractPartialJsonStringField,
   isOptimizationEnabledForScope,
@@ -229,15 +231,140 @@ describe("thinking optimization", () => {
 
     expect(sql.required).toEqual(["sql"]);
     expect(python.required).toEqual(["script"]);
+    expect(python.properties?.script).not.toHaveProperty("maxLength");
     expect(chart.required).toEqual(["title", "chartType", "dimensionFields", "measureFields"]);
     expect(chart.properties).not.toHaveProperty("visualizationSpec");
     expect(report.required).toEqual(["title", "markdown"]);
-    expect(executionToolDescription("sql_query")).toContain("禁止用 GROUP BY、COUNT、SUM、AVG、MIN、MAX 或 DISTINCT 提前聚合");
+    expect(executionToolDescription("sql_query")).toContain("SQL 工具只执行查询并返回结果");
+    expect(executionToolDescription("sql_query")).not.toContain("可执行查询骨架");
+    expect(sql.properties?.sql?.description).toContain("上下文提供可执行查询骨架时直接复制");
+    expect(sql.properties?.sql?.description).toContain("不得包含任务说明、Schema、分析过程");
+    expect(sql.properties?.sql?.description).toContain("禁止空标识符或占位符");
+    expect(executionToolDescription("python_analysis")).toContain("受控 Python 统计脚本");
+    expect(executionToolDescription("python_analysis")).not.toContain("json.load(sys.stdin)");
+    expect(python.properties?.script?.description).not.toContain("json.load(sys.stdin)");
+    expect(python.properties?.script?.description).toContain("已授权的上游 JSON 数据写入 stdin");
+    expect(python.properties?.script?.description).toContain("不限定 import 顺序、变量名或具体语句");
+    expect(python.properties?.script?.description).toContain("明显短于 6000 字符");
+    expect(python.properties?.script?.description).toContain("禁止把 collections.namedtuple 等模块属性写成 import 目标");
+    expect(python.properties?.script?.description).not.toContain("16000");
+    expect(python.properties?.script?.description).not.toContain("逐字从 import json, sys");
+    expect(executionToolDescription("report_generation")).toContain("报告结构组合、结论撰写和内容一致性审核");
     for (const schema of [sql, python, chart, report]) {
       expect(schema.properties).not.toHaveProperty("userRequest");
       expect(schema.properties).not.toHaveProperty("purpose");
       expect(schema.additionalProperties).toBe(false);
     }
+    const config = resolveThinkingOptimizationConfig({}, {});
+    expect(config.qwenProfiles.sql).toMatchObject({
+      enableThinking: false,
+      temperature: 0,
+      maxTokens: 4_096,
+    });
+    expect(config.qwenProfiles.python).toMatchObject({
+      enableThinking: false,
+      temperature: 0,
+      maxTokens: 8_192,
+    });
+    const pythonPrompt = buildExecutionSystemPrompt({
+      stepId: "analysis",
+      toolKind: "python_analysis",
+      purpose: "统计分类占比",
+      dependencies: ["query"],
+      inputResolution: "current_run",
+      expectedOutput: "分析 Artifact",
+    }, {
+      name: "request_python_analysis_execution",
+      description: executionToolDescription("python_analysis"),
+      inputSchema: python,
+      handler: async () => ({ status: "completed" }),
+    });
+    expect(pythonPrompt).not.toContain("rows = json.load(sys.stdin)");
+    expect(pythonPrompt).not.toContain("print(json.dumps(result, ensure_ascii=False))");
+    expect(pythonPrompt).toContain("禁止只返回 import");
+    expect(pythonPrompt).toContain("只导入脚本直接使用的标准库能力且不得重复");
+    expect(pythonPrompt).toContain("紧凑是减少重复逻辑，不是压缩成单行");
+    expect(pythonPrompt).toContain("script 通常应明显短于 6000 字符");
+    expect(pythonPrompt).toContain("模块使用 import module");
+    expect(pythonPrompt).not.toContain("16000");
+    expect(pythonPrompt).not.toContain("前两个物理行必须逐字");
+    expect(pythonPrompt).toContain("一个数据驱动累计结构");
+    expect(pythonPrompt).not.toMatch(/导入项.*(?:不超过|最多|超过)\s*8/);
+    expect(pythonPrompt).not.toContain("SQL 仅允许单条只读查询");
+    expect(pythonPrompt.length).toBeLessThan(2_500);
+
+    const sqlPrompt = buildExecutionSystemPrompt({
+      stepId: "query",
+      toolKind: "sql_query",
+      purpose: "查询明细",
+      dependencies: [],
+      inputResolution: "selected_data_source",
+      expectedOutput: "查询 Artifact",
+    }, {
+      name: "request_sql_query_execution",
+      description: executionToolDescription("sql_query"),
+      inputSchema: sql,
+      handler: async () => ({ status: "completed" }),
+    });
+    expect(sqlPrompt).toContain("可执行查询骨架");
+    expect(sqlPrompt).toContain("SQL 参数契约以工具 Schema 为准");
+    expect(sqlPrompt).not.toContain("不得包含任务说明、Schema、分析过程");
+    expect(sqlPrompt).not.toContain("Python 只能使用标准库");
+    expect(sqlPrompt.length).toBeLessThan(1_200);
+  });
+
+  it("uses the active tool step instead of a report-level user request for parameter generation", () => {
+    const sqlTool = {
+      name: "request_sql_query_execution",
+      description: executionToolDescription("sql_query"),
+      inputSchema: executionToolSchema("sql_query"),
+      handler: async () => ({ status: "completed" }),
+    };
+    const sqlMessages = executionMessages("verified SQL context", "重新生成报告", {
+      stepId: "query",
+      toolKind: "sql_query",
+      purpose: "查询担保方式、风险分类、贷款余额和合同流水号明细",
+      dependencies: [],
+      inputResolution: "selected_data_source",
+      expectedOutput: "查询 Artifact",
+    }, sqlTool);
+
+    expect(sqlMessages[1]?.content).toContain("执行当前已确定步骤：查询担保方式、风险分类、贷款余额和合同流水号明细");
+    expect(sqlMessages[1]?.content).toContain("只调用 request_sql_query_execution 一次");
+    expect(sqlMessages[1]?.content).not.toContain("可执行查询骨架");
+    expect(sqlMessages[1]?.content).not.toContain("重新生成报告");
+
+    const pythonMessages = executionMessages("upstream result context", "重新生成报告", {
+      stepId: "analysis",
+      toolKind: "python_analysis",
+      purpose: "统计担保方式风险分布",
+      dependencies: ["query"],
+      inputResolution: "current_run",
+      expectedOutput: "分析 Artifact",
+    }, {
+      name: "request_python_analysis_execution",
+      description: executionToolDescription("python_analysis"),
+      inputSchema: executionToolSchema("python_analysis"),
+      handler: async () => ({ status: "completed" }),
+    });
+    expect(pythonMessages[1]?.content).not.toContain("rows = json.load(sys.stdin)");
+    expect(pythonMessages[1]?.content).not.toContain("stdout 输出唯一 JSON `result`");
+    expect(pythonMessages[1]?.content).not.toContain("重新生成报告");
+
+    const reportMessages = executionMessages("report context", "重新生成报告", {
+      stepId: "report",
+      toolKind: "report_generation",
+      purpose: "生成报告",
+      dependencies: ["analysis"],
+      inputResolution: "current_run",
+      expectedOutput: "报告 Artifact",
+    }, {
+      name: "request_markdown_report_generation",
+      description: executionToolDescription("report_generation"),
+      inputSchema: executionToolSchema("report_generation"),
+      handler: async () => ({ status: "completed" }),
+    });
+    expect(reportMessages[1]?.content).toBe("重新生成报告");
   });
 
   it("forces the sole execution tool and classifies a plain-text response as a protocol failure", async () => {
@@ -296,6 +423,50 @@ describe("thinking optimization", () => {
       errorStage: "protocol",
     });
     expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("executes runtime-resolved parameters without requesting the execution model", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const handler = vi.fn(async (input: unknown) => ({ status: "completed", input }));
+    const events: string[] = [];
+    const adapter = new ExecutionParameterAdapter({
+      providerName: "siliconflow",
+      baseURL: "https://example.local/v1",
+      apiKey: "test-key",
+      model: "execution-model",
+      timeoutMs: 10_000,
+      profileName: "sql",
+    });
+    const output = await adapter.executePrepared({
+      conversationId: "conversation-1",
+      messageId: "message-1",
+      step: {
+        stepId: "query",
+        toolKind: "sql_query",
+        purpose: "查询明细",
+        dependencies: [],
+        inputResolution: "selected_data_source",
+        expectedOutput: "查询数据集",
+      },
+      messages: [],
+      tool: {
+        name: "request_sql_query_execution",
+        description: "执行 SQL 查询",
+        inputSchema: executionToolSchema("sql_query"),
+        handler,
+      },
+      onEvent: (event) => events.push(event.type),
+    }, { sql: 'SELECT "风险分类" FROM "chat_csv_table"' });
+    vi.unstubAllGlobals();
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(handler).toHaveBeenCalledWith(
+      { sql: 'SELECT "风险分类" FROM "chat_csv_table"' },
+      expect.objectContaining({ conversationId: "conversation-1", messageId: "message-1" }),
+    );
+    expect(events).toEqual(["tool-call-start", "tool-call-end", "tool-execution-result"]);
+    expect(output).toMatchObject({ invoked: true, output: { status: "completed" } });
   });
 
   it("does not execute truncated tool-call JSON and classifies it as provider output truncation", async () => {

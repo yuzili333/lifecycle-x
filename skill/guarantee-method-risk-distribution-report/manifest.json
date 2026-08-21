@@ -1,0 +1,44 @@
+{
+  "skillId": "guarantee-method-risk-distribution-report",
+  "name": "guarantee-method-risk-distribution-report",
+  "displayName": "担保方式风险分布分析报告",
+  "description": "按主要担保方式统计最新风险五级分类的笔数、贷款余额、不良率和关注率，并生成匹配模板的风险分布分析报告。",
+  "version": "1.2.0",
+  "category": "credit-risk-analysis",
+  "tags": [
+    "信贷资产",
+    "担保方式",
+    "风险分布",
+    "五级分类",
+    "不良率",
+    "关注率"
+  ],
+  "keywords": [
+    "担保方式风险分布",
+    "担保风险方式分布",
+    "保证信用抵押质押",
+    "担保方式不良率",
+    "担保方式关注率",
+    "贷款余额分布"
+  ],
+  "sourceType": "local_builtin",
+  "runtime": "cycle-probe-client",
+  "clientOnly": true,
+  "enabled": true,
+  "requiredTools": [
+    "request_sql_query_execution",
+    "request_python_analysis_execution",
+    "request_markdown_report_generation"
+  ],
+  "entryFile": "SKILL.md",
+  "templateFile": "report-template.md",
+  "inputSchemaFile": "schemas/skill-input.schema.json",
+  "reportDataSchemaFile": "schemas/report-data.schema.json",
+  "toolPolicyFile": "tool-policy.json",
+  "analysisRecipeFile": "analysis-recipe.json",
+  "aliases": [
+    "@担保方式风险分布",
+    "@担保风险分布分析",
+    "@担保方式不良率分析"
+  ]
+}

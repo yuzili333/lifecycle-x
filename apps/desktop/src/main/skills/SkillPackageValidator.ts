@@ -48,6 +48,7 @@ export async function validateSkillDirectory(input: {
     manifest.inputSchemaFile,
     manifest.reportDataSchemaFile,
     manifest.toolPolicyFile,
+    manifest.analysisRecipeFile,
   ].filter((value): value is string => Boolean(value));
   for (const referencedFile of referencedFiles) {
     const referencedPath = safeReferencedPath(root, referencedFile, input.traceId);
@@ -84,6 +85,13 @@ export async function validateSkillDirectory(input: {
     ? asRecord(await readJson(safeReferencedPath(root, manifest.toolPolicyFile, input.traceId), "SKILL_SCHEMA_INVALID", input.traceId), "工具策略", manifest.skillId, input.traceId)
     : undefined;
   validateToolPolicy(toolPolicy, manifest, input.traceId);
+  const analysisRecipe = manifest.analysisRecipeFile
+    ? validateAnalysisRecipe(
+        await readJson(safeReferencedPath(root, manifest.analysisRecipeFile, input.traceId), "SKILL_SCHEMA_INVALID", input.traceId),
+        manifest.skillId,
+        input.traceId,
+      )
+    : undefined;
   const reportTemplate = manifest.templateFile
     ? await readFile(safeReferencedPath(root, manifest.templateFile, input.traceId), "utf8")
     : undefined;
@@ -101,6 +109,7 @@ export async function validateSkillDirectory(input: {
       inputSchema,
       outputSchema,
       toolPolicy,
+      analysisRecipe,
       contentHash,
       loadedAt: new Date().toISOString(),
     },
@@ -209,12 +218,60 @@ function validateManifest(value: unknown, origin: SkillOrigin, traceId: string):
       throw manifestError(`Skill 声明了未知工具：${tool}`, traceId, skillId);
     }
   }
-  for (const key of ["templateFile", "inputSchemaFile", "reportDataSchemaFile", "toolPolicyFile"] as const) {
+  for (const key of ["templateFile", "inputSchemaFile", "reportDataSchemaFile", "toolPolicyFile", "analysisRecipeFile"] as const) {
     if (manifest[key] !== undefined && typeof manifest[key] !== "string") {
       throw manifestError(`Manifest 字段 ${key} 必须是相对路径。`, traceId, skillId);
     }
   }
   return manifest as SkillManifest;
+}
+
+function validateAnalysisRecipe(value: unknown, skillId: string, traceId: string) {
+  const recipe = asRecord(value, "分析配方", skillId, traceId);
+  if (recipe.kind !== "grouped-risk-distribution-v1") {
+    throw schemaError("分析配方 kind 不受支持。", traceId, skillId);
+  }
+  const fieldRoles = asRecord(recipe.fieldRoles, "分析配方 fieldRoles", skillId, traceId);
+  for (const role of ["group", "risk", "amount", "recordId"] as const) {
+    const definition = asRecord(fieldRoles[role], `分析配方字段 ${role}`, skillId, traceId);
+    if (!isStringArray(definition.candidates) || definition.candidates.length === 0) {
+      throw schemaError(`分析配方字段 ${role}.candidates 必须是非空字符串数组。`, traceId, skillId);
+    }
+  }
+  if (!isStringArray(recipe.groupOrder) || recipe.groupOrder.length === 0) {
+    throw schemaError("分析配方 groupOrder 必须是非空字符串数组。", traceId, skillId);
+  }
+  const groupOrder = recipe.groupOrder;
+  const groupRules = Array.isArray(recipe.groupRules) ? recipe.groupRules : [];
+  if (groupRules.length === 0 || groupRules.some((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return true;
+    const rule = item as Record<string, unknown>;
+    return typeof rule.label !== "string" || !groupOrder.includes(rule.label) ||
+      !isStringArray(rule.keywords) || rule.keywords.length === 0;
+  })) {
+    throw schemaError("分析配方 groupRules 必须引用 groupOrder 中的分类并提供关键词。", traceId, skillId);
+  }
+  const riskRules = asRecord(recipe.riskRules, "分析配方 riskRules", skillId, traceId);
+  for (const key of ["normal", "attention", "nonperforming"] as const) {
+    if (!isStringArray(riskRules[key]) || riskRules[key].length === 0) {
+      throw schemaError(`分析配方 riskRules.${key} 必须是非空字符串数组。`, traceId, skillId);
+    }
+  }
+  const output = asRecord(recipe.output, "分析配方 output", skillId, traceId);
+  for (const key of ["distributionKey", "groupLabelKey"] as const) {
+    if (typeof output[key] !== "string" || !String(output[key]).trim()) {
+      throw schemaError(`分析配方 output.${key} 不能为空。`, traceId, skillId);
+    }
+  }
+  if (output.specialMetrics !== undefined && (!Array.isArray(output.specialMetrics) || output.specialMetrics.some((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return true;
+    const metric = item as Record<string, unknown>;
+    return typeof metric.key !== "string" || typeof metric.groupSourceContains !== "string" ||
+      !["normal", "attention", "nonperforming"].includes(String(metric.risk));
+  }))) {
+    throw schemaError("分析配方 output.specialMetrics 格式不合法。", traceId, skillId);
+  }
+  return recipe;
 }
 
 function validateSchema(value: unknown, skillId: string, traceId: string) {

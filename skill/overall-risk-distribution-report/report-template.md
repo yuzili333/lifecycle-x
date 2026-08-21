@@ -2,36 +2,32 @@
 
 ## 整体风险分类分布（笔数+金额）
 
-全样本共 {{sample_count}} 笔信贷合同。笔数口径：{{count_basis_text}}。`{{loan_balance_business_name}}`合计 {{loan_balance_display}}{{contract_amount_clause}}
+{{报告模型依据 totals、sourceFields、countBasis 和 fallbackCode 组合样本、口径、贷款余额及可选合同金额摘要，并完成单位格式化}}
 
-| `{{five_level_field_name}}` | 笔数 | 笔数占比 | `{{loan_balance_field_name}}` | 金额占比 | 备注 |
-|---|---:|---:|---:|---:|---|
-| 正常 | {{normal_count}} | {{normal_count_rate}} | {{normal_balance}} | {{normal_balance_rate}} | |
-| 关注 | {{attention_count}} | {{attention_count_rate}} | {{attention_balance}} | {{attention_balance_rate}} | {{attention_remark}} |
-| 次级 | {{substandard_count}} | {{substandard_count_rate}} | {{substandard_balance}} | {{substandard_balance_rate}} | {{nonperforming_remark}} |
-| 可疑 | {{doubtful_count}} | {{doubtful_count_rate}} | {{doubtful_balance}} | {{doubtful_balance_rate}} | |
-| 损失 | {{loss_count}} | {{loss_count_rate}} | {{loss_balance}} | {{loss_balance_rate}} | |
-| 合计 | {{total_count}} | 100.00% | {{total_balance}} | 100.00% | |
+### 最新风险五级分类
 
-`{{risk_result_field_name}}`明细（含金额）：
-
-| `{{risk_result_field_name}}` | 笔数 | 笔数占比 | `{{loan_balance_field_name}}` | 金额占比 |
+| 风险分类 | 合同笔数 | 笔数占比 | 贷款余额（保留真实源单位） | 金额占比 |
 |---|---:|---:|---:|---:|
-{{risk_result_rows}}
-| 合计 | {{total_count}} | 100.00% | {{total_balance}} | 100.00% |
+{{报告模型按正常、关注、次级、可疑、损失顺序格式化 fiveLevelDistribution}}
+
+### 最新风险分类结果
+
+{{riskResultDistribution 非空时由报告模型生成明细表，否则省略本节}}
 
 ## 可视化图表
 
-{{controlled_visualization_nodes}}
+{{仅展示本轮成功的受控图表节点；没有图表时省略本节}}
 
 ## 分析结论
 
-【笔数维度】
+### 【笔数维度】
 
-{{count_dimension_conclusion}}
+{{基于 fiveLevelDistribution 与 nonperformingSummary 撰写}}
 
-【金额维度】
+### 【金额维度】
 
-{{amount_dimension_conclusion}}
+{{基于同一统计项撰写并将可确认金额格式化为三位小数亿元}}
 
-{{normal_detail_conclusion}}
+### 正常类内部细分
+
+{{基于 riskResultDistribution 中实际正常明细撰写；无明细时省略}}

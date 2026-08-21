@@ -119,6 +119,51 @@ describe("dual-model agent orchestration", () => {
     expect(currentDurations(run, 2_500)).toEqual({ activeDurationMs: 2_000, waitingDurationMs: 700 });
   });
 
+  it("keeps a cancelled run terminal when stale async progress arrives", () => {
+    const db = new Database(":memory:");
+    const store = new SQLiteAgentProgressStore(db);
+    store.migrate();
+    const orchestrator = new AgentTurnOrchestrator(store, () => undefined);
+    orchestrator.start({
+      runId: "run-cancelled",
+      conversationId: "conversation-1",
+      messageId: "message-1",
+      userId: "user-1",
+      attempt: 1,
+      reasoningModelName: "reasoning",
+      executionModelName: "execution",
+    });
+    const step = {
+      stepId: "analysis",
+      toolKind: "python_analysis" as const,
+      purpose: "统计分析",
+      dependencies: [],
+      inputResolution: "current_run" as const,
+      expectedOutput: "分析结果",
+    };
+    orchestrator.cancel("run-cancelled");
+    const cancelled = store.get("run-cancelled")!;
+    orchestrator.fallback("run-cancelled", "迟到的修复事件", { stepId: step.stepId });
+    orchestrator.preparingStep("run-cancelled", step);
+    orchestrator.stepFailed("run-cancelled", step, {
+      code: "TOOL_EXECUTION_FAILED",
+      phase: "step_failed",
+      message: "迟到的执行错误",
+      recoverable: true,
+      traceId: "trace-1",
+      retryTrace: [],
+      fallbackTrace: [],
+      conflictTrace: [],
+    });
+
+    const after = store.get("run-cancelled")!;
+    expect(after.status).toBe("cancelled");
+    expect(after.activeDurationMs).toBe(cancelled.activeDurationMs);
+    expect(after.failedStepIds).toEqual([]);
+    expect(after.events.map((event) => event.phase)).toEqual(["accepted", "cancelled"]);
+    db.close();
+  });
+
   it("emits a distinct planning.started business event before planning progress", () => {
     const db = new Database(":memory:");
     const store = new SQLiteAgentProgressStore(db);

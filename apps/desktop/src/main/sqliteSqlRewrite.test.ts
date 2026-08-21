@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { hasTopLevelCompoundOperator, rewriteCompoundOrderByForSqlite } from "./sqliteSqlRewrite";
+import {
+  hasTopLevelCompoundOperator,
+  quoteKnownIdentifiersForSqlite,
+  rewriteCompoundOrderByForSqlite,
+  rewriteTopLevelAliasSourceForSqlite,
+  sqliteSqlStructureIssue,
+  sqlReferencesIdentifier,
+} from "./sqliteSqlRewrite";
 
 describe("sqlite SQL rewrite", () => {
   it("rewrites compound queries with a top-level order by expression", () => {
@@ -44,5 +51,61 @@ describe("sqlite SQL rewrite", () => {
 
     expect(hasTopLevelCompoundOperator(sql)).toBe(false);
     expect(rewriteCompoundOrderByForSqlite(sql)).toBeNull();
+  });
+
+  it("quotes known CSV identifiers without touching literals, comments or existing quotes", () => {
+    const sql = `SELECT T1.贷款余额(万元), T1.合同流水号, '贷款余额(万元)' AS label
+      FROM chat_csv_abc T1
+      WHERE T1."主要担保方式名称" = '抵押' -- 贷款余额(万元)`;
+
+    expect(quoteKnownIdentifiersForSqlite(sql, [
+      "chat_csv_abc",
+      "贷款余额(万元)",
+      "合同流水号",
+      "主要担保方式名称",
+    ])).toBe(`SELECT T1."贷款余额(万元)", T1."合同流水号", '贷款余额(万元)' AS label
+      FROM "chat_csv_abc" T1
+      WHERE T1."主要担保方式名称" = '抵押' -- 贷款余额(万元)`);
+  });
+
+  it("rejects empty or unterminated quoted identifiers before SQLite execution", () => {
+    expect(sqliteSqlStructureIssue("SELECT T1.``")).toBe("SQL 包含空字段名或空表名。");
+    expect(sqliteSqlStructureIssue('SELECT T1.""')).toBe("SQL 包含空字段名或空表名。");
+    expect(sqliteSqlStructureIssue("SELECT T1.[]")).toBe("SQL 包含空字段名或空表名。");
+    expect(sqliteSqlStructureIssue('SELECT "" AS blank FROM loans')).toBeNull();
+    expect(sqliteSqlStructureIssue('SELECT * FROM loans WHERE COALESCE("备注", "") = ""')).toBeNull();
+    expect(sqliteSqlStructureIssue('SELECT * FROM ""')).toBe("SQL 包含空字段名或空表名。");
+    expect(sqliteSqlStructureIssue('SELECT T1."贷款余额(万元) FROM loans T1')).toBe("SQL 包含未闭合的标识符引号。");
+    expect(sqliteSqlStructureIssue('SELECT T1."贷款余额(万元)" FROM "loans" T1')).toBeNull();
+  });
+
+  it("finds actual SQL identifier references but ignores literals and comments", () => {
+    const tableName = "chat_csv_abc";
+
+    expect(sqlReferencesIdentifier('SELECT * FROM "chat_csv_abc"', tableName)).toBe(true);
+    expect(sqlReferencesIdentifier("SELECT * FROM chat_csv_abc", tableName)).toBe(true);
+    expect(sqlReferencesIdentifier("SELECT 'chat_csv_abc' AS label", tableName)).toBe(false);
+    expect(sqlReferencesIdentifier("SELECT 1 -- chat_csv_abc", tableName)).toBe(false);
+    expect(sqlReferencesIdentifier("SELECT * FROM chat_csv_abcdef", tableName)).toBe(false);
+  });
+
+  it("rewrites a top-level T1 alias used as the sole source to the verified table", () => {
+    expect(rewriteTopLevelAliasSourceForSqlite(
+      'SELECT T1."风险等级" FROM T1 WHERE T1."风险等级" = \'关注\';',
+      "T1",
+      "chat_csv_conversation_1",
+    )).toBe('SELECT T1."风险等级" FROM "chat_csv_conversation_1" AS T1 WHERE T1."风险等级" = \'关注\';');
+    expect(rewriteTopLevelAliasSourceForSqlite(
+      "SELECT * FROM T1;",
+      "T1",
+      "chat_csv_conversation_1",
+    )).toBe('SELECT * FROM "chat_csv_conversation_1" AS T1;');
+  });
+
+  it("does not rewrite unknown, quoted, nested, or already-aliased sources", () => {
+    expect(rewriteTopLevelAliasSourceForSqlite("SELECT * FROM other_table", "T1", "chat_csv_1")).toBeNull();
+    expect(rewriteTopLevelAliasSourceForSqlite('SELECT * FROM "T1"', "T1", "chat_csv_1")).toBeNull();
+    expect(rewriteTopLevelAliasSourceForSqlite("SELECT * FROM (SELECT * FROM T1)", "T1", "chat_csv_1")).toBeNull();
+    expect(rewriteTopLevelAliasSourceForSqlite("SELECT * FROM T1 AS source", "T1", "chat_csv_1")).toBeNull();
   });
 });

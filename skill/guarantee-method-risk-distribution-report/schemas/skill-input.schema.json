@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cycle-probe.local/schemas/guarantee-method-risk-distribution-report-input.schema.json",
+  "title": "GuaranteeMethodRiskDistributionReportInput",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "dataSourceId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "当前会话选择的数据源 ID；未提供时从会话上下文解析。"
+    },
+    "fieldBindings": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "仅保存当前数据源中已经确认存在的真实字段名称。",
+      "properties": {
+        "guaranteeMethod": {
+          "$ref": "#/$defs/actualField",
+          "description": "担保方式业务角色，模板语义为主要担保方式名称。"
+        },
+        "fiveLevelClassification": {
+          "$ref": "#/$defs/actualField"
+        },
+        "amount": {
+          "$ref": "#/$defs/amountField",
+          "description": "金额指标对应的真实字段；用户未指定时默认绑定贷款余额并转换为万。"
+        },
+        "contractSerial": {
+          "$ref": "#/$defs/actualField"
+        }
+      }
+    },
+    "filters": {
+      "type": "object",
+      "description": "用户明确指定的筛选条件；默认分析所选数据源的全部日期范围。",
+      "additionalProperties": true
+    }
+  },
+  "$defs": {
+    "actualField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "actualName"
+      ],
+      "properties": {
+        "actualName": {
+          "type": "string",
+          "minLength": 1
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1
+        },
+        "selectedByUser": {
+          "type": "boolean"
+        }
+      }
+    },
+    "amountField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "actualName"
+      ],
+      "properties": {
+        "actualName": {
+          "type": "string",
+          "minLength": 1
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1
+        },
+        "businessName": {
+          "type": "string",
+          "minLength": 1,
+          "description": "去除单位后的真实业务指标名称；默认贷款余额。"
+        },
+        "sourceUnit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "displayUnit": {
+          "type": "string",
+          "minLength": 1,
+          "description": "报告金额列展示单位；默认万。"
+        },
+        "selectedByUser": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

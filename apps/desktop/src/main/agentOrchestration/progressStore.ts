@@ -121,6 +121,9 @@ export class SQLiteAgentProgressStore {
   }) {
     const current = this.get(runId);
     if (!current) throw new Error(`Agent Run 不存在：${runId}`);
+    if (isTerminalStatus(current.status)) {
+      return current;
+    }
     const next = { ...current, ...patch, updatedAt: new Date().toISOString() };
     this.db.prepare(`update agent_runs set status = ?, route_json = ?, analysis_plan_json = ?, thinking_decision_json = ?,
       kimi_call_count = ?, cumulative_thinking_budget = ?,
@@ -226,6 +229,10 @@ export class SQLiteAgentProgressStore {
       this.db.exec(`alter table ${table} add column ${column} ${type}`);
     }
   }
+}
+
+function isTerminalStatus(status: AgentRunStatus) {
+  return status === "completed" || status === "partial" || status === "failed" || status === "cancelled";
 }
 
 function parseJson<T>(value: unknown, fallback: T): T {

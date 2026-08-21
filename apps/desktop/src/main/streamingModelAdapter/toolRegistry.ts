@@ -196,6 +196,9 @@ function validateInputSchema(schema: JsonSchema, value: unknown, toolName: strin
   if (schema.type === "string" && typeof schema.minLength === "number" && (value as string).length < schema.minLength) {
     throw new ModelAdapterError("TOOL_INPUT_INVALID", `${toolName} 参数 ${path} 长度不能小于 ${schema.minLength}`);
   }
+  if (schema.type === "string" && typeof schema.maxLength === "number" && (value as string).length > schema.maxLength) {
+    throw new ModelAdapterError("TOOL_INPUT_INVALID", `${toolName} 参数 ${path} 长度不能大于 ${schema.maxLength}`);
+  }
   if (schema.type === "number" && typeof schema.minimum === "number" && (value as number) < schema.minimum) {
     throw new ModelAdapterError("TOOL_INPUT_INVALID", `${toolName} 参数 ${path} 不能小于 ${schema.minimum}`);
   }

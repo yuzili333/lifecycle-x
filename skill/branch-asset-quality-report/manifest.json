@@ -3,7 +3,7 @@
   "name": "branch-asset-quality-report",
   "displayName": "各分行资产质量状况分析报告",
   "description": "按一级分行统计最新风险五级分类的笔数、贷款余额、不良率和关注率，并生成匹配模板的资产质量分析报告。",
-  "version": "1.1.1",
+  "version": "1.1.3",
   "category": "credit-risk-analysis",
   "tags": [
     "信贷资产",

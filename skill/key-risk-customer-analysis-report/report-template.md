@@ -2,30 +2,24 @@
 
 ## 重点风险客户分析（含金额占比）
 
-全样本 {{sample_count}} 笔中，非正常类客户共 {{non_normal_count}} 笔（占比 {{non_normal_count_rate_display}}），其中不良类 {{nonperforming_count}} 笔、关注类 {{attention_count}} 笔。
+{{报告模型依据 sample、riskSummary、sourceFields、countBasis 和 fallbackCode 组合样本、笔数口径和金额摘要并完成格式化}}
 
-笔数口径：{{count_basis_text}}。{{data_quality_note}}
-
-【金额维度】非正常类`{{loan_balance_business_name}}`合计 {{non_normal_loan_balance_display}}（占贷款余额总额 {{non_normal_loan_balance_rate_display}}），其中“不良”类 {{nonperforming_loan_balance_display}}、“关注”类 {{attention_loan_balance_display}}。{{deterioration_summary}}
-
-| 序号 | `{{customer_name_field}}` | `{{branch_field}}` | `{{beginning_risk_field}}` | `{{latest_risk_field}}` | `{{risk_result_field}}` | `{{guarantee_method_field}}` | `{{industry_field}}` | `{{business_product_field}}` | `{{loan_term_field}}` | `{{loan_balance_business_name}}({{amount_unit_label}})` | `{{contract_amount_business_name}}({{amount_unit_label}})` | 占总额% |
-|---|---|---|---|---|---|---|---|---|---|---:|---:|---:|
-{{risk_customer_rows}}
+| 序号 | 客户名称 | 一级分行 | 年初风险分类 | 最新风险分类 | 最新风险分类结果 | 主要担保方式名称 | 国标行业投向名称 | 业务品种名称 | 短中长期贷款标识 | 贷款余额(万) | 合同金额(万) | 占总额% |
+|---:|---|---|---|---|---|---|---|---|---|---:|---:|---:|
+{{报告模型按 riskCustomers 顺序格式化全部重点风险合同，缺失辅助字段展示 --}}
 
 ## 重点风险客户特征分析
 
-（1）{{business_term_summary}}
+（1）{{依据 loanTermDistribution 撰写业务期限特征}}
 
-（2）{{nonperforming_summary}}
+（2）{{依据 riskSummary 说明不良合同，并从 riskCustomers 选取 riskGroup=nonperforming 的全部记录生成下表}}
 
-{{#if_nonperforming_customers}}
-| `{{customer_name_field}}` | `{{branch_field}}` | `{{guarantee_method_field}}` | `{{industry_field}}` | `{{loan_balance_business_name}}({{amount_unit_label}})` |
+| 客户名称 | 一级分行 | 主要担保方式名称 | 国标行业投向名称 | 贷款余额(万) |
 |---|---|---|---|---:|
-{{nonperforming_customer_rows}}
-{{/if_nonperforming_customers}}
+{{全部不良合同；无不良时省略表格}}
 
-（3）{{attention_summary}}
+（3）{{依据 riskSummary 和关注合同明细撰写关注特征}}
 
-{{#if_migration_summary}}（4）{{migration_summary}}{{/if_migration_summary}}
+{{deteriorationCount 非空时生成第（4）项风险迁徙结论}}
 
-（5）{{distribution_summary}}
+（5）{{依据 industryDistribution 和 provinceDistribution 撰写分布特征}}

@@ -2,7 +2,7 @@ import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import type { AgentProgressEvent, AgentRunRecord } from "./agentOrchestration";
-import { AgentProgressPanel, formatDurationMs, isActiveAgentRun, shouldShowMessageMetadataStatus } from "../renderer/src/DataAssistantWorkspace";
+import { AgentProgressPanel, formatDurationMs, formatStoppedMessageFromActiveDuration, isActiveAgentRun, shouldShowMessageMetadataStatus } from "../renderer/src/DataAssistantWorkspace";
 
 describe("AgentProgressPanel", () => {
   it("renders structured progress while a run is active", () => {
@@ -15,7 +15,7 @@ describe("AgentProgressPanel", () => {
     const html = renderToStaticMarkup(<AgentProgressPanel run={run} />);
 
     expect(isActiveAgentRun(run)).toBe(true);
-    expect(html).toContain("Assistant 工作进度");
+    expect(html).toContain("工作进度");
     expect(html).toContain("执行查询和分析。");
     expect(html).toContain('data-agent-run-status="executing"');
   });
@@ -47,7 +47,8 @@ describe("AgentProgressPanel", () => {
 
     expect(isActiveAgentRun(run)).toBe(false);
     expect(formatDurationMs(125_000)).toBe("2m 5s");
-    expect(html).toContain("Assistant 工作记录");
+    expect(formatStoppedMessageFromActiveDuration(197_464)).toBe("你在 3m 17s 后停止了");
+    expect(html).toContain("工作记录");
     expect(html).toContain("本轮 1 项任务已完成。");
     expect(html).toContain("推理模型已超时，已使用 Qwen 降级计划。");
     expect(html).toContain("lucide-badge-info");
@@ -55,6 +56,22 @@ describe("AgentProgressPanel", () => {
     expect(html).not.toContain("assistant-message-status-spinner");
     expect(html).not.toContain("等待审批 45s");
     expect(shouldShowMessageMetadataStatus(true, run)).toBe(true);
+  });
+
+  it("hides a step repair notice after that step succeeds", () => {
+    const fallback = createEvent("fallback", "info", "SQL 参数修复后结构仍无效，正在进行高可靠参数生成。");
+    fallback.detail = { stepId: "query", fallbackReason: "sql_reasoning_preflight_repair" };
+    const run = createRun("executing", [
+      fallback,
+      createEvent("step_completed", "success", "SQL 查询已完成，共获得 200 条记录。", "query"),
+      createEvent("preparing_step", "running", "Python 分析：正在生成受控工具参数。", "analysis"),
+    ]);
+
+    const html = renderToStaticMarkup(<AgentProgressPanel run={run} />);
+
+    expect(html).not.toContain("SQL 参数修复后结构仍无效");
+    expect(html).toContain("SQL 查询已完成，共获得 200 条记录。");
+    expect(html).toContain("Python 分析：正在生成受控工具参数。");
   });
 });
 

@@ -1,0 +1,82 @@
+{
+  "kind": "grouped-risk-distribution-v1",
+  "fieldRoles": {
+    "group": {
+      "candidates": [
+        "主要担保方式名称",
+        "担保方式名称",
+        "主要担保方式"
+      ]
+    },
+    "risk": {
+      "candidates": [
+        "最新风险五级分类",
+        "风险五级分类",
+        "五级分类"
+      ]
+    },
+    "amount": {
+      "candidates": [
+        "贷款余额",
+        "贷款余额(万元)",
+        "贷款余额（万元）",
+        "贷款余额(万)",
+        "贷款余额（万）",
+        "贷款余额(元)",
+        "贷款余额（元）",
+        "贷款余额(亿元)",
+        "贷款余额（亿元）"
+      ]
+    },
+    "recordId": {
+      "candidates": [
+        "合同流水号"
+      ]
+    }
+  },
+  "groupOrder": [
+    "保证",
+    "信用",
+    "其他",
+    "抵押",
+    "质押"
+  ],
+  "groupRules": [
+    {
+      "label": "质押",
+      "keywords": ["保证金"]
+    },
+    {
+      "label": "抵押",
+      "keywords": ["抵押"]
+    },
+    {
+      "label": "质押",
+      "keywords": ["质押"]
+    },
+    {
+      "label": "保证",
+      "keywords": ["保证", "担保"]
+    },
+    {
+      "label": "信用",
+      "keywords": ["信用"]
+    }
+  ],
+  "riskRules": {
+    "normal": ["正常"],
+    "attention": ["关注"],
+    "nonperforming": ["不良", "次级", "可疑", "损失"]
+  },
+  "output": {
+    "distributionKey": "guaranteeMethodDistribution",
+    "groupLabelKey": "guaranteeMethod",
+    "specialMetrics": [
+      {
+        "key": "professionalGuaranteeNonperformingCount",
+        "groupSourceContains": "专业担保公司保证",
+        "risk": "nonperforming"
+      }
+    ]
+  }
+}

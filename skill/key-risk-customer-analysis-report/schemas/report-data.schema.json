@@ -1,555 +1,97 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://cycle-probe.local/schemas/key-risk-customer-analysis-report-data.schema.json",
-  "title": "KeyRiskCustomerAnalysisReportData",
+  "title": "KeyRiskCustomerAnalysisResult",
   "type": "object",
   "additionalProperties": false,
-  "required": [
-    "dataSourceName",
-    "countBasis",
-    "countBasisField",
-    "fallbackReason",
-    "deduplicatedRecordCount",
-    "excludedRecordCount",
-    "sourceFields",
-    "totals",
-    "riskCustomers",
-    "validation",
-    "featureAnalysis",
-    "dataQualityNote"
-  ],
+  "required": ["dataSourceName", "sourceFields", "countBasis", "countBasisField", "fallbackCode", "analyzedRecordCount", "excludedRecordCount", "sample", "riskSummary", "riskCustomers", "loanTermDistribution", "industryDistribution", "provinceDistribution", "validation"],
   "properties": {
-    "dataSourceName": {
-      "type": "string",
-      "minLength": 1
-    },
-    "countBasis": {
-      "type": "string",
-      "enum": [
-        "contract_serial",
-        "valid_rows"
-      ]
-    },
-    "countBasisField": {
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "fallbackReason": {
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "deduplicatedRecordCount": {
-      "type": "integer",
-      "minimum": 0
-    },
-    "excludedRecordCount": {
-      "type": "integer",
-      "minimum": 0
-    },
+    "dataSourceName": { "type": "string", "minLength": 1 },
     "sourceFields": {
       "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "customerName",
-        "latestRiskClassification",
-        "loanBalance",
-        "loanBalanceSourceUnit",
-        "loanBalanceBusinessName",
-        "amountDisplayUnit"
-      ],
-      "properties": {
-        "contractSerial": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "customerName": {
-          "type": "string",
-          "minLength": 1
-        },
-        "branch": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "province": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "description": "省份分析采用的真实字段名称；仅允许绑定“客户所属省/市”。"
-        },
-        "beginningRiskClassification": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "latestRiskClassification": {
-          "type": "string",
-          "minLength": 1
-        },
-        "latestRiskResult": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "guaranteeMethod": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "industryName": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "description": "行业分析采用的真实字段名称；仅允许绑定“国标行业投向名称”。"
-        },
-        "businessProduct": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "loanTerm": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "loanBalance": {
-          "type": "string",
-          "minLength": 1
-        },
-        "loanBalanceSourceUnit": {
-          "type": "string",
-          "minLength": 1
-        },
-        "loanBalanceBusinessName": {
-          "type": "string",
-          "minLength": 1
-        },
-        "contractAmount": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "contractAmountSourceUnit": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "contractAmountBusinessName": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "amountDisplayUnit": {
-          "const": "万",
-          "description": "风险客户表中的贷款余额和合同金额统一换算为万展示。"
-        }
-      }
+      "additionalProperties": { "type": ["string", "null"] },
+      "required": ["contractSerial", "customerName", "branch", "beginningRisk", "latestRisk", "riskResult", "guaranteeMethod", "province", "industry", "businessProduct", "loanTerm", "loanBalance", "contractAmount"]
     },
-    "totals": {
+    "countBasis": { "type": "string", "enum": ["contract_serial", "valid_rows"] },
+    "countBasisField": { "type": ["string", "null"] },
+    "fallbackCode": { "type": ["string", "null"], "enum": ["missing_contract_serial", "blank_contract_serial", "conflicting_contract_records", null] },
+    "analyzedRecordCount": { "type": "integer", "minimum": 0 },
+    "excludedRecordCount": { "type": "integer", "minimum": 0 },
+    "sample": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "sampleCount",
-        "normalCount",
-        "attentionCount",
-        "nonperformingCount",
-        "nonNormalCount",
-        "nonNormalCountRate",
-        "nonNormalCountRateDisplay",
-        "sampleLoanBalanceWan",
-        "sampleLoanBalanceDisplay",
-        "attentionLoanBalanceWan",
-        "attentionLoanBalanceDisplay",
-        "nonperformingLoanBalanceWan",
-        "nonperformingLoanBalanceDisplay",
-        "nonNormalLoanBalanceWan",
-        "nonNormalLoanBalanceDisplay",
-        "nonNormalLoanBalanceRate",
-        "nonNormalLoanBalanceRateDisplay",
-        "deteriorationCount",
-        "deteriorationRate",
-        "deteriorationRateDisplay"
-      ],
+      "required": ["count", "loanBalance"],
       "properties": {
-        "sampleCount": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "normalCount": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "attentionCount": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "nonperformingCount": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "nonNormalCount": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "nonNormalCountRate": {
-          "type": [
-            "number",
-            "null"
-          ],
-          "minimum": 0,
-          "maximum": 1
-        },
-        "nonNormalCountRateDisplay": {
-          "$ref": "#/$defs/percentageDisplay"
-        },
-        "sampleLoanBalanceWan": {
-          "type": "number"
-        },
-        "sampleLoanBalanceDisplay": {
-          "type": "string",
-          "minLength": 1
-        },
-        "attentionLoanBalanceWan": {
-          "type": "number"
-        },
-        "attentionLoanBalanceDisplay": {
-          "type": "string",
-          "minLength": 1
-        },
-        "nonperformingLoanBalanceWan": {
-          "type": "number"
-        },
-        "nonperformingLoanBalanceDisplay": {
-          "type": "string",
-          "minLength": 1
-        },
-        "nonNormalLoanBalanceWan": {
-          "type": "number"
-        },
-        "nonNormalLoanBalanceDisplay": {
-          "type": "string",
-          "minLength": 1
-        },
-        "nonNormalLoanBalanceRate": {
-          "type": [
-            "number",
-            "null"
-          ],
-          "minimum": 0,
-          "maximum": 1
-        },
-        "nonNormalLoanBalanceRateDisplay": {
-          "$ref": "#/$defs/percentageDisplay"
-        },
-        "deteriorationCount": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "minimum": 0
-        },
-        "deteriorationRate": {
-          "type": [
-            "number",
-            "null"
-          ],
-          "minimum": 0,
-          "maximum": 1
-        },
-        "deteriorationRateDisplay": {
-          "$ref": "#/$defs/percentageDisplay"
-        }
+        "count": { "type": "integer", "minimum": 0 },
+        "loanBalance": { "type": "number", "minimum": 0 }
       }
     },
-    "riskCustomers": {
-      "type": "array",
-      "description": "全部且仅有的关注及不良合同，按不良优先、同类贷款余额降序稳定排列；禁止 Top N 截断。",
-      "items": {
-        "$ref": "#/$defs/riskCustomer"
+    "riskSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["nonNormalCount", "nonNormalCountShare", "attentionCount", "nonperformingCount", "nonNormalLoanBalance", "nonNormalLoanBalanceShare", "attentionLoanBalance", "nonperformingLoanBalance", "deteriorationCount"],
+      "properties": {
+        "nonNormalCount": { "type": "integer", "minimum": 0 },
+        "nonNormalCountShare": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+        "attentionCount": { "type": "integer", "minimum": 0 },
+        "nonperformingCount": { "type": "integer", "minimum": 0 },
+        "nonNormalLoanBalance": { "type": "number", "minimum": 0 },
+        "nonNormalLoanBalanceShare": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+        "attentionLoanBalance": { "type": "number", "minimum": 0 },
+        "nonperformingLoanBalance": { "type": "number", "minimum": 0 },
+        "deteriorationCount": { "type": ["integer", "null"], "minimum": 0 }
       }
     },
+    "riskCustomers": { "type": "array", "items": { "$ref": "#/$defs/riskCustomer" } },
+    "loanTermDistribution": { "type": "array", "items": { "$ref": "#/$defs/featureItem" } },
+    "industryDistribution": { "type": "array", "items": { "$ref": "#/$defs/featureItem" } },
+    "provinceDistribution": { "type": "array", "items": { "$ref": "#/$defs/featureItem" } },
     "validation": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "sampleCount",
-        "riskCustomerCount",
-        "riskCustomerRows",
-        "countReconciled",
-        "balanceReconciled",
-        "sharesReconciled",
-        "sequenceContinuous",
-        "nonperformingDetailsReconciled"
-      ],
+      "required": ["sampleReconciled", "riskCustomerCountReconciled", "amountReconciled", "sequenceContinuous"],
       "properties": {
-        "sampleCount": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "riskCustomerCount": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "riskCustomerRows": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "countReconciled": {
-          "const": true,
-          "description": "全样本、关注、不良、非正常笔数及风险客户明细行数完全一致。"
-        },
-        "balanceReconciled": {
-          "const": true,
-          "description": "风险客户逐行贷款余额、关注余额、不良余额和非正常余额在 Decimal 精度下完全一致。"
-        },
-        "sharesReconciled": {
-          "const": true,
-          "description": "所有金额占比均采用全样本贷款余额作为同一分母。"
-        },
-        "sequenceContinuous": {
-          "const": true,
-          "description": "风险客户表序号从 1 开始连续，且每行字段来自同一合同记录。"
-        },
-        "nonperformingDetailsReconciled": {
-          "const": true,
-          "description": "特征分析中的不良客户表包含全部且仅有的不良合同，行数和贷款余额与不良类汇总一致。"
-        }
+        "sampleReconciled": { "const": true },
+        "riskCustomerCountReconciled": { "const": true },
+        "amountReconciled": { "const": true },
+        "sequenceContinuous": { "const": true }
       }
-    },
-    "featureAnalysis": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "businessTermSummary",
-        "nonperformingSummary",
-        "nonperformingCustomers",
-        "attentionSummary",
-        "migrationSummary",
-        "distributionSummary"
-      ],
-      "properties": {
-        "businessTermSummary": {
-          "type": "string",
-          "minLength": 1
-        },
-        "nonperformingSummary": {
-          "type": "string",
-          "minLength": 1
-        },
-        "nonperformingCustomers": {
-          "type": "array",
-          "description": "全部且仅有的不良合同，用于特征分析第（2）项 Markdown 表格；顺序与风险客户主表中的不良记录一致。",
-          "items": {
-            "$ref": "#/$defs/nonperformingCustomer"
-          }
-        },
-        "attentionSummary": {
-          "type": "string",
-          "minLength": 1
-        },
-        "migrationSummary": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "distributionSummary": {
-          "type": "string",
-          "minLength": 1
-        }
-      }
-    },
-    "dataQualityNote": {
-      "type": [
-        "string",
-        "null"
-      ],
-      "description": "仅在辅助字段缺失、记录排除或笔数口径降级时提供的一句说明。"
     }
   },
   "$defs": {
-    "percentageDisplay": {
-      "type": "string",
-      "pattern": "^(--|\\d+\\.\\d{2}%)$"
-    },
-    "nonperformingCustomer": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "customerName",
-        "branchName",
-        "guaranteeMethod",
-        "industryName",
-        "loanBalanceWan",
-        "loanBalanceDisplay"
-      ],
-      "properties": {
-        "customerName": {
-          "type": "string",
-          "minLength": 1
-        },
-        "branchName": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "guaranteeMethod": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "industryName": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "loanBalanceWan": {
-          "type": "number"
-        },
-        "loanBalanceDisplay": {
-          "type": "string",
-          "minLength": 1
-        }
-      }
-    },
     "riskCustomer": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "sequence",
-        "customerName",
-        "branchName",
-        "provinceName",
-        "beginningRiskClassification",
-        "latestRiskClassification",
-        "latestRiskResult",
-        "guaranteeMethod",
-        "industryName",
-        "businessProduct",
-        "loanTerm",
-        "loanBalanceWan",
-        "loanBalanceDisplay",
-        "contractAmountWan",
-        "contractAmountDisplay",
-        "loanBalanceShare",
-        "loanBalanceShareDisplay"
-      ],
+      "required": ["sequence", "riskGroup", "contractSerial", "customerName", "branch", "beginningRisk", "latestRisk", "riskResult", "guaranteeMethod", "province", "industry", "businessProduct", "loanTerm", "loanBalance", "contractAmount", "loanBalanceShare"],
       "properties": {
-        "sequence": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "customerName": {
-          "type": "string",
-          "minLength": 1
-        },
-        "branchName": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "provinceName": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "description": "仅从当前合同记录的“客户所属省/市”字段读取，不根据其他文本推断。"
-        },
-        "beginningRiskClassification": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "latestRiskClassification": {
-          "type": "string",
-          "enum": [
-            "关注",
-            "不良"
-          ]
-        },
-        "latestRiskResult": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "guaranteeMethod": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "industryName": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "businessProduct": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "loanTerm": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "loanBalanceWan": {
-          "type": "number"
-        },
-        "loanBalanceDisplay": {
-          "type": "string",
-          "minLength": 1,
-          "description": "以万为单位、带千分位的表格展示值。"
-        },
-        "contractAmountWan": {
-          "type": [
-            "number",
-            "null"
-          ]
-        },
-        "contractAmountDisplay": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "loanBalanceShare": {
-          "type": [
-            "number",
-            "null"
-          ],
-          "minimum": 0,
-          "maximum": 1
-        },
-        "loanBalanceShareDisplay": {
-          "$ref": "#/$defs/percentageDisplay"
-        }
+        "sequence": { "type": "integer", "minimum": 1 },
+        "riskGroup": { "type": "string", "enum": ["attention", "nonperforming"] },
+        "contractSerial": { "type": ["string", "null"] },
+        "customerName": { "type": "string", "minLength": 1 },
+        "branch": { "type": ["string", "null"] },
+        "beginningRisk": { "type": ["string", "null"] },
+        "latestRisk": { "type": "string", "minLength": 1 },
+        "riskResult": { "type": ["string", "null"] },
+        "guaranteeMethod": { "type": ["string", "null"] },
+        "province": { "type": ["string", "null"] },
+        "industry": { "type": ["string", "null"] },
+        "businessProduct": { "type": ["string", "null"] },
+        "loanTerm": { "type": ["string", "null"] },
+        "loanBalance": { "type": "number", "minimum": 0 },
+        "contractAmount": { "type": ["number", "null"], "minimum": 0 },
+        "loanBalanceShare": { "type": ["number", "null"], "minimum": 0, "maximum": 1 }
+      }
+    },
+    "featureItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "attentionCount", "nonperformingCount", "totalCount", "loanBalance"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "attentionCount": { "type": "integer", "minimum": 0 },
+        "nonperformingCount": { "type": "integer", "minimum": 0 },
+        "totalCount": { "type": "integer", "minimum": 0 },
+        "loanBalance": { "type": "number", "minimum": 0 }
       }
     }
   }

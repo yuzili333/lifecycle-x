@@ -10,6 +10,7 @@ import { LocalSkillManager } from "./LocalSkillManager";
 import { asSkillOperationError, SkillError } from "./SkillError";
 import { validateSkillDirectory } from "./SkillPackageValidator";
 import { SkillStateStore } from "./SkillStateStore";
+import { compactSkillResultContract } from "./SkillResultValidator";
 
 const temporaryDirectories: string[] = [];
 
@@ -57,6 +58,32 @@ function writeSkillPackage(
 }
 
 describe("Skill package validation", () => {
+  it("uses a compact Python contract across built-in report skills", async () => {
+    const skillRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../../../../skill");
+    const skillIds = [
+      "overall-risk-distribution-report",
+      "branch-asset-quality-report",
+      "key-risk-customer-analysis-report",
+      "guarantee-method-risk-distribution-report",
+    ];
+    const instructions = await Promise.all(skillIds.map((skillId) => readFile(join(skillRoot, skillId, "SKILL.md"), "utf8")));
+
+    for (const content of instructions) {
+      expect(content).toContain("## 目标与字段");
+      expect(content).toContain("## 统计口径");
+      expect(content).toContain("## 工具职责");
+      expect(content.indexOf("## 目标与字段")).toBeLessThan(content.indexOf("## 统计口径"));
+      expect(content.indexOf("## 统计口径")).toBeLessThan(content.indexOf("## 工具职责"));
+      expect(content).toContain("统一的紧凑统计脚本约束");
+      expect(content).not.toMatch(/脚本目标不超过\s*[\d,]+\s*个字符/);
+      expect(content).toMatch(/Python 禁止(?:生成|输出) Markdown|不输出 Markdown/);
+      const pythonInstructions = content.match(/### Python 工具\s+([\s\S]*?)\s+### (?:报告模型|图表工具)/)?.[1] ?? "";
+      expect(pythonInstructions.length).toBeGreaterThan(0);
+      expect(pythonInstructions.length).toBeLessThan(900);
+      expect(pythonInstructions).not.toContain("顶层 `result` 仅包含");
+    }
+  });
+
   it("loads the built-in overall risk distribution report without legacy field mappings", async () => {
     const root = resolve(
       dirname(fileURLToPath(import.meta.url)),
@@ -79,7 +106,7 @@ describe("Skill package validation", () => {
     expect(validated.loaded.summary).toMatchObject({
       skillId: "overall-risk-distribution-report",
       displayName: "整体风险分类分布分析报告",
-      version: "1.0.7",
+      version: "1.0.9",
       origin: "system",
       enabled: true,
       canToggle: false,
@@ -91,24 +118,17 @@ describe("Skill package validation", () => {
       "request_chart_rendering",
       "request_markdown_report_generation",
     ]);
-    expect(validated.loaded.reportTemplate).toContain("`{{loan_balance_field_name}}`");
-    expect(validated.loaded.reportTemplate).toContain("{{loan_balance_display}}{{contract_amount_clause}}");
-    expect(validated.loaded.instructions).toContain("10,000万元 = 1亿元");
-    expect(validated.loaded.instructions).toContain("固定保留小数点后三位");
-    expect(validated.loaded.instructions).toContain("换算结果前不添加“约”");
-    expect(validated.loaded.instructions).toContain("`合同金额`合计 {{contract_amount_display}}");
-    expect(validated.loaded.instructions).toContain("`riskResultDistribution[].loanBalanceDisplay`");
-    expect(validated.loaded.instructions).toContain("`chartType` 使用 `pie`");
-    expect(validated.loaded.instructions).toContain("每个扇面必须可见展示该分类笔数与占总笔数比例");
-    expect(validated.loaded.instructions).toContain("Y 轴标题统一使用“贷款余额（万元）”");
-    expect(validated.loaded.instructions).toContain("字段名称中的中英文括号和单位必须完整包含在字符串引号内");
-    expect(validated.loaded.instructions).toContain("金额占比应先执行 `Decimal / Decimal`");
-    expect(JSON.stringify(validated.loaded.outputSchema)).toContain("loanBalanceInYi");
-    expect(JSON.stringify(validated.loaded.outputSchema)).toContain("contractAmountInYi");
-    expect(JSON.stringify(validated.loaded.outputSchema)).toContain("loanBalanceDisplay");
-    expect(JSON.stringify(validated.loaded.outputSchema)).toContain("contractAmountDisplay");
-    expect(JSON.stringify(validated.loaded.outputSchema)).toContain("contractAmountClause");
-    expect(JSON.stringify(validated.loaded.outputSchema)).toContain("固定三位小数的亿元值");
+    expect(validated.loaded.reportTemplate).toContain("fiveLevelDistribution");
+    expect(validated.loaded.reportTemplate).toContain("nonperformingSummary");
+    expect(validated.loaded.instructions).toContain("万元除以 `10,000`");
+    expect(validated.loaded.instructions).toContain("Python 禁止生成 Markdown");
+    expect(validated.loaded.instructions).toContain("报告模型");
+    expect(validated.loaded.instructions).toContain("五级分类笔数饼图");
+    const outputSchemaText = JSON.stringify(validated.loaded.outputSchema);
+    expect(outputSchemaText).toContain("fiveLevelDistribution");
+    expect(outputSchemaText).toContain("nonperformingSummary");
+    expect(outputSchemaText).toContain("loanBalanceShare");
+    expect(outputSchemaText).not.toMatch(/Display|conclusions|Markdown|Clause|dataQuality/i);
     expect(packageText.join("\n")).not.toMatch(
       /overall-risk-classification-distribution|latest_five_level_risk|latest_risk_result|loan_balance_10k|contract_amount_10k|businessFieldId|十二级分类/,
     );
@@ -147,7 +167,7 @@ describe("Skill package validation", () => {
     expect(validated.loaded.summary).toMatchObject({
       skillId: "branch-asset-quality-report",
       displayName: "各分行资产质量状况分析报告",
-      version: "1.1.1",
+      version: "1.1.3",
       origin: "system",
       enabled: true,
       canToggle: false,
@@ -159,25 +179,18 @@ describe("Skill package validation", () => {
       "request_markdown_report_generation",
     ]);
     expect(validated.loaded.requiredTools).not.toContain("request_chart_rendering");
-    expect(validated.loaded.instructions).toContain("不良：源值“不良”，或次级、可疑、损失合计");
-    expect(validated.loaded.instructions).toContain("全行平均率必须使用全量分子除以全量分母计算");
+    expect(validated.loaded.instructions).toContain("不良包含源值“不良”、次级、可疑、损失");
+    expect(validated.loaded.instructions).toContain("全行平均率使用所有分行全量分子除以全量分母");
     expect(validated.loaded.instructions).toContain("按合同流水号去重");
-    expect(validated.loaded.reportTemplate).toContain("{{branch_distribution_rows}}");
-    expect(validated.loaded.reportTemplate).toContain("{{numbered_conclusions}}");
-    expect(validated.loaded.reportTemplate).toContain("正常({{amount_unit_label}})");
-    expect(validated.loaded.reportTemplate).toContain("合计({{amount_unit_label}}) | 不良率% | 关注率%");
-    expect(validated.loaded.reportTemplate).not.toContain("{{amount_business_name}}");
-    expect(validated.loaded.reportTemplate).not.toContain("正常(`{{loan_balance_business_name}}`");
-    expect(validated.loaded.instructions).toContain("默认金额指标为贷款余额，报告展示单位为 `万`");
-    expect(validated.loaded.instructions).toContain("第 12、13 列分别渲染金额不良率和金额关注率");
-    expect(validated.loaded.instructions).toContain("所有对账完成前禁止转换为 `float`");
-    expect(validated.loaded.instructions).toContain("禁止使用 `sum(branch[\"totalBalance\"])`");
-    expect(validated.loaded.instructions).toContain("禁止读取 `branchDistribution[0]`");
-    expect(JSON.stringify(validated.loaded.outputSchema)).toContain("nonperformingBalanceRate");
-    expect(JSON.stringify(validated.loaded.outputSchema)).toContain("attentionBalanceRate");
-    expect(JSON.stringify(validated.loaded.outputSchema)).toContain("normalBalanceDisplay");
-    expect(JSON.stringify(validated.loaded.outputSchema)).toContain("amountDisplayUnit");
-    expect(JSON.stringify(validated.loaded.outputSchema)).toContain("nonperformingCountRateDisplay");
+    expect(validated.loaded.reportTemplate).toContain("branchDistribution");
+    expect(validated.loaded.reportTemplate).toContain("金额不良率% | 金额关注率%");
+    expect(validated.loaded.instructions).toContain("Python 禁止生成 Markdown");
+    expect(validated.loaded.instructions).toContain("报告模型");
+    const outputSchemaText = JSON.stringify(validated.loaded.outputSchema);
+    expect(outputSchemaText).toContain("branchDistribution");
+    expect(outputSchemaText).toContain("nonperformingRate");
+    expect(outputSchemaText).toContain("amountSourceUnit");
+    expect(outputSchemaText).not.toMatch(/Display|conclusions|Markdown|dataQuality/i);
     expect(packageText.join("\n")).not.toMatch(
       /latest_five_level_risk|loan_balance_10k|businessFieldId|十二级分类/,
     );
@@ -188,6 +201,113 @@ describe("Skill package validation", () => {
     });
     expect(await manager.list("user-1")).toContainEqual(expect.objectContaining({
       skillId: "branch-asset-quality-report",
+      origin: "system",
+      availability: "ready",
+      enabled: true,
+    }));
+  });
+
+  it("loads the built-in guarantee method risk distribution report without template example values", async () => {
+    const root = resolve(
+      dirname(fileURLToPath(import.meta.url)),
+      "../../../../../skill/guarantee-method-risk-distribution-report",
+    );
+    const validated = await validateSkillDirectory({
+      root,
+      origin: "system",
+      traceId: "trace-guarantee-method-risk",
+    });
+    const packageText = await Promise.all([
+      "manifest.json",
+      "SKILL.md",
+      "report-template.md",
+      "schemas/skill-input.schema.json",
+      "schemas/report-data.schema.json",
+      "tool-policy.json",
+      "analysis-recipe.json",
+    ].map((relativePath) => readFile(join(root, relativePath), "utf8")));
+
+    expect(validated.loaded.summary).toMatchObject({
+      skillId: "guarantee-method-risk-distribution-report",
+      displayName: "担保方式风险分布分析报告",
+      version: "1.2.0",
+      origin: "system",
+      enabled: true,
+      canToggle: false,
+      canDelete: false,
+    });
+    expect(validated.loaded.requiredTools).toEqual([
+      "request_sql_query_execution",
+      "request_python_analysis_execution",
+      "request_markdown_report_generation",
+    ]);
+    expect(validated.loaded.requiredTools).not.toContain("request_chart_rendering");
+    expect(validated.loaded.instructions).toContain("主要担保方式名称");
+    expect(validated.loaded.instructions).toContain("保证金→质押");
+    expect(validated.loaded.instructions).toContain("不良包含源值“不良”、次级、可疑、损失");
+    expect(validated.loaded.instructions).toContain("按合同流水号去重");
+    expect(validated.loaded.instructions).toContain("本模板只生成统计表和分析结论，不生成图表");
+    expect(validated.loaded.instructions).toContain("## 目标与字段");
+    expect(validated.loaded.instructions).toContain("## 统计口径");
+    expect(validated.loaded.instructions).toContain("## 工具职责");
+    expect(validated.loaded.instructions).toContain("### SQL 工具");
+    expect(validated.loaded.instructions).toContain("只执行查询脚本并返回查询结果");
+    expect(validated.loaded.instructions).toContain("### Python 工具");
+    expect(validated.loaded.instructions).toContain("只执行统计脚本并输出计算结果");
+    expect(validated.loaded.instructions).toContain("只读统计配方");
+    expect(validated.loaded.instructions).toContain("执行模型不得重新编写、扩展或修复整段统计程序");
+    expect(validated.loaded.instructions).toContain("专业担保公司保证不良数");
+    expect(validated.loaded.analysisRecipe).toMatchObject({
+      kind: "grouped-risk-distribution-v1",
+      output: { distributionKey: "guaranteeMethodDistribution" },
+    });
+    expect(validated.loaded.instructions).toContain("不负责字段发现");
+    expect(validated.loaded.instructions).toContain("不得退回模型生成完整脚本");
+    expect(validated.loaded.instructions).not.toContain("顶层 `result` 仅包含");
+    expect(validated.loaded.instructions).not.toContain("`guaranteeMethodDistribution` 只包含");
+    expect(validated.loaded.instructions).not.toContain("## 任务与规划");
+    expect(validated.loaded.instructions).not.toContain("运行时已核验查询骨架");
+    expect(validated.loaded.instructions).not.toContain("当前步骤只调用 SQL 工具一次");
+    expect(validated.loaded.instructions).not.toContain("前三条语句必须依次为");
+    expect(validated.loaded.instructions).not.toContain("rows = json.load(sys.stdin)");
+    expect(validated.loaded.instructions).not.toContain("print(json.dumps(result");
+    expect(validated.loaded.instructions).not.toContain("当前步骤只调用 Python 工具一次");
+    expect(validated.loaded.instructions).not.toContain("sourceRowCount = len(rows)");
+    expect(validated.loaded.instructions).not.toContain("失败立即抛出 `ValueError`");
+    expect(validated.loaded.instructions).toContain("### 报告模型");
+    expect(validated.loaded.instructions).toContain("Python 禁止生成 Markdown");
+    expect(validated.loaded.instructions).toContain("Python 统计结果契约");
+    expect(validated.loaded.instructions).not.toContain("## 参数生成契约");
+    expect(validated.loaded.instructions).not.toContain("表别名固定为 `T1`");
+    expect(validated.loaded.reportTemplate).toContain("guaranteeMethodDistribution");
+    expect(validated.loaded.reportTemplate).toContain("| 担保方式 | 正常 | 关注 | 不良 | 合计 | 笔数不良率% | 笔数关注率%");
+    expect(validated.loaded.reportTemplate).toContain("金额不良率% | 金额关注率%");
+    expect(validated.loaded.reportTemplate).toContain("overall");
+    const outputSchemaText = JSON.stringify(validated.loaded.outputSchema);
+    expect(outputSchemaText).toContain("guaranteeMethodDistribution");
+    expect(outputSchemaText).toContain("categorySetReconciled");
+    expect(outputSchemaText).toContain("professionalGuaranteeNonperformingCount");
+    expect(outputSchemaText).toContain("sourceRowCount");
+    expect(outputSchemaText).not.toMatch(/Display|conclusions|Markdown|dataQuality/i);
+    const pythonResultContract = compactSkillResultContract(validated.loaded.outputSchema!);
+    expect(pythonResultContract).toContain('"guaranteeMethodDistribution"');
+    expect(pythonResultContract).toContain('"professionalGuaranteeNonperformingCount":integer');
+    expect(pythonResultContract.length).toBeLessThan(outputSchemaText.length);
+    const pythonInstructions = validated.loaded.instructions.match(/### Python 工具\s+([\s\S]*?)\s+### 报告模型/)?.[1] ?? "";
+    expect(pythonInstructions.length).toBeGreaterThan(0);
+    expect(pythonInstructions.length).toBeLessThan(700);
+    expect(validated.loaded.instructions.length).toBeLessThan(3_000);
+    expect(outputSchemaText.length).toBeLessThan(6_000);
+    expect(packageText.join("\n")).not.toMatch(
+      /latest_five_level_risk|loan_balance_10k|businessFieldId|十二级分类|336,080|345,340|925,520/,
+    );
+
+    const manager = new LocalSkillManager({
+      userDataRoot: temporaryDirectory("skill-guarantee-method-catalog-"),
+      systemRoot: resolve(root, ".."),
+    });
+    expect(await manager.list("user-1")).toContainEqual(expect.objectContaining({
+      skillId: "guarantee-method-risk-distribution-report",
       origin: "system",
       availability: "ready",
       enabled: true,
@@ -216,7 +336,7 @@ describe("Skill package validation", () => {
     expect(validated.loaded.summary).toMatchObject({
       skillId: "key-risk-customer-analysis-report",
       displayName: "重点风险客户分析报告",
-      version: "1.1.0",
+      version: "1.1.2",
       origin: "system",
       enabled: true,
       canToggle: false,
@@ -228,27 +348,26 @@ describe("Skill package validation", () => {
       "request_markdown_report_generation",
     ]);
     expect(validated.loaded.requiredTools).not.toContain("request_chart_rendering");
-    expect(validated.loaded.instructions).toContain("重点风险客户指最新风险分类为关注或不良");
-    expect(validated.loaded.instructions).toContain("不得先按最新风险分类过滤");
+    expect(validated.loaded.instructions).toContain("重点风险客户是最新风险分类为关注或不良");
+    expect(validated.loaded.instructions).toContain("不能先筛选关注或不良");
     expect(validated.loaded.instructions).toContain("按合同流水号去重");
     expect(validated.loaded.instructions).toContain("同一客户存在多笔合同时不合并为一个客户");
     expect(validated.loaded.instructions).toContain("10,000万 = 1亿");
-    expect(validated.loaded.instructions).toContain("“省份”对应当前数据源中的真实字段“客户所属省/市”");
-    expect(validated.loaded.instructions).toContain("“行业”对应当前数据源中的真实字段“国标行业投向名称”");
-    expect(validated.loaded.instructions).toContain("不得根据分行名称、客户名称或地址文本推断省份");
+    expect(validated.loaded.instructions).toContain("“省份”对应真实字段“客户所属省/市”");
+    expect(validated.loaded.instructions).toContain("“行业”对应真实字段“国标行业投向名称”");
+    expect(validated.loaded.instructions).toContain("不得根据分行、客户名称或地址推断省份");
     expect(validated.loaded.instructions).toContain("禁止 Top N 截断");
-    expect(validated.loaded.instructions).toContain("表格行数必须与不良笔数一致");
-    expect(validated.loaded.reportTemplate).toContain("{{risk_customer_rows}}");
-    expect(validated.loaded.reportTemplate).toContain("{{nonperforming_customer_rows}}");
-    expect(validated.loaded.reportTemplate).toContain("| `{{customer_name_field}}` | `{{branch_field}}`");
-    expect(validated.loaded.reportTemplate).toContain("{{non_normal_loan_balance_display}}");
-    expect(JSON.stringify(validated.loaded.outputSchema)).toContain("nonNormalCountRate");
-    expect(JSON.stringify(validated.loaded.outputSchema)).toContain("loanBalanceShare");
-    expect(JSON.stringify(validated.loaded.outputSchema)).toContain("deteriorationCount");
-    expect(JSON.stringify(validated.loaded.outputSchema)).toContain("provinceName");
-    expect(JSON.stringify(validated.loaded.outputSchema)).toContain("sequenceContinuous");
-    expect(JSON.stringify(validated.loaded.outputSchema)).toContain("nonperformingCustomers");
-    expect(JSON.stringify(validated.loaded.outputSchema)).toContain("nonperformingDetailsReconciled");
+    expect(validated.loaded.instructions).toContain("不良合同表行数必须与计算结果中的不良笔数一致");
+    expect(validated.loaded.instructions).toContain("Python 禁止生成 Markdown");
+    expect(validated.loaded.reportTemplate).toContain("riskCustomers");
+    expect(validated.loaded.reportTemplate).toContain("industryDistribution");
+    const outputSchemaText = JSON.stringify(validated.loaded.outputSchema);
+    expect(outputSchemaText).toContain("nonNormalCountShare");
+    expect(outputSchemaText).toContain("loanBalanceShare");
+    expect(outputSchemaText).toContain("deteriorationCount");
+    expect(outputSchemaText).toContain("provinceDistribution");
+    expect(outputSchemaText).toContain("sequenceContinuous");
+    expect(outputSchemaText).not.toMatch(/Display|conclusions|Markdown|SummaryText|dataQuality/i);
     expect(packageText.join("\n")).not.toMatch(
       /福建墨砾|大连财神岛|山西全球蛙|latest_five_level_risk|latest_risk_result|loan_balance_10k|contract_amount_10k|businessFieldId|十二级分类/,
     );

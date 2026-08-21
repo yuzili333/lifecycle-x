@@ -21,7 +21,7 @@ export const KIMI_THINKING_PROFILES: Record<KimiThinkingProfileName, ModelReques
 export const QWEN_EXECUTION_PROFILES: Record<QwenExecutionProfileName, ModelRequestProfile> = {
   router: { enableThinking: false, stream: true, temperature: 0, maxTokens: 800 },
   sql: { enableThinking: false, stream: false, temperature: 0, maxTokens: 4_096 },
-  python: { enableThinking: false, stream: false, temperature: 0.1, maxTokens: 8_192 },
+  python: { enableThinking: false, stream: false, temperature: 0, maxTokens: 8_192 },
   chart: { enableThinking: false, stream: false, temperature: 0, maxTokens: 4_096 },
   report: { enableThinking: false, stream: true, temperature: 0.2, maxTokens: 12_000 },
 };

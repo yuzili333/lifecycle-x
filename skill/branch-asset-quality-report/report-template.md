@@ -2,14 +2,13 @@
 
 ## 各分行资产质量状况（笔数+金额）
 
-按 `{{branch_field_name}}` 维度统计 `{{five_level_field_name}}` 分布，下表同时展示笔数和金额双维度指标。
+{{报告模型依据 sourceFields、countBasis 和 fallbackCode 组合真实字段、金额单位及笔数口径说明}}
 
-笔数口径：{{count_basis_text}}。{{data_quality_note}}
-
-| 分行 | 正常 | 关注 | 不良 | 合计 | 不良率% | 关注率% | 正常({{amount_unit_label}}) | 关注({{amount_unit_label}}) | 不良({{amount_unit_label}}) | 合计({{amount_unit_label}}) | 不良率% | 关注率% |
+| 一级分行名称 | 正常 | 关注 | 不良 | 合计 | 笔数不良率% | 笔数关注率% | 正常(万) | 关注(万) | 不良(万) | 合计(万) | 金额不良率% | 金额关注率% |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-{{branch_distribution_rows}}
+{{报告模型按 branchDistribution 顺序格式化全部分行}}
+{{报告模型格式化 overall 全行合计}}
 
 ## 分析结论
 
-{{numbered_conclusions}}
+{{报告模型依据 branchDistribution 和 overall 组合编号结论并审核分行名称、数值和排序一致性，不重新计算指标}}

@@ -242,6 +242,10 @@ function formatStoppedMessageFromCreatedAt(createdAt?: string) {
   return `你在 ${formatted} 后停止了`;
 }
 
+export function formatStoppedMessageFromActiveDuration(durationMs: number) {
+  return `你在 ${formatDurationMs(durationMs)} 后停止了`;
+}
+
 function formatArtifactGeneratedAt(value: string) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) {
@@ -674,14 +678,23 @@ function agentRunActiveDuration(run: AgentRunRecord, nowMs: number) {
 }
 
 function compactAgentProgressEvents(events: AgentProgressEvent[]) {
+  const completedStepIds = new Set(events.flatMap((event) =>
+    event.phase === "step_completed" && event.status === "success" && event.stepId ? [event.stepId] : []
+  ));
   const order: string[] = [];
   const latest = new Map<string, AgentProgressEvent>();
   for (const event of events) {
+    const stepId = progressEventStepId(event);
+    if (event.phase === "fallback" && stepId && completedStepIds.has(stepId)) continue;
     const key = progressEventDisplayKey(event);
     if (!latest.has(key)) order.push(key);
     latest.set(key, event);
   }
   return order.map((key) => latest.get(key)!).filter(Boolean);
+}
+
+function progressEventStepId(event: AgentProgressEvent) {
+  return event.stepId ?? (typeof event.detail?.stepId === "string" ? event.detail.stepId : undefined);
 }
 
 function progressEventDisplayKey(event: AgentProgressEvent) {
@@ -707,7 +720,7 @@ function progressEventDisplayKey(event: AgentProgressEvent) {
   if (event.phase === "responding" || event.phase === "clarifying" || event.phase === "completed" || event.phase === "failed" || event.phase === "cancelled") {
     return "run-result";
   }
-  return `${event.phase}:${event.stepId ?? "run"}`;
+  return `${event.phase}:${progressEventStepId(event) ?? "run"}`;
 }
 
 export function AgentProgressPanel({ run }: { run: AgentRunRecord }) {
@@ -717,7 +730,7 @@ export function AgentProgressPanel({ run }: { run: AgentRunRecord }) {
     <div className="assistant-agent-progress" data-agent-run-status={run.status}>
       <div className="assistant-agent-progress-heading">
         <Icon icon={BrainCircuit} size="sm" color="inherit" />
-        <span>{active ? "Assistant 工作进度" : "Assistant 工作记录"}</span>
+        <span>{active ? "工作进度" : "工作记录"}</span>
       </div>
       <div className="assistant-agent-progress-events">
         {events.map((event) => (
@@ -1935,15 +1948,15 @@ export function DataAssistantWorkspace({
           [event.conversationId]: (current[event.conversationId] ?? []).map((attachment) =>
             attachment.attachmentId === event.attachmentId
               ? {
-                  ...attachment,
-                  status: event.phase,
-                  progressPhase: event.phase,
-                  progressPercent: event.percent,
-                  processedRows: event.processedRows,
-                  totalRows: event.totalRows,
-                  progressMessage: event.message,
-                  error: event.error,
-                }
+                ...attachment,
+                status: event.phase,
+                progressPhase: event.phase,
+                progressPercent: event.percent,
+                processedRows: event.processedRows,
+                totalRows: event.totalRows,
+                progressMessage: event.message,
+                error: event.error,
+              }
               : attachment,
           ),
         }));
@@ -2348,12 +2361,12 @@ export function DataAssistantWorkspace({
             [conversation.id]: (current[conversation.id] ?? []).map((attachment) =>
               attachment.attachmentId === localAttachment.attachmentId
                 ? {
-                    ...attachment,
-                    status,
-                    progressPhase: status === "selected" || status === "removed" ? undefined : status,
-                    progressPercent,
-                    progressMessage,
-                  }
+                  ...attachment,
+                  status,
+                  progressPhase: status === "selected" || status === "removed" ? undefined : status,
+                  progressPercent,
+                  progressMessage,
+                }
                 : attachment,
             ),
           }));
@@ -2415,12 +2428,12 @@ export function DataAssistantWorkspace({
             [conversationId!]: (current[conversationId!] ?? []).map((attachment) =>
               attachment.attachmentId === localAttachmentId
                 ? {
-                    ...attachment,
-                    status: "failed",
-                    progressPhase: "failed",
-                    progressMessage: message,
-                    error: { code: "UNKNOWN_ERROR", message },
-                  }
+                  ...attachment,
+                  status: "failed",
+                  progressPhase: "failed",
+                  progressMessage: message,
+                  error: { code: "UNKNOWN_ERROR", message },
+                }
                 : attachment,
             ),
           }));
@@ -2958,7 +2971,10 @@ export function DataAssistantWorkspace({
     }
     for (const activeMessage of activeStreamingMessages) {
       locallyStoppedMessageIdsRef.current.add(activeMessage.id);
-      const stoppedText = formatStoppedMessageFromCreatedAt(activeMessage.createdAt);
+      const agentRun = agentRunsByMessage[activeMessage.id];
+      const stoppedText = agentRun
+        ? formatStoppedMessageFromActiveDuration(agentRunActiveDuration(agentRun, Date.now()))
+        : formatStoppedMessageFromCreatedAt(activeMessage.createdAt);
       patchMessage(activeConversation.id, activeMessage.id, {
         status: "stopped",
         content: stoppedText,
@@ -2967,7 +2983,7 @@ export function DataAssistantWorkspace({
       });
       void window.lifecycleX?.assistant?.cancelMessage(activeMessage.id);
     }
-  }, [activeConversation?.id, activeStreamingMessages, patchMessage]);
+  }, [activeConversation?.id, activeStreamingMessages, agentRunsByMessage, patchMessage]);
 
   const copyMessage = useCallback(
     async (message: AssistantMessage) => {
@@ -3177,12 +3193,12 @@ export function DataAssistantWorkspace({
         const visualizationImages = format === "markdown"
           ? []
           : await prepareReportVisualizationImages({
-              userId: user.id,
-              conversationId: activeArtifactMessage.conversationId,
-              reportArtifactId: activeArtifactId,
-              reportVersion,
-              markdown,
-            });
+            userId: user.id,
+            conversationId: activeArtifactMessage.conversationId,
+            reportArtifactId: activeArtifactId,
+            reportVersion,
+            markdown,
+          });
         const result = await api.exportReport({
           userId: user.id,
           conversationId: activeArtifactMessage.conversationId,
@@ -3925,17 +3941,17 @@ export function DataAssistantWorkspace({
     const reportCardBlock =
       shouldShowReportCard && segmentId
         ? renderReportReplacementBlock(
-            message,
-            reportBlockIndex >= 0
-              ? message.blocks[reportBlockIndex]
-              : {
-                  id: `report-card-${segmentId}`,
-                  type: "markdown",
-                  content: "",
-                },
-            message.status,
-            segmentId,
-          )
+          message,
+          reportBlockIndex >= 0
+            ? message.blocks[reportBlockIndex]
+            : {
+              id: `report-card-${segmentId}`,
+              type: "markdown",
+              content: "",
+            },
+          message.status,
+          segmentId,
+        )
         : null;
 
     return (
@@ -3966,12 +3982,12 @@ export function DataAssistantWorkspace({
       guidance.type === "data_source_selection" ||
       (guidance.type === "clarification" && /(任务目标|数据任务|需要补充任务目标|想执行哪类数据任务)/i.test(guidance.title)) ||
       Boolean(requiredInputs?.length) &&
-        requiredInputs!.every((input) =>
-          input.key === "analysis_goal" ||
-          input.type === "analysis_rule" ||
-          input.key === "data_source" ||
-          input.type === "data_source"
-        )
+      requiredInputs!.every((input) =>
+        input.key === "analysis_goal" ||
+        input.type === "analysis_rule" ||
+        input.key === "data_source" ||
+        input.type === "data_source"
+      )
     );
   };
 

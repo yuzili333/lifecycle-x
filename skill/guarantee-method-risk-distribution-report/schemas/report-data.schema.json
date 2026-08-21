@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cycle-probe.local/schemas/guarantee-method-risk-distribution-report-data.schema.json",
+  "title": "GuaranteeMethodRiskDistributionAnalysisResult",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["dataSourceName", "sourceFields", "sourceRowCount", "countBasis", "countBasisField", "fallbackCode", "analyzedRecordCount", "excludedRecordCount", "guaranteeMethodDistribution", "overall", "professionalGuaranteeNonperformingCount", "validation"],
+  "properties": {
+    "dataSourceName": { "type": "string", "minLength": 1 },
+    "sourceFields": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["guaranteeMethod", "fiveLevelClassification", "amount", "amountSourceUnit", "contractSerial"],
+      "properties": {
+        "guaranteeMethod": { "type": "string", "minLength": 1 },
+        "fiveLevelClassification": { "type": "string", "minLength": 1 },
+        "amount": { "type": "string", "minLength": 1 },
+        "amountSourceUnit": { "type": ["string", "null"] },
+        "contractSerial": { "type": ["string", "null"] }
+      }
+    },
+    "sourceRowCount": { "type": "integer", "minimum": 0 },
+    "countBasis": { "type": "string", "enum": ["contract_serial", "valid_rows"] },
+    "countBasisField": { "type": ["string", "null"] },
+    "fallbackCode": {
+      "type": ["string", "null"],
+      "enum": ["missing_contract_serial", "blank_contract_serial", "conflicting_contract_records", null]
+    },
+    "analyzedRecordCount": { "type": "integer", "minimum": 0 },
+    "excludedRecordCount": { "type": "integer", "minimum": 0 },
+    "guaranteeMethodDistribution": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "items": { "$ref": "#/$defs/distributionRow" }
+    },
+    "overall": { "$ref": "#/$defs/distributionRow" },
+    "professionalGuaranteeNonperformingCount": { "type": "integer", "minimum": 0 },
+    "validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["categorySetReconciled", "countReconciled", "amountReconciled"],
+      "properties": {
+        "categorySetReconciled": { "const": true },
+        "countReconciled": { "const": true },
+        "amountReconciled": { "const": true }
+      }
+    }
+  },
+  "$defs": {
+    "distributionRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["guaranteeMethod", "counts", "amounts"],
+      "properties": {
+        "guaranteeMethod": { "type": "string", "enum": ["保证", "信用", "其他", "抵押", "质押", "合计"] },
+        "counts": { "$ref": "#/$defs/countGroup" },
+        "amounts": { "$ref": "#/$defs/amountGroup" }
+      }
+    },
+    "countGroup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["normal", "attention", "nonperforming", "total", "nonperformingRate", "attentionRate"],
+      "properties": {
+        "normal": { "type": "integer", "minimum": 0 },
+        "attention": { "type": "integer", "minimum": 0 },
+        "nonperforming": { "type": "integer", "minimum": 0 },
+        "total": { "type": "integer", "minimum": 0 },
+        "nonperformingRate": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+        "attentionRate": { "type": ["number", "null"], "minimum": 0, "maximum": 1 }
+      }
+    },
+    "amountGroup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["normal", "attention", "nonperforming", "total", "nonperformingRate", "attentionRate"],
+      "properties": {
+        "normal": { "type": "number", "minimum": 0 },
+        "attention": { "type": "number", "minimum": 0 },
+        "nonperforming": { "type": "number", "minimum": 0 },
+        "total": { "type": "number", "minimum": 0 },
+        "nonperformingRate": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+        "attentionRate": { "type": ["number", "null"], "minimum": 0, "maximum": 1 }
+      }
+    }
+  }
+}

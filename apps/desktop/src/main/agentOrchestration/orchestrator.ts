@@ -223,7 +223,8 @@ export class AgentTurnOrchestrator {
   }
 
   fallback(runId: string, summary: string, detail?: Record<string, unknown>) {
-    return this.progress(runId, { phase: "fallback", status: "info", summary, detail });
+    const stepId = typeof detail?.stepId === "string" ? detail.stepId : undefined;
+    return this.progress(runId, { phase: "fallback", status: "info", summary, stepId, detail });
   }
 
   finish(runId: string, summary: string) {
@@ -294,6 +295,9 @@ export class AgentTurnOrchestrator {
     businessEventType?: AgentProgressEvent["businessEventType"];
   }) {
     const run = this.requiredRun(runId);
+    if (isTerminal(run.status) && !isMatchingTerminalProgress(run.status, input.phase)) {
+      return run;
+    }
     const durations = currentDurations(run);
     const event: AgentProgressEvent = {
       eventId: randomUUID(),
@@ -378,6 +382,12 @@ function isActive(status: AgentRunStatus) {
 
 function isTerminal(status: AgentRunStatus) {
   return status === "completed" || status === "partial" || status === "failed" || status === "cancelled";
+}
+
+function isMatchingTerminalProgress(status: AgentRunStatus, phase: AgentProgressPhase) {
+  if (status === "cancelled") return phase === "cancelled";
+  if (status === "failed") return phase === "failed";
+  return (status === "completed" || status === "partial") && phase === "completed";
 }
 
 function toolLabel(toolKind: PlannerStep["toolKind"]) {

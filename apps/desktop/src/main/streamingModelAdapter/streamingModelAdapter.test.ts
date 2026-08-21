@@ -49,6 +49,30 @@ describe("StreamingMarkdownParser", () => {
 });
 
 describe("ToolRegistry", () => {
+  it("rejects string parameters that exceed the declared maximum length", async () => {
+    const registry = new ToolRegistry();
+    registry.registerTool({
+      name: "runPython",
+      description: "执行脚本",
+      inputSchema: {
+        type: "object",
+        required: ["script"],
+        properties: { script: { type: "string", minLength: 1, maxLength: 8 } },
+      },
+      handler: async () => ({ completed: true }),
+    });
+
+    const [result] = await registry.executeToolCalls(
+      [{ toolCallId: "tool_long", index: 0, name: "runPython", argumentsText: JSON.stringify({ script: "123456789" }) }],
+      "serial",
+      { conversationId: "conv", messageId: "msg", traceId: "trace" },
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.error?.code).toBe("TOOL_INPUT_INVALID");
+    expect(result.error?.message).toContain("长度不能大于 8");
+  });
+
   it("aggregates, validates, executes multiple tools and captures failures", async () => {
     const registry = new ToolRegistry();
     registry.registerTool({

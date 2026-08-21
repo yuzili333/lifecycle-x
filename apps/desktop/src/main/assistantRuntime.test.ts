@@ -1,21 +1,309 @@
 import { describe, expect, it } from "vitest";
-import { appendVisualizationReferencesToReport, buildFallbackTempCsvSqlForAnalysisRequest, buildGenericSqlResultAnalysisPythonScript, buildModelToolParameterIssueFeedback, completedChartLineageForMessage, detectToolFromAssistantOutput, filterReportVisualizationsToArtifacts, formatStoppedGenerationMessage, generalStreamSegmentId, generalTextStreamSegmentId, generatedReportArtifactId, generatedReportToolCallId, inferReportTitle, isDetailSqlRequiredParameterIssue, isPreToolTextGuidanceRequiredInputs, isPythonReportCardContent, isRepairablePythonRuntimeError, isReportGenerationContent, mergeReportChartSections, normalizeAnalysisReportMarkdown, normalizeAnalysisReportTitle, normalizeChartVisualizationSpec, normalizePythonScriptParameter, providerToolFallbackText, pythonScriptReadsStdin, renderLocalToolPlanContext, reportStreamSegmentId, selectedFieldReferencesMarkdown, shouldAnalyzePriorSqlResult, shouldAutoStartPythonReport, shouldBypassBlockingGuidanceForModelIntent, shouldDeferChartUntilUpstreamTools, shouldDeferReportUntilChartTool, shouldEagerStartToolFromAssistantStream, shouldForceGenericSqlResultAnalysisScript, shouldGenerateReportFromAnalysisResult, shouldKeepProviderToolActivityMessage, shouldRegisterAssistantGeneratedArtifacts, shouldRequireDetailSqlForCompositeAnalysis, shouldRouteDeterministicTempCsvToolPlan, shouldUseModelForPriorResultVisualization, shouldUseModelForUnclearTaskGoal, summarizeToolArguments, validatePythonScriptSyntax } from "./assistantRuntime";
+import { appendVisualizationReferencesToReport, buildFallbackTempCsvSqlForAnalysisRequest, buildGenericSqlResultAnalysisPythonScript, buildModelToolParameterIssueFeedback, completedChartLineageForMessage, detectToolFromAssistantOutput, filterReportVisualizationsToArtifacts, formatStoppedGenerationDuration, formatStoppedGenerationMessage, generalStreamSegmentId, generalTextStreamSegmentId, generatedReportArtifactId, generatedReportToolCallId, hasExplicitSqlFilterIntent, inferReportTitle, isDetailSqlRequiredParameterIssue, isPreToolTextGuidanceRequiredInputs, isPythonReportCardContent, isRepairablePythonRuntimeError, isReportGenerationContent, isSqlSyntaxPreflightParameterIssue, mergeReportChartSections, missingSqlExecutionScopeFields, normalizeAnalysisReportMarkdown, normalizeAnalysisReportTitle, normalizeChartVisualizationSpec, normalizePythonScriptParameter, providerToolFallbackText, renderLocalToolPlanContext, reportStreamSegmentId, resolveSqlExecutionScope, selectedFieldReferencesMarkdown, selectedSkillSystemPrompt, shouldAnalyzePriorSqlResult, shouldAutoStartPythonReport, shouldBypassBlockingGuidanceForModelIntent, shouldBypassBuiltInSkillParameterPreflight, shouldDeferChartUntilUpstreamTools, shouldDeferReportUntilChartTool, shouldEagerStartToolFromAssistantStream, shouldForceGenericSqlResultAnalysisScript, shouldGenerateReportFromAnalysisResult, shouldIncludeSkillExecutionContext, shouldKeepProviderToolActivityMessage, shouldRegisterAssistantGeneratedArtifacts, shouldRequireDetailSqlForCompositeAnalysis, shouldRouteDeterministicTempCsvToolPlan, shouldUseModelForPriorResultVisualization, shouldUseModelForUnclearTaskGoal, sqlExecutionScopeMarkdown, summarizeToolArguments, validatePythonScriptLength, validatePythonScriptSyntax, verifiedDetailSqlArguments } from "./assistantRuntime";
 import { TOOL_NAMES, type ToolExecutionPlan } from "./toolOrchestration";
 import { MissingInputDetector } from "./agentGuidance";
 import { buildTaskRouterSystemPrompt, executionToolSchema } from "./agentOrchestration/modelAdapters";
+import type { AnalysisPlan } from "./agentOrchestration";
 import type { ChatCsvSelectedFieldRef, ConversationTempCsvTable } from "./chatCsvTempSource";
 import { validateVisualizationSpec } from "../shared/visualization";
+import type { LoadedSkill } from "../shared/skills";
 
 describe("AssistantRuntime workflow intent", () => {
-  it("normalizes model Python wrappers before approval and detects stdin consumers", () => {
+  it("bypasses desktop parameter preflight only for system built-in Skills", () => {
+    const skill = (origin: LoadedSkill["summary"]["origin"]): LoadedSkill => ({
+      summary: {
+        skillId: `${origin}-skill`,
+        displayName: `${origin} skill`,
+        description: "test",
+        version: "1.0.0",
+        category: "analysis",
+        origin,
+        enabled: true,
+        availability: "ready",
+        tags: [],
+        keywords: [],
+        aliases: [],
+        canToggle: origin === "personal",
+        canDelete: origin === "personal",
+      },
+      requiredTools: [],
+      instructions: "test",
+      contentHash: "hash",
+      loadedAt: new Date().toISOString(),
+    });
+
+    expect(shouldBypassBuiltInSkillParameterPreflight(skill("system"))).toBe(true);
+    expect(shouldBypassBuiltInSkillParameterPreflight(skill("personal"))).toBe(false);
+    expect(shouldBypassBuiltInSkillParameterPreflight(undefined)).toBe(false);
+    expect(shouldIncludeSkillExecutionContext({
+      toolKind: "sql_query",
+      hasVerifiedSqlFields: true,
+      skill: skill("system"),
+    })).toBe(false);
+    expect(shouldIncludeSkillExecutionContext({
+      toolKind: "sql_query",
+      hasVerifiedSqlFields: true,
+      skill: skill("personal"),
+    })).toBe(false);
+  });
+
+  it("builds a compact SQL execution scope from plan fields verified by the real CSV schema", () => {
+    const source: ConversationTempCsvTable = {
+      tempTableId: "temp-table-1",
+      tempDataSourceId: "temp-source-1",
+      conversationId: "conversation-1",
+      userId: "user-1",
+      fileName: "信贷风险.csv",
+      fileSizeBytes: 100,
+      sqliteTableName: "chat_csv_conversation_1",
+      rowCount: 10,
+      columnCount: 5,
+      status: "ready",
+      createdAt: "2026-08-18T00:00:00.000Z",
+      updatedAt: "2026-08-18T00:00:00.000Z",
+      columns: ["主要担保方式名称", "最新风险五级分类", "贷款余额(万元)", "合同流水号", "无关字段"].map((field, index) => ({
+        ordinalPosition: index,
+        sourceHeader: field,
+        sqliteColumnName: field,
+        displayName: field,
+        inferredLogicalType: field.includes("余额") ? "decimal" : "string",
+        sqliteType: field.includes("余额") ? "NUMERIC" : "TEXT",
+      })),
+    };
+    const analysisPlan: AnalysisPlan = {
+      goal: "生成担保方式风险报告",
+      businessDefinitions: [],
+      requiredData: [{
+        source: "信贷风险.csv / chat_csv_conversation_1",
+        table: "chat_csv_conversation_1",
+        fields: ["主要担保方式名称", "最新风险五级分类", "贷款余额(万元)", "合同流水号", "不存在字段"],
+        purpose: "查询明细",
+      }],
+      steps: [{ id: "query", type: "sql", purpose: "查询明细" }],
+      validationRules: [],
+      reportOutline: [],
+      assumptions: [],
+      unresolvedAmbiguities: [],
+    };
+
+    const scopes = resolveSqlExecutionScope({ analysisPlan, tempSources: [source] });
+    const markdown = sqlExecutionScopeMarkdown(scopes);
+
+    expect(scopes).toEqual([{
+      tempDataSourceId: "temp-source-1",
+      tableName: "chat_csv_conversation_1",
+      fileName: "信贷风险.csv",
+      fields: ["主要担保方式名称", "最新风险五级分类", "贷款余额(万元)", "合同流水号"],
+    }]);
+    expect(markdown).toContain("已核验字段数：4");
+    expect(markdown).toContain('可执行查询骨架：SELECT T1."主要担保方式名称", T1."最新风险五级分类", T1."贷款余额(万元)", T1."合同流水号" FROM "chat_csv_conversation_1" AS T1');
+    expect(markdown).toContain("禁止写 FROM T1");
+    expect(markdown).not.toContain("不存在字段");
+    expect(missingSqlExecutionScopeFields(
+      'SELECT T1."主要担保方式名称" FROM "chat_csv_conversation_1" T1',
+      scopes[0],
+    )).toEqual(["最新风险五级分类", "贷款余额(万元)", "合同流水号"]);
+    expect(missingSqlExecutionScopeFields(
+      'SELECT T1.* FROM "chat_csv_conversation_1" T1',
+      scopes[0],
+    )).toEqual([]);
+  });
+
+  it("scopes Skill context to the current execution tool", () => {
+    const skill: LoadedSkill = {
+      summary: {
+        skillId: "sample-report",
+        displayName: "样本报告",
+        description: "样本",
+        version: "1.0.0",
+        category: "analysis",
+        origin: "system",
+        enabled: true,
+        availability: "ready",
+        tags: [],
+        keywords: [],
+        aliases: [],
+        canToggle: false,
+        canDelete: false,
+      },
+      requiredTools: ["request_sql_query_execution", "request_python_analysis_execution", "request_markdown_report_generation"],
+      instructions: [
+        "# SAMPLE_SKILL",
+        "",
+        "## 统计口径",
+        "COMMON_RULES",
+        "",
+        "## 工具职责",
+        "",
+        "### SQL 工具",
+        "SQL_ONLY_RULES",
+        "",
+        "### Python 工具",
+        "PYTHON_ONLY_RULES",
+        "",
+        "### 报告模型",
+        "REPORT_ONLY_RULES",
+      ].join("\n"),
+      inputSchema: { type: "object", title: "INPUT_SCHEMA" },
+      outputSchema: {
+        type: "object",
+        title: "OUTPUT_SCHEMA",
+        required: ["contractMarker"],
+        properties: { contractMarker: { type: "string" } },
+      },
+      toolPolicy: { marker: "TOOL_POLICY" },
+      reportTemplate: "REPORT_TEMPLATE",
+      contentHash: "content-hash",
+      loadedAt: new Date().toISOString(),
+    };
+
+    const sqlContext = selectedSkillSystemPrompt(skill, "sql_query");
+    expect(sqlContext).not.toContain("COMMON_RULES");
+    expect(sqlContext).toContain("SQL_ONLY_RULES");
+    expect(sqlContext).not.toContain("INPUT_SCHEMA");
+    expect(sqlContext).not.toContain("只生成读取真实明细字段的单条只读查询脚本");
+    expect(sqlContext).toContain("当前只应用上述 SQL 工具职责");
+    expect(sqlContext).not.toContain("PYTHON_ONLY_RULES");
+    expect(sqlContext).not.toContain("REPORT_ONLY_RULES");
+    expect(sqlContext).not.toContain("OUTPUT_SCHEMA");
+    expect(sqlContext).not.toContain("REPORT_TEMPLATE");
+    expect(sqlContext).not.toContain("TOOL_POLICY");
+
+    const planningContext = selectedSkillSystemPrompt(skill, "planning");
+    expect(planningContext).toContain("COMMON_RULES");
+    expect(planningContext).not.toContain("SQL_ONLY_RULES");
+    expect(planningContext).not.toContain("PYTHON_ONLY_RULES");
+    expect(planningContext).not.toContain("REPORT_ONLY_RULES");
+    expect(planningContext).toContain("仅规划任务目标、工具顺序、依赖和预期产物");
+
+    const pythonContext = selectedSkillSystemPrompt(skill, "python_analysis");
+    expect(pythonContext).not.toContain("COMMON_RULES");
+    expect(pythonContext).toContain("PYTHON_ONLY_RULES");
+    expect(pythonContext).not.toContain("SQL_ONLY_RULES");
+    expect(pythonContext).not.toContain("REPORT_ONLY_RULES");
+    expect(pythonContext).not.toContain("OUTPUT_SCHEMA");
+    expect(pythonContext).toContain("Python 统计结果契约");
+    expect(pythonContext).toContain('"contractMarker":string');
+    expect(pythonContext).toContain("当前只应用上述 Python 工具职责");
+    expect(pythonContext).not.toContain("INPUT_SCHEMA");
+    expect(pythonContext).not.toContain("REPORT_TEMPLATE");
+    expect(pythonContext).not.toContain("TOOL_POLICY");
+
+    const reportContext = selectedSkillSystemPrompt(skill, "report_generation");
+    expect(reportContext).toContain("REPORT_ONLY_RULES");
+    expect(reportContext).not.toContain("COMMON_RULES");
+    expect(reportContext).not.toContain("SQL_ONLY_RULES");
+    expect(reportContext).not.toContain("PYTHON_ONLY_RULES");
+    expect(reportContext).toContain("OUTPUT_SCHEMA");
+    expect(reportContext).toContain("REPORT_TEMPLATE");
+    expect(reportContext).toContain("当前只应用上述报告职责");
+    expect(reportContext).not.toContain("INPUT_SCHEMA");
+    expect(reportContext).not.toContain("TOOL_POLICY");
+  });
+
+  it("submits a verified system Skill detail query locally only when no filter is requested", () => {
+    const skill = {
+      summary: { origin: "system" as const, skillId: "guarantee-method-risk-distribution-report" },
+      requiredTools: ["request_markdown_report_generation"],
+    } as LoadedSkill;
+    const scopes = [{
+      tempDataSourceId: "temp-1",
+      tableName: "chat_csv_table",
+      fileName: "risk.csv",
+      fields: ["主要担保方式名称", "贷款余额(万元)"],
+    }];
+
+    expect(verifiedDetailSqlArguments({
+      skill,
+      prompt: "根据当前数据源生成担保方式风险分布报告",
+      purpose: "查询后续统计所需明细",
+      scopes,
+    })).toEqual({
+      sql: 'SELECT T1."主要担保方式名称", T1."贷款余额(万元)"\nFROM "chat_csv_table" AS T1',
+    });
+    expect(hasExplicitSqlFilterIntent("筛选担保方式为“保证”的记录")).toBe(true);
+    expect(hasExplicitSqlFilterIntent("生成北京分行的数据分析报告")).toBe(true);
+    expect(verifiedDetailSqlArguments({
+      skill,
+      prompt: "筛选担保方式为“保证”的记录并生成报告",
+      purpose: "查询明细",
+      scopes,
+    })).toBeUndefined();
+  });
+
+  it("prefers dedicated Skill parameter contracts over shared and unrelated instructions", () => {
+    const skill: LoadedSkill = {
+      summary: {
+        skillId: "contract-report",
+        displayName: "契约报告",
+        description: "契约",
+        version: "1.0.0",
+        category: "analysis",
+        origin: "system",
+        enabled: true,
+        availability: "ready",
+        tags: [],
+        keywords: [],
+        aliases: [],
+        canToggle: false,
+        canDelete: false,
+      },
+      requiredTools: ["request_sql_query_execution", "request_python_analysis_execution", "request_markdown_report_generation"],
+      instructions: [
+        "# CONTRACT_SKILL",
+        "",
+        "## 统计口径",
+        "SHARED_BUSINESS_AND_REPORT_RULES",
+        "",
+        "## 参数生成契约",
+        "",
+        "### SQL",
+        "SQL_PARAMETER_CONTRACT",
+        "",
+        "### Python",
+        "PYTHON_PARAMETER_CONTRACT",
+        "",
+        "## 报告生成",
+        "REPORT_FORMATTING_RULES",
+      ].join("\n"),
+      inputSchema: { type: "object", title: "INPUT_SCHEMA" },
+      outputSchema: { type: "object", title: "OUTPUT_SCHEMA" },
+      toolPolicy: { marker: "TOOL_POLICY" },
+      reportTemplate: "REPORT_TEMPLATE",
+      contentHash: "content-hash",
+      loadedAt: new Date().toISOString(),
+    };
+
+    const sqlContext = selectedSkillSystemPrompt(skill, "sql_query");
+    expect(sqlContext).toContain("SQL_PARAMETER_CONTRACT");
+    expect(sqlContext).not.toContain("PYTHON_PARAMETER_CONTRACT");
+    expect(sqlContext).not.toContain("SHARED_BUSINESS_AND_REPORT_RULES");
+    expect(sqlContext).not.toContain("INPUT_SCHEMA");
+
+    const pythonContext = selectedSkillSystemPrompt(skill, "python_analysis");
+    expect(pythonContext).toContain("PYTHON_PARAMETER_CONTRACT");
+    expect(pythonContext).not.toContain("SQL_PARAMETER_CONTRACT");
+    expect(pythonContext).not.toContain("SHARED_BUSINESS_AND_REPORT_RULES");
+    expect(pythonContext).not.toContain("REPORT_FORMATTING_RULES");
+  });
+
+  it("normalizes model Python wrappers before approval", () => {
     expect(normalizePythonScriptParameter("print('ok')\n</script>")).toBe("print('ok')");
     expect(normalizePythonScriptParameter("<script>\nprint('ok')\n</script>")).toBe("print('ok')");
     expect(normalizePythonScriptParameter("```python\nprint('ok')\n```")).toBe("print('ok')");
-    expect(pythonScriptReadsStdin("import json, sys\nrows = json.load(sys.stdin)")).toBe(true);
-    expect(pythonScriptReadsStdin("print('ok')")).toBe(false);
+    expect(normalizePythonScriptParameter("Python script:\n```python\nprint('ok')\n```\nEnd.")).toBe("print('ok')");
+    expect(normalizePythonScriptParameter("```python\nprint('first')\n```\n```python\nprint('second')\n```")).toContain("```");
   });
 
-  it("rejects model Python with a field-name parenthesis outside the string literal", async () => {
+  it("rejects saturated Python parameters before syntax parsing", () => {
+    expect(validatePythonScriptLength("x".repeat(24_000))).toEqual({ valid: true });
+    expect(validatePythonScriptLength("x".repeat(24_001))).toMatchObject({
+      valid: false,
+      message: expect.stringContaining("超过本地上限 24000"),
+    });
+  });
+
+  it("rejects malformed model Python instead of repairing syntax locally", async () => {
     await expect(validatePythonScriptSyntax(
       "contract_amount_field = '合同金额(万元')\nprint(contract_amount_field)",
     )).resolves.toMatchObject({
@@ -25,19 +313,26 @@ describe("AssistantRuntime workflow intent", () => {
     await expect(validatePythonScriptSyntax(
       "contract_amount_field = '合同金额(万元)'\nprint(contract_amount_field)",
     )).resolves.toEqual({ valid: true });
+    await expect(validatePythonScriptSyntax(
+      "import json, sys; rows = json.load(sys.stdin); def summarize(items): return len(items)",
+    )).resolves.toMatchObject({
+      valid: false,
+      message: expect.stringContaining("invalid syntax"),
+    });
   });
 
-  it("rejects count ratios that introduce float values into Decimal analysis", async () => {
+  it("treats a Skill result contract mismatch as one repairable Python execution failure", () => {
+    expect(isRepairablePythonRuntimeError("Python 分析结果不符合 Skill 结果契约：$.overall 缺失")).toBe(true);
+  });
+
+  it("leaves Decimal calculation semantics to runtime instead of syntax preflight", async () => {
     await expect(validatePythonScriptSyntax([
       "from decimal import Decimal",
       "deterioration_count = 2",
       "sample_count = 200",
       "deterioration_rate = deterioration_count / sample_count",
       "print(deterioration_rate * Decimal('100'))",
-    ].join("\n"))).resolves.toMatchObject({
-      valid: false,
-      message: expect.stringContaining("Decimal(count) / Decimal(total)"),
-    });
+    ].join("\n"))).resolves.toEqual({ valid: true });
     await expect(validatePythonScriptSyntax([
       "from decimal import Decimal",
       "deterioration_count = 2",
@@ -52,7 +347,37 @@ describe("AssistantRuntime workflow intent", () => {
       "TypeError: unsupported operand type(s) for /: 'float' and 'decimal.Decimal'",
     )).toBe(true);
     expect(isRepairablePythonRuntimeError("ZeroDivisionError: division by zero")).toBe(true);
+    expect(isRepairablePythonRuntimeError("ModuleNotFoundError: No module named 'collections.namedtuple'")).toBe(true);
+    expect(isRepairablePythonRuntimeError("Python 分析未输出可用结果。")).toBe(true);
+    expect(isRepairablePythonRuntimeError("Python 分析输出不是合法 JSON。")).toBe(true);
+    expect(isRepairablePythonRuntimeError("Python 分析输出为空 JSON，未形成可用统计结果。")).toBe(true);
     expect(isRepairablePythonRuntimeError("Python 执行超时，已终止。")).toBe(false);
+  });
+
+  it("rejects invalid standard-library module targets without policing import style", async () => {
+    await expect(validatePythonScriptSyntax(
+      "import collections.namedtuple as Nt\nprint('ok')",
+    )).resolves.toMatchObject({
+      valid: false,
+      message: expect.stringContaining("不是可导入的标准库模块"),
+    });
+    await expect(validatePythonScriptSyntax(
+      "import collections.namedtuple as Nt\nprint('ok')",
+      undefined,
+      { validateImportTargets: false },
+    )).resolves.toEqual({ valid: true });
+    await expect(validatePythonScriptSyntax(
+      "from collections import namedtuple\nprint(namedtuple('Row', ['value']))",
+    )).resolves.toEqual({ valid: true });
+    await expect(validatePythonScriptSyntax(
+      "import json\nimport json\nprint('{}')",
+    )).resolves.toEqual({ valid: true });
+    await expect(validatePythonScriptSyntax(
+      "import json, sys, re, math, statistics, decimal, collections, itertools, functools\nprint('{}')",
+    )).resolves.toEqual({ valid: true });
+    await expect(validatePythonScriptSyntax(
+      "from collections import Counter, defaultdict, deque, namedtuple, OrderedDict, ChainMap, UserDict, UserList, UserString\nprint('{}')",
+    )).resolves.toEqual({ valid: true });
   });
 
   it("routes explicit follow-up tasks around stale blocking guidance", () => {
@@ -181,6 +506,7 @@ describe("AssistantRuntime workflow intent", () => {
     expect(formatStoppedGenerationMessage(1_000, 2_250)).toBe("你在 1s 后停止了");
     expect(formatStoppedGenerationMessage(1_000, 13_400)).toBe("你在 12s 后停止了");
     expect(formatStoppedGenerationMessage(1_000, 62_400)).toBe("你在 1m 1s 后停止了");
+    expect(formatStoppedGenerationDuration(197_464)).toBe("你在 3m 17s 后停止了");
   });
 
   it("continues tool detection when provider activity text contains executable SQL", () => {
@@ -249,6 +575,18 @@ describe("AssistantRuntime workflow intent", () => {
       prompt: "仅需 SQL 直接返回汇总统计。",
       sql: 'select "行业", count(*) as "合同数" from "loans" group by "行业"',
     })).toBe(false);
+    expect(shouldRequireDetailSqlForCompositeAnalysis({
+      prompt,
+      sql: 'select "count(合同)", `sum(贷款余额)`, [group by] from "loans" where "备注" = \'select distinct\' and "风险分类" = \'0300--次级\'',
+    })).toBe(false);
+    expect(shouldRequireDetailSqlForCompositeAnalysis({
+      prompt,
+      sql: 'select "行业", count("合同流水号") from "loans" group by "行业"',
+    })).toBe(true);
+    expect(shouldRequireDetailSqlForCompositeAnalysis({
+      prompt,
+      sql: 'select distinct "行业", "合同流水号" from "loans"',
+    })).toBe(true);
     expect(isDetailSqlRequiredParameterIssue({
       status: "waiting_input",
       reason: "sql_must_return_detail_rows_for_analysis",
@@ -257,6 +595,10 @@ describe("AssistantRuntime workflow intent", () => {
       status: "parameter_issue",
       reason: "missing_sql",
     })).toBe(false);
+    expect(isSqlSyntaxPreflightParameterIssue({
+      status: "waiting_input",
+      reason: "sql_syntax_preflight_failed",
+    })).toBe(true);
   });
 
   it("does not allow report generation to replace an explicitly requested chart", () => {

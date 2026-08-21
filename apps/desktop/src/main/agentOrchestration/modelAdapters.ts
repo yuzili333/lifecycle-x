@@ -260,6 +260,7 @@ export type ExecutionAdapterOutput = {
   error?: string;
   errorCode?: string;
   errorStage?: "provider" | "protocol" | "schema" | "handler";
+  parameterSource?: "execution_model" | "verified_runtime_scope";
 };
 
 export class ExecutionParameterAdapter {
@@ -335,6 +336,62 @@ export class ExecutionParameterAdapter {
       };
     }
     return { invoked, output, toolCallId, content, traceId, error, errorCode, errorStage };
+  }
+
+  async executePrepared(input: ExecutionAdapterInput, argumentsValue: Record<string, unknown>): Promise<ExecutionAdapterOutput> {
+    const toolCallId = `prepared-${randomUUID()}`;
+    const traceId = `trace-${randomUUID()}`;
+    const argumentsText = JSON.stringify(argumentsValue);
+    const metadata = {
+      modelRole: "execution",
+      orchestrationPhase: "resolved_parameter_execution",
+      executionProfile: this.config.profileName,
+      stepId: input.step.stepId,
+      toolKind: input.step.toolKind,
+    };
+    input.onEvent?.(localExecutionEvent(input, "tool-call-start", traceId, toolCallId, {
+      index: 0,
+      toolName: input.tool.name,
+      argumentsDelta: "",
+      argumentsText,
+    }));
+    input.onEvent?.(localExecutionEvent(input, "tool-call-end", traceId, toolCallId, {
+      index: 0,
+      toolName: input.tool.name,
+      argumentsText,
+    }));
+    const registry = new ToolRegistry();
+    registry.registerTool(input.tool);
+    const [result] = await registry.executeToolCalls(
+      [{ toolCallId, index: 0, name: input.tool.name, argumentsText }],
+      "serial",
+      {
+        conversationId: input.conversationId,
+        messageId: input.messageId,
+        traceId,
+        signal: input.signal,
+        metadata,
+      },
+    );
+    if (result?.success) {
+      input.onEvent?.(localExecutionEvent(input, "tool-execution-result", traceId, toolCallId, { result }));
+      return { invoked: true, output: result.output, toolCallId, content: "", traceId, parameterSource: "verified_runtime_scope" };
+    }
+    const failure = result?.error;
+    input.onEvent?.(localExecutionEvent(input, "tool-execution-error", traceId, toolCallId, {
+      result,
+      error: failure,
+    }));
+    return {
+      invoked: true,
+      toolCallId,
+      content: "",
+      traceId,
+      error: failure?.message ?? "工具执行失败。",
+      errorCode: failure?.code ?? "TOOL_EXECUTION_FAILED",
+      errorStage: failure?.code === "TOOL_INPUT_INVALID" ? "schema" : "handler",
+      parameterSource: "verified_runtime_scope",
+    };
   }
 
   private async executeReport(input: ExecutionAdapterInput): Promise<ExecutionAdapterOutput> {
@@ -465,17 +522,20 @@ export function executionToolSchema(toolKind: ToolKind) {
   return EXECUTION_PARAMETER_SCHEMAS[toolKind];
 }
 
+export const SQL_TOOL_PARAMETER_VALUE_RULE = "`sql` 只能包含一条完整的 SQLite 只读 SQL；不得包含任务说明、Schema、分析过程、Markdown、JSON、注释或重复 SQL。";
+export const PYTHON_TOOL_SCRIPT_TARGET_CHARS = 6_000;
+
 export function executionToolDescription(toolKind: ToolKind) {
   if (toolKind === "sql_query") {
-    return "为当前步骤提交一条只读 SQL。只生成 sql；用户需求、步骤目的、数据源和审批上下文由客户端注入。复合分析中若上下文要求先查询明细，必须选择后续 Python 所需原始字段，禁止用 GROUP BY、COUNT、SUM、AVG、MIN、MAX 或 DISTINCT 提前聚合。";
+    return "提交当前步骤的一条 SQLite 只读查询。SQL 工具只执行查询并返回结果；统计计算、图表和报告由后续步骤完成。";
   }
   if (toolKind === "python_analysis") {
-    return "为当前步骤提交受控 Python 脚本。只生成 script；数据与 Artifact 血缘由客户端注入。";
+    return "提交当前步骤的受控 Python 统计脚本；不得生成报告正文。";
   }
   if (toolKind === "chart_rendering") {
     return "为当前步骤提交声明式图表参数。只生成标题、图表类型、维度、指标及可选排序/颜色字段；禁止生成 VisualizationSpec、ECharts option、内联数据和 Artifact 参数。";
   }
-  return "为当前步骤提交报告标题和 Markdown 正文；Artifact 与图表引用由客户端注入。";
+  return "为当前步骤提交报告标题和 Markdown 正文；统一负责计算结果的展示格式、报告结构组合、结论撰写和内容一致性审核，Artifact 与图表引用由客户端注入。不得重新统计原始数据。";
 }
 
 const EXECUTION_PARAMETER_SCHEMAS: Record<ToolKind, JsonSchema> = {
@@ -487,7 +547,7 @@ const EXECUTION_PARAMETER_SCHEMAS: Record<ToolKind, JsonSchema> = {
       sql: {
         type: "string",
         minLength: 1,
-        description: "单条只读 SQL。只查询当前步骤所需的真实明细字段；统计、占比和排序由后续 Python 步骤完成。",
+        description: `${SQL_TOOL_PARAMETER_VALUE_RULE} 必须包含非空 SELECT 字段清单和 FROM 真实数据源表。上下文提供可执行查询骨架时直接复制；仅按当前步骤追加明确的 WHERE 筛选。表名、字段名和别名使用 SQLite 双引号，禁止空标识符或占位符。`,
       },
     },
   },
@@ -499,7 +559,7 @@ const EXECUTION_PARAMETER_SCHEMAS: Record<ToolKind, JsonSchema> = {
       script: {
         type: "string",
         minLength: 1,
-        description: "使用标准库、只读取当前步骤已注入数据的 Python 脚本。",
+        description: `完整、紧凑的 Python 统计脚本，通常应明显短于 ${PYTHON_TOOL_SCRIPT_TARGET_CHARS} 字符。只导入脚本直接使用的标准库模块或符号：模块使用 import module，符号使用 from module import name；禁止把 collections.namedtuple 等模块属性写成 import 目标。受控运行时会把当前步骤已授权的上游 JSON 数据写入 stdin；脚本可按实际需要选择安全读取方式，不限定 import 顺序、变量名或具体语句。脚本必须向 stdout 输出一个可解析、非空的 JSON 统计结果。不得包含说明、标签、代码围栏或其他非 Python 前后缀。`,
       },
     },
   },
@@ -605,12 +665,18 @@ export function analysisPlanMessages(systemContext: string, userPrompt: string, 
 
 export function buildExecutionSystemPrompt(step: PlannerStep, tool: ToolDefinition) {
   const canonicalParameterRule = step.toolKind === "sql_query"
-    ? "只生成非空 sql；userRequest、purpose、数据源和血缘参数由客户端注入，不要输出这些字段。"
+    ? "SQL 参数契约以工具 Schema 为准。上下文提供可执行查询骨架时，无筛选条件就原样提交；有明确筛选条件时只追加 WHERE。真实表名和字段名必须逐字符复制，不得改成空标识符或占位符。T1 只能作为真实表名后的别名，禁止写 FROM T1。"
     : step.toolKind === "python_analysis"
-      ? "只生成非空、简洁且语法完整的 script，并仅使用上游结果摘要中存在的真实字段；script 必须控制在 12000 个字符以内，删除长注释、重复分支和逐项硬编码，优先使用辅助函数、映射表与循环。字段名称必须从上游结果字段清单逐字符复制，包含单位的中英文括号必须完整保留在字符串引号内，不得手工改写。金额一旦解析为 Decimal，累计、分子、分母、占比和单位换算必须始终使用 Decimal；笔数、行数等整数计算占比时也必须先执行 Decimal(count) / Decimal(total)，禁止 count / total 先产生 float。只在最终 JSON 序列化时转换为 float；正确形式是 float(decimal_numerator / decimal_denominator)，禁止 float_value / Decimal_value，也不得把 float 传给使用 Decimal 常量的格式化函数。Artifact 血缘由客户端注入。运行时会把已授权 SQL Artifact 的完整数据行作为 JSON 数组写入 stdin，使用 `import json, sys` 和 `rows = json.load(sys.stdin)` 读取；不要输出推测性长注释，不要猜测 artifact_data、df_data 等全局变量，不要读取本地路径，也不要用 Markdown 围栏、<script> 或其他包装标签包裹脚本。"
+      ? [
+          "只生成一段完整、紧凑、可直接执行的统计 script，禁止只返回 import、代码片段或解释。紧凑是减少重复逻辑，不是压缩成单行。",
+          `script 通常应明显短于 ${PYTHON_TOOL_SCRIPT_TARGET_CHARS} 字符。保留真实换行和 Python 缩进，使用少量辅助函数、一个数据驱动累计结构和循环完成当前统计；禁止逐类别复制变量、分支、函数或结果构造，禁止单行复合语句、注释、类型声明、类和通用分析框架。`,
+          "真实字段名称从上游结果摘要逐字符复制，只计算当前步骤要求的数值、分类明细、口径和校验结果，不生成展示字符串、Markdown、章节或结论。",
+          "只导入脚本直接使用的标准库能力且不得重复。模块使用 import module；类或函数使用 from module import name。禁止把 collections.namedtuple、collections.OrderedDict 等属性当作模块导入。常规统计通常只需要 json、sys，以及确有金额精度计算时的 Decimal；使用 Decimal 时仅在写入最终 JSON 结果时转为 float。",
+          "客户端负责 Artifact 注入和权限控制；脚本不得读取路径、连接数据库或构造模拟数据。不得使用代码围栏或包装标签。",
+        ].join("\n")
       : step.toolKind === "chart_rendering"
         ? "只提供 title、chartType、dimensionFields、measureFields 及可选 dimensionLabels、measureLabels、排序/颜色字段；禁止生成 visualizationSpec、ECharts option 或内联数据。维度和指标必须来自上游结果摘要，标签只用于展示且映射键必须是对应字段。"
-        : "直接输出非空、完整的 Markdown 正文，一级标题作为报告标题；正文只能使用上游分析摘要和 Artifact 中已经存在的结论，引用关系由客户端注入。只允许展示当前轮成功生成的图表；图表步骤失败或没有可用图表时继续生成文本报告并省略可视化章节，不得引用历史图表补位。正文不得显示 Artifact ID、toolCallId、内部工具名称或“上游 Python 分析结果”等内部血缘信息。禁止使用 Markdown 图片语法或 HTML img 标签表示图表，图表仅由客户端注入的受控可视化节点展示。";
+        : "直接输出非空、完整的 Markdown 正文，一级标题作为报告标题；统一完成数值与单位展示格式、表格和章节组合、数据驱动结论撰写以及内容一致性审核。只能使用上游计算结果和 Artifact 中已经存在的事实，不得重新统计原始数据或编造指标。只允许展示当前轮成功生成的图表；图表步骤失败或没有可用图表时继续生成文本报告并省略可视化章节，不得引用历史图表补位。正文不得显示 Artifact ID、toolCallId、内部工具名称或“上游 Python 分析结果”等内部血缘信息。禁止使用 Markdown 图片语法或 HTML img 标签表示图表，图表仅由客户端注入的受控可视化节点展示。";
   return [
     step.toolKind === "report_generation"
       ? "你是数据探针 Agent 的报告执行模型，只为当前一个确定步骤生成报告正文。"
@@ -627,8 +693,6 @@ export function buildExecutionSystemPrompt(step: PlannerStep, tool: ToolDefiniti
       ? "正文必须使用上下文中的真实字段、统计结果和可用 Artifact 摘要。"
       : "参数必须严格符合工具 Schema，并使用上下文中的真实表名、字段名和 Artifact ID。",
     canonicalParameterRule,
-    "SQL 仅允许单条只读查询；复合分析任务的 SQL 返回后续需要的明细字段，统计、占比和排序交给 Python。",
-    "Python 只能使用标准库和已授权输入 Artifact，不得连接业务数据库或构造模拟数据。",
     "不要在普通文本中输出脚本或参数。",
   ].join("\n");
 }
@@ -638,7 +702,17 @@ export function plannerMessages(systemContext: string, userPrompt: string): Conv
 }
 
 export function executionMessages(systemContext: string, userPrompt: string, step: PlannerStep, tool: ToolDefinition): ConversationMessage[] {
-  return [message("system", `${buildExecutionSystemPrompt(step, tool)}\n\n${systemContext}`), message("user", userPrompt)];
+  const activeStepInstruction = step.toolKind === "report_generation"
+    ? userPrompt
+    : [
+        `执行当前已确定步骤：${step.purpose}`,
+        `只调用 ${tool.name} 一次并返回符合 Schema 的参数。`,
+        "原始用户目标已经由上游完成意图识别和步骤拆分；不要直接回答、重述原始请求或执行其他步骤。",
+      ].filter(Boolean).join("\n");
+  return [
+    message("system", `${buildExecutionSystemPrompt(step, tool)}\n\n${systemContext}`),
+    message("user", activeStepInstruction),
+  ];
 }
 
 function message(role: ConversationMessage["role"], content: string): ConversationMessage {
