@@ -108,7 +108,7 @@ import {
   type MissingInputDetectionResult,
 } from "./agentGuidance";
 import { compactSkillResultContract, validateSkillResult } from "./skills/SkillResultValidator";
-import { compileSkillAnalysisRecipe } from "./skills/SkillAnalysisRecipe";
+import { compileSkillAnalysisRecipe, SKILL_ANALYSIS_RECIPE_MARKER } from "./skills/SkillAnalysisRecipe";
 
 const require = createRequire(import.meta.url);
 const Database = require("better-sqlite3");
@@ -2866,6 +2866,66 @@ export class AssistantRuntime {
     return this.tempSourceManager.listByConversation(conversationId, userId).slice(0, 1);
   }
 
+  private fieldRefsForTempSources(
+    fieldRefs: ChatCsvSelectedFieldRef[] | undefined,
+    tempSources: ConversationTempCsvTable[],
+  ) {
+    const activeSources = new Map(tempSources.map((source) => [source.tempDataSourceId, source]));
+    return (fieldRefs ?? []).filter((field) => {
+      if (field.status !== "valid") {
+        return false;
+      }
+      const source = activeSources.get(field.tempDataSourceId);
+      return Boolean(source?.columns.some((column) =>
+        column.sqliteColumnName === field.physicalName ||
+        column.sourceHeader === field.sourceHeader ||
+        column.displayName === field.displayName));
+    });
+  }
+
+  private reusableConversationContext(
+    userId: string,
+    conversationId: string,
+    tempSources: ConversationTempCsvTable[],
+  ): Pick<AssistantMessageContext, "skill" | "selectedFieldRefs"> {
+    const rows = this.db
+      .prepare(
+        `select context_json
+         from messages
+         where conversation_id = ?
+           and user_id = ?
+           and role = 'user'
+           and context_json is not null
+         order by created_at desc`,
+      )
+      .all(conversationId, userId) as Array<{ context_json?: string | null }>;
+    let skill: AssistantSkill | null | undefined;
+    let selectedFieldRefs: ChatCsvSelectedFieldRef[] | undefined;
+
+    for (const row of rows) {
+      let context: AssistantMessageContext;
+      try {
+        context = JSON.parse(row.context_json ?? "{}") as AssistantMessageContext;
+      } catch {
+        continue;
+      }
+      if (!skill && context.skill) {
+        skill = context.skill;
+      }
+      if (!selectedFieldRefs?.length) {
+        const reusableFields = this.fieldRefsForTempSources(context.selectedFieldRefs, tempSources);
+        if (reusableFields.length > 0) {
+          selectedFieldRefs = reusableFields;
+        }
+      }
+      if (skill && selectedFieldRefs?.length) {
+        break;
+      }
+    }
+
+    return { skill, selectedFieldRefs };
+  }
+
   private guidanceMessageStatus(status?: string): AssistantMessageStatus {
     if (status === "waiting_for_data_source") {
       return "waiting_for_data_source";
@@ -3429,20 +3489,34 @@ export class AssistantRuntime {
       ? this.findConversation(input.userId, input.conversationId) ?? this.createConversation(input.userId)
       : this.createConversation(input.userId, prompt.slice(0, 18) || "新对话");
     const tempSources = this.activeTempSources(input.userId, conversation.id, input.selectedTempDataSourceIds);
+    const reusableContext = input.conversationId
+      ? this.reusableConversationContext(input.userId, conversation.id, tempSources)
+      : {};
+    const inheritedFieldRefs = (input.selectedFieldRefs?.length ?? 0) === 0
+      ? reusableContext.selectedFieldRefs
+      : undefined;
+    const effectiveSelectedFieldRefs = input.selectedFieldRefs?.length
+      ? input.selectedFieldRefs
+      : inheritedFieldRefs ?? [];
+    const effectiveSkill = input.skill || reusableContext.skill || null;
     const tempSchemaContextMarkdown = this.tempSourceManager.buildSchemaContextMarkdown({
       userId: input.userId,
       conversationId: conversation.id,
       tempDataSourceIds: tempSources.map((source) => source.tempDataSourceId),
-      selectedFieldRefs: input.selectedFieldRefs,
+      selectedFieldRefs: effectiveSelectedFieldRefs,
       maxFieldsPerSource: input.tempSchemaFieldLimit,
     });
+    const clientSchemaContextMarkdown = inheritedFieldRefs?.length && !input.dataSourceId
+      ? null
+      : input.schemaContextMarkdown;
     let effectiveInput: AssistantSendInput = {
       ...input,
       conversationId: conversation.id,
       selectedTempDataSourceIds: tempSources.map((source) => source.tempDataSourceId),
-      selectedFieldRefs: input.selectedFieldRefs,
+      selectedFieldRefs: effectiveSelectedFieldRefs,
       tempSchemaFieldLimit: input.tempSchemaFieldLimit,
-      schemaContextMarkdown: [input.schemaContextMarkdown, tempSchemaContextMarkdown].filter(Boolean).join("\n\n") || null,
+      schemaContextMarkdown: [clientSchemaContextMarkdown, tempSchemaContextMarkdown].filter(Boolean).join("\n\n") || null,
+      skill: effectiveSkill,
     };
 
     if (conversation.title === "新对话") {
@@ -3461,10 +3535,10 @@ export class AssistantRuntime {
       clientRequestId: input.clientRequestId,
       context: {
         dataSourceLabel: input.dataSourceLabel ?? null,
-        skill: input.skill ?? null,
+        skill: effectiveSkill,
         temporaryDataSourceIds: tempSources.map((source) => source.tempDataSourceId),
         temporaryDataSourceLabels: tempSources.map((source) => source.fileName),
-        selectedFieldRefs: input.selectedFieldRefs ?? [],
+        selectedFieldRefs: effectiveSelectedFieldRefs,
       },
     });
     const assistantMessage = this.insertMessage({
@@ -4133,8 +4207,18 @@ export class AssistantRuntime {
     const nextConversation = this.findConversation(input.userId, conversation.id) ?? conversation;
     this.options.emit({ type: "conversation", conversation: nextConversation });
     this.options.emit({ type: "message", conversationId: conversation.id, message: assistantMessage });
-    const tempSources = this.activeTempSources(input.userId, conversation.id, input.selectedTempDataSourceIds);
-    const retrySelectedFieldRefs = input.selectedFieldRefs ?? sourceUserMessage.context?.selectedFieldRefs;
+    const requestedTempSourceIds = input.selectedTempDataSourceIds?.length
+      ? input.selectedTempDataSourceIds
+      : sourceUserMessage.context?.temporaryDataSourceIds;
+    const tempSources = this.activeTempSources(input.userId, conversation.id, requestedTempSourceIds);
+    const reusableContext = this.reusableConversationContext(input.userId, conversation.id, tempSources);
+    const sourceMessageFieldRefs = this.fieldRefsForTempSources(sourceUserMessage.context?.selectedFieldRefs, tempSources);
+    const retrySelectedFieldRefs = input.selectedFieldRefs?.length
+      ? input.selectedFieldRefs
+      : sourceMessageFieldRefs.length
+        ? sourceMessageFieldRefs
+        : reusableContext.selectedFieldRefs ?? [];
+    const retrySkill = input.skill || sourceUserMessage.context?.skill || reusableContext.skill || null;
     const tempSchemaContextMarkdown = this.tempSourceManager.buildSchemaContextMarkdown({
       userId: input.userId,
       conversationId: conversation.id,
@@ -4156,7 +4240,7 @@ export class AssistantRuntime {
       selectedFieldRefs: retrySelectedFieldRefs,
       tempSchemaFieldLimit: input.tempSchemaFieldLimit,
       schemaContextMarkdown: [input.schemaContextMarkdown, tempSchemaContextMarkdown].filter(Boolean).join("\n\n") || null,
-      skill: input.skill,
+      skill: retrySkill,
       approvalMode: input.approvalMode,
       assistantMessageId: assistantMessage.id,
     };
@@ -4609,7 +4693,7 @@ export class AssistantRuntime {
 
   private async normalizePythonToolScript(input: { userId: string; conversationId: string; prompt?: string; script: string; selectedTempDataSourceIds?: string[]; selectedFieldRefs?: ChatCsvSelectedFieldRef[] }) {
     const normalizedInputScript = normalizePythonScriptParameter(input.script);
-    const isPreparedSkillRecipe = normalizedInputScript.startsWith("# cycle-probe:skill-analysis-recipe-v1");
+    const isPreparedSkillRecipe = normalizedInputScript.startsWith(SKILL_ANALYSIS_RECIPE_MARKER);
     const shouldReplaceScript =
       !isPreparedSkillRecipe && (
         this.shouldReplacePythonScript(normalizedInputScript) ||

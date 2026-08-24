@@ -164,7 +164,7 @@ function createMainWindow(): BrowserWindow {
     height: 840,
     minWidth: 1080,
     minHeight: 720,
-    title: "Cycle Probe",
+    title: "溯据",
     icon: currentDockIcon,
     backgroundColor: "#f7fafc",
     show: false,

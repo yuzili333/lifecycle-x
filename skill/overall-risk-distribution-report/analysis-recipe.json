@@ -1,0 +1,56 @@
+{
+  "kind": "overall-risk-distribution-v1",
+  "fieldRoles": {
+    "fiveLevelClassification": {
+      "candidates": [
+        "最新风险五级分类",
+        "风险五级分类",
+        "五级分类"
+      ]
+    },
+    "riskClassificationResult": {
+      "candidates": [
+        "最新风险分类结果",
+        "风险分类结果"
+      ]
+    },
+    "loanBalance": {
+      "candidates": [
+        "贷款余额",
+        "贷款余额(万元)",
+        "贷款余额（万元）",
+        "贷款余额(万)",
+        "贷款余额（万）",
+        "贷款余额(元)",
+        "贷款余额（元）",
+        "贷款余额(亿元)",
+        "贷款余额（亿元）"
+      ]
+    },
+    "contractAmount": {
+      "candidates": [
+        "合同金额",
+        "合同金额(万元)",
+        "合同金额（万元）",
+        "合同金额(万)",
+        "合同金额（万）",
+        "合同金额(元)",
+        "合同金额（元）",
+        "合同金额(亿元)",
+        "合同金额（亿元）"
+      ]
+    },
+    "contractSerial": {
+      "candidates": [
+        "合同流水号"
+      ]
+    }
+  },
+  "categoryOrder": [
+    "正常",
+    "关注",
+    "次级",
+    "可疑",
+    "损失"
+  ]
+}

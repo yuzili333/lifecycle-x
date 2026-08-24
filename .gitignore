@@ -15,3 +15,6 @@ output/
 # environment variables
 .env
 .env.*
+
+# 脱敏数据
+# de-identified-data/

@@ -34,6 +34,18 @@ const recipe = {
   },
 };
 
+const overallRiskRecipe = {
+  kind: "overall-risk-distribution-v1",
+  fieldRoles: {
+    fiveLevelClassification: { candidates: ["最新风险五级分类"] },
+    riskClassificationResult: { candidates: ["最新风险分类结果"] },
+    loanBalance: { candidates: ["贷款余额", "贷款余额(万元)"] },
+    contractAmount: { candidates: ["合同金额", "合同金额(万元)"] },
+    contractSerial: { candidates: ["合同流水号"] },
+  },
+  categoryOrder: ["正常", "关注", "次级", "可疑", "损失"],
+};
+
 describe("Skill analysis recipe compiler", () => {
   it("compiles real fields into a bounded executable Python aggregation", () => {
     const compiled = compileSkillAnalysisRecipe({
@@ -106,5 +118,87 @@ describe("Skill analysis recipe compiler", () => {
         fieldBindings: expect.objectContaining({ amount: "贷款余额（万元）" }),
       }),
     }));
+  });
+
+  it("compiles the overall risk Skill into one schema-ready JSON result", () => {
+    const compiled = compileSkillAnalysisRecipe({
+      recipe: overallRiskRecipe,
+      availableFields: ["最新风险五级分类", "贷款余额(万元)", "合同流水号"],
+      selectedFieldNames: ["最新风险五级分类", "贷款余额(万元)", "合同流水号"],
+      dataSourceName: "信贷风险.csv",
+    });
+    expect(compiled.ok).toBe(true);
+    if (!compiled.ok) return;
+    expect(compiled.value.fieldBindings).toEqual({
+      fiveLevelClassification: "最新风险五级分类",
+      riskClassificationResult: null,
+      loanBalance: "贷款余额(万元)",
+      contractAmount: null,
+      contractSerial: "合同流水号",
+    });
+    expect(compiled.value.script).toMatch(/^# cycle-probe:skill-analysis-recipe-v1\n# recipe-kind: overall-risk-distribution-v1/);
+    expect(compiled.value.script.length).toBeLessThan(12_000);
+    const rows = [
+      { "最新风险五级分类": "正常", "贷款余额(万元)": "100.5", "合同流水号": "C1" },
+      { "最新风险五级分类": "正常", "贷款余额(万元)": "100.5", "合同流水号": "C1" },
+      { "最新风险五级分类": "关注", "贷款余额(万元)": "200", "合同流水号": "C2" },
+      { "最新风险五级分类": "0300--次级", "贷款余额(万元)": "300", "合同流水号": "C3" },
+      { "最新风险五级分类": "", "贷款余额(万元)": "999", "合同流水号": "C4" },
+    ];
+    const stdout = execFileSync("python3", ["-I", "-S", "-c", compiled.value.script], {
+      input: JSON.stringify(rows),
+      encoding: "utf8",
+    });
+    const result = JSON.parse(stdout) as Record<string, any>;
+    expect(result).toMatchObject({
+      dataSourceName: "信贷风险.csv",
+      sourceFields: {
+        fiveLevelClassification: "最新风险五级分类",
+        riskClassificationResult: null,
+        loanBalance: "贷款余额(万元)",
+        loanBalanceUnit: "万元",
+        contractAmount: null,
+        contractAmountUnit: null,
+        contractSerial: "合同流水号",
+      },
+      countBasis: "contract_serial",
+      countBasisField: "合同流水号",
+      fallbackCode: null,
+      analyzedRecordCount: 3,
+      excludedRecordCount: 1,
+      totals: { count: 3, loanBalance: 600.5, contractAmount: null },
+      validation: {
+        countReconciled: true,
+        loanBalanceReconciled: true,
+        contractAmountReconciled: true,
+      },
+    });
+    expect(result.fiveLevelDistribution.map((item: any) => item.category)).toEqual(["正常", "关注", "次级", "可疑", "损失"]);
+    expect(result.nonperformingSummary).toMatchObject({ category: "不良类", count: 1, loanBalance: 300 });
+    expect(result.riskResultDistribution).toEqual([]);
+  });
+
+  it("falls back to valid rows when overall risk contract serials conflict", () => {
+    const compiled = compileSkillAnalysisRecipe({
+      recipe: overallRiskRecipe,
+      availableFields: ["最新风险五级分类", "贷款余额(万元)", "合同流水号"],
+      dataSourceName: "信贷风险.csv",
+    });
+    expect(compiled.ok).toBe(true);
+    if (!compiled.ok) return;
+    const stdout = execFileSync("python3", ["-I", "-S", "-c", compiled.value.script], {
+      input: JSON.stringify([
+        { "最新风险五级分类": "正常", "贷款余额(万元)": "100", "合同流水号": "C1" },
+        { "最新风险五级分类": "关注", "贷款余额(万元)": "200", "合同流水号": "C1" },
+      ]),
+      encoding: "utf8",
+    });
+    expect(JSON.parse(stdout)).toMatchObject({
+      countBasis: "valid_rows",
+      countBasisField: null,
+      fallbackCode: "conflicting_contract_records",
+      analyzedRecordCount: 2,
+      totals: { count: 2, loanBalance: 300 },
+    });
   });
 });

@@ -101,12 +101,13 @@ describe("Skill package validation", () => {
       "schemas/skill-input.schema.json",
       "schemas/report-data.schema.json",
       "tool-policy.json",
+      "analysis-recipe.json",
     ].map((relativePath) => readFile(join(root, relativePath), "utf8")));
 
     expect(validated.loaded.summary).toMatchObject({
       skillId: "overall-risk-distribution-report",
       displayName: "整体风险分类分布分析报告",
-      version: "1.0.9",
+      version: "1.0.10",
       origin: "system",
       enabled: true,
       canToggle: false,
@@ -122,6 +123,11 @@ describe("Skill package validation", () => {
     expect(validated.loaded.reportTemplate).toContain("nonperformingSummary");
     expect(validated.loaded.instructions).toContain("万元除以 `10,000`");
     expect(validated.loaded.instructions).toContain("Python 禁止生成 Markdown");
+    expect(validated.loaded.instructions).toContain("只读统计配方");
+    expect(validated.loaded.analysisRecipe).toMatchObject({
+      kind: "overall-risk-distribution-v1",
+      categoryOrder: ["正常", "关注", "次级", "可疑", "损失"],
+    });
     expect(validated.loaded.instructions).toContain("报告模型");
     expect(validated.loaded.instructions).toContain("五级分类笔数饼图");
     const outputSchemaText = JSON.stringify(validated.loaded.outputSchema);

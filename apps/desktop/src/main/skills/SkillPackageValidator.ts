@@ -228,6 +228,20 @@ function validateManifest(value: unknown, origin: SkillOrigin, traceId: string):
 
 function validateAnalysisRecipe(value: unknown, skillId: string, traceId: string) {
   const recipe = asRecord(value, "分析配方", skillId, traceId);
+  if (recipe.kind === "overall-risk-distribution-v1") {
+    const fieldRoles = asRecord(recipe.fieldRoles, "分析配方 fieldRoles", skillId, traceId);
+    for (const role of ["fiveLevelClassification", "riskClassificationResult", "loanBalance", "contractAmount", "contractSerial"] as const) {
+      const definition = asRecord(fieldRoles[role], `分析配方字段 ${role}`, skillId, traceId);
+      if (!isStringArray(definition.candidates) || definition.candidates.length === 0) {
+        throw schemaError(`分析配方字段 ${role}.candidates 必须是非空字符串数组。`, traceId, skillId);
+      }
+    }
+    if (!isStringArray(recipe.categoryOrder) || recipe.categoryOrder.length !== 5 ||
+      recipe.categoryOrder.join(",") !== "正常,关注,次级,可疑,损失") {
+      throw schemaError("整体风险分析配方 categoryOrder 必须依次为正常、关注、次级、可疑、损失。", traceId, skillId);
+    }
+    return recipe;
+  }
   if (recipe.kind !== "grouped-risk-distribution-v1") {
     throw schemaError("分析配方 kind 不受支持。", traceId, skillId);
   }

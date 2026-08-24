@@ -1,6 +1,14 @@
 type JsonRecord = Record<string, unknown>;
 
+export const SKILL_ANALYSIS_RECIPE_MARKER = "# cycle-probe:skill-analysis-recipe-v1";
+
 type FieldRole = "group" | "risk" | "amount" | "recordId";
+type OverallRiskFieldRole =
+  | "fiveLevelClassification"
+  | "riskClassificationResult"
+  | "loanBalance"
+  | "contractAmount"
+  | "contractSerial";
 
 type GroupedRiskDistributionRecipe = {
   kind: "grouped-risk-distribution-v1";
@@ -23,14 +31,17 @@ type GroupedRiskDistributionRecipe = {
   };
 };
 
+type OverallRiskDistributionRecipe = {
+  kind: "overall-risk-distribution-v1";
+  fieldRoles: Record<OverallRiskFieldRole, { candidates: string[] }>;
+  categoryOrder: string[];
+};
+
+type SkillAnalysisRecipe = GroupedRiskDistributionRecipe | OverallRiskDistributionRecipe;
+
 export type CompiledSkillAnalysisRecipe = {
   script: string;
-  fieldBindings: {
-    group: string;
-    risk: string;
-    amount: string;
-    recordId: string | null;
-  };
+  fieldBindings: Record<string, string | null>;
 };
 
 export type SkillAnalysisRecipeCompilation =
@@ -46,8 +57,8 @@ function stringArray(value: unknown): string[] | null {
   return value.map((item) => item.trim());
 }
 
-function parseRecipe(value: unknown): GroupedRiskDistributionRecipe | null {
-  if (!isRecord(value) || value.kind !== "grouped-risk-distribution-v1") return null;
+function parseGroupedRiskRecipe(value: JsonRecord): GroupedRiskDistributionRecipe | null {
+  if (value.kind !== "grouped-risk-distribution-v1") return null;
   if (!isRecord(value.fieldRoles) || !isRecord(value.riskRules) || !isRecord(value.output)) return null;
   const roles = {} as GroupedRiskDistributionRecipe["fieldRoles"];
   for (const role of ["group", "risk", "amount", "recordId"] as const) {
@@ -96,6 +107,26 @@ function parseRecipe(value: unknown): GroupedRiskDistributionRecipe | null {
   };
 }
 
+function parseOverallRiskRecipe(value: JsonRecord): OverallRiskDistributionRecipe | null {
+  if (value.kind !== "overall-risk-distribution-v1" || !isRecord(value.fieldRoles)) return null;
+  const roles = {} as OverallRiskDistributionRecipe["fieldRoles"];
+  for (const role of ["fiveLevelClassification", "riskClassificationResult", "loanBalance", "contractAmount", "contractSerial"] as const) {
+    const definition = value.fieldRoles[role];
+    if (!isRecord(definition)) return null;
+    const candidates = stringArray(definition.candidates);
+    if (!candidates?.length) return null;
+    roles[role] = { candidates };
+  }
+  const categoryOrder = stringArray(value.categoryOrder);
+  if (!categoryOrder?.length) return null;
+  return { kind: value.kind, fieldRoles: roles, categoryOrder };
+}
+
+function parseRecipe(value: unknown): SkillAnalysisRecipe | null {
+  if (!isRecord(value)) return null;
+  return parseGroupedRiskRecipe(value) ?? parseOverallRiskRecipe(value);
+}
+
 function normalizedFieldName(value: string) {
   return value
     .normalize("NFKC")
@@ -111,7 +142,7 @@ function unitlessFieldName(value: string) {
 }
 
 function resolveRoleField(input: {
-  role: FieldRole;
+  role: FieldRole | OverallRiskFieldRole;
   candidates: string[];
   availableFields: string[];
   selectedFieldNames: string[];
@@ -160,7 +191,7 @@ function pythonString(value: unknown) {
 
 function buildGroupedRiskDistributionScript(input: {
   recipe: GroupedRiskDistributionRecipe;
-  fields: CompiledSkillAnalysisRecipe["fieldBindings"];
+  fields: { group: string; risk: string; amount: string; recordId: string | null };
   amountUnit: string;
   dataSourceName: string;
 }) {
@@ -173,7 +204,7 @@ function buildGroupedRiskDistributionScript(input: {
     riskRules: input.recipe.riskRules,
     output: input.recipe.output,
   };
-  return `# cycle-probe:skill-analysis-recipe-v1
+  return `${SKILL_ANALYSIS_RECIPE_MARKER}
 import json
 import sys
 from decimal import Decimal, InvalidOperation
@@ -309,6 +340,238 @@ print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
 `;
 }
 
+function buildOverallRiskDistributionScript(input: {
+  recipe: OverallRiskDistributionRecipe;
+  fields: {
+    fiveLevelClassification: string;
+    riskClassificationResult: string | null;
+    loanBalance: string;
+    contractAmount: string | null;
+    contractSerial: string | null;
+  };
+  loanBalanceUnit: string;
+  contractAmountUnit: string | null;
+  dataSourceName: string;
+}) {
+  const config = {
+    fields: input.fields,
+    units: {
+      loanBalance: input.loanBalanceUnit,
+      contractAmount: input.contractAmountUnit,
+    },
+    dataSourceName: input.dataSourceName,
+    categoryOrder: input.recipe.categoryOrder,
+  };
+  return `${SKILL_ANALYSIS_RECIPE_MARKER}
+# recipe-kind: overall-risk-distribution-v1
+import json
+import sys
+from decimal import Decimal, InvalidOperation
+
+cfg = json.loads(${pythonString(config)})
+rows = json.load(sys.stdin)
+
+def text(value):
+    return "" if value is None else str(value).strip()
+
+def decimal_value(value):
+    raw = text(value).replace(",", "")
+    if not raw:
+        return None
+    try:
+        parsed = Decimal(raw)
+        return parsed if parsed.is_finite() and parsed >= 0 else None
+    except (InvalidOperation, ValueError):
+        return None
+
+def risk_category(value):
+    raw = text(value)
+    if "--" in raw:
+        raw = raw.split("--", 1)[1].strip()
+    for category in ("损失", "可疑", "次级", "关注", "正常"):
+        if category in raw:
+            return category
+    return None
+
+def ratio(numerator, denominator):
+    return None if denominator == 0 else float(numerator / denominator)
+
+clean = []
+for row in rows:
+    category = risk_category(row.get(cfg["fields"]["fiveLevelClassification"]))
+    loan_balance = decimal_value(row.get(cfg["fields"]["loanBalance"]))
+    if category is None or loan_balance is None:
+        continue
+    risk_result = text(row.get(cfg["fields"]["riskClassificationResult"])) if cfg["fields"]["riskClassificationResult"] else ""
+    contract_amount = decimal_value(row.get(cfg["fields"]["contractAmount"])) if cfg["fields"]["contractAmount"] else None
+    contract_serial = text(row.get(cfg["fields"]["contractSerial"])) if cfg["fields"]["contractSerial"] else ""
+    clean.append({
+        "category": category,
+        "riskResult": risk_result,
+        "loanBalance": loan_balance,
+        "contractAmount": contract_amount,
+        "contractSerial": contract_serial,
+    })
+
+fallback_code = None
+records = clean
+if not cfg["fields"]["contractSerial"]:
+    fallback_code = "missing_contract_serial"
+elif any(not item["contractSerial"] for item in clean):
+    fallback_code = "blank_contract_serial"
+else:
+    unique = {}
+    conflict = False
+    for item in clean:
+        signature = (item["category"], item["riskResult"], item["loanBalance"], item["contractAmount"])
+        previous = unique.get(item["contractSerial"])
+        if previous is not None and previous[0] != signature:
+            conflict = True
+            break
+        unique[item["contractSerial"]] = (signature, item)
+    if conflict:
+        fallback_code = "conflicting_contract_records"
+    else:
+        records = [entry[1] for entry in unique.values()]
+
+def aggregate(items, category):
+    selected = [item for item in items if item["category"] == category]
+    count = len(selected)
+    loan_balance = sum((item["loanBalance"] for item in selected), Decimal("0"))
+    contract_amount = None
+    if cfg["fields"]["contractAmount"]:
+        contract_amount = sum((item["contractAmount"] for item in selected if item["contractAmount"] is not None), Decimal("0"))
+    return count, loan_balance, contract_amount
+
+total_count = len(records)
+total_loan_balance = sum((item["loanBalance"] for item in records), Decimal("0"))
+total_contract_amount = None
+if cfg["fields"]["contractAmount"]:
+    total_contract_amount = sum((item["contractAmount"] for item in records if item["contractAmount"] is not None), Decimal("0"))
+
+def distribution_item(category, count, loan_balance, contract_amount):
+    return {
+        "category": category,
+        "count": count,
+        "countShare": ratio(Decimal(count), Decimal(total_count)),
+        "loanBalance": float(loan_balance),
+        "loanBalanceShare": ratio(loan_balance, total_loan_balance),
+        "contractAmount": float(contract_amount) if contract_amount is not None else None,
+    }
+
+five_level_distribution = []
+category_values = {}
+for category in cfg["categoryOrder"]:
+    values = aggregate(records, category)
+    category_values[category] = values
+    five_level_distribution.append(distribution_item(category, *values))
+
+nonperforming_categories = ("次级", "可疑", "损失")
+nonperforming_count = sum(category_values[category][0] for category in nonperforming_categories)
+nonperforming_balance = sum((category_values[category][1] for category in nonperforming_categories), Decimal("0"))
+nonperforming_contract_amount = None
+if cfg["fields"]["contractAmount"]:
+    nonperforming_contract_amount = sum((category_values[category][2] for category in nonperforming_categories), Decimal("0"))
+
+risk_result_distribution = []
+if cfg["fields"]["riskClassificationResult"]:
+    labels = sorted({item["riskResult"] for item in records if item["riskResult"]})
+    for label in labels:
+        selected = [item for item in records if item["riskResult"] == label]
+        count = len(selected)
+        loan_balance = sum((item["loanBalance"] for item in selected), Decimal("0"))
+        contract_amount = None
+        if cfg["fields"]["contractAmount"]:
+            contract_amount = sum((item["contractAmount"] for item in selected if item["contractAmount"] is not None), Decimal("0"))
+        risk_result_distribution.append(distribution_item(label, count, loan_balance, contract_amount))
+
+result = {
+    "dataSourceName": cfg["dataSourceName"],
+    "sourceFields": {
+        "fiveLevelClassification": cfg["fields"]["fiveLevelClassification"],
+        "riskClassificationResult": cfg["fields"]["riskClassificationResult"],
+        "loanBalance": cfg["fields"]["loanBalance"],
+        "loanBalanceUnit": cfg["units"]["loanBalance"],
+        "contractAmount": cfg["fields"]["contractAmount"],
+        "contractAmountUnit": cfg["units"]["contractAmount"],
+        "contractSerial": cfg["fields"]["contractSerial"],
+    },
+    "countBasis": "valid_rows" if fallback_code else "contract_serial",
+    "countBasisField": None if fallback_code else cfg["fields"]["contractSerial"],
+    "fallbackCode": fallback_code,
+    "analyzedRecordCount": total_count,
+    "excludedRecordCount": len(rows) - len(clean),
+    "totals": {
+        "count": total_count,
+        "loanBalance": float(total_loan_balance),
+        "contractAmount": float(total_contract_amount) if total_contract_amount is not None else None,
+    },
+    "fiveLevelDistribution": five_level_distribution,
+    "nonperformingSummary": distribution_item("不良类", nonperforming_count, nonperforming_balance, nonperforming_contract_amount),
+    "riskResultDistribution": risk_result_distribution,
+    "validation": {
+        "countReconciled": sum(item["count"] for item in five_level_distribution) == total_count,
+        "loanBalanceReconciled": sum((category_values[category][1] for category in cfg["categoryOrder"]), Decimal("0")) == total_loan_balance,
+        "contractAmountReconciled": total_contract_amount is None or sum((category_values[category][2] for category in cfg["categoryOrder"]), Decimal("0")) == total_contract_amount,
+    },
+}
+print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+`;
+}
+
+function compileOverallRiskDistributionRecipe(input: {
+  recipe: OverallRiskDistributionRecipe;
+  availableFields: string[];
+  selectedFieldNames: string[];
+  dataSourceName: string;
+}): SkillAnalysisRecipeCompilation {
+  const resolve = (role: OverallRiskFieldRole, optional = false) => resolveRoleField({
+    role,
+    candidates: input.recipe.fieldRoles[role].candidates,
+    availableFields: input.availableFields,
+    selectedFieldNames: input.selectedFieldNames,
+    optional,
+  });
+  const fiveLevelClassification = resolve("fiveLevelClassification");
+  const riskClassificationResult = resolve("riskClassificationResult", true);
+  const loanBalance = resolve("loanBalance");
+  const contractAmount = resolve("contractAmount", true);
+  const contractSerial = resolve("contractSerial", true);
+  if ("error" in fiveLevelClassification) return { ok: false, error: fiveLevelClassification.error };
+  if ("error" in riskClassificationResult) return { ok: false, error: riskClassificationResult.error };
+  if ("error" in loanBalance) return { ok: false, error: loanBalance.error };
+  if ("error" in contractAmount) return { ok: false, error: contractAmount.error };
+  if ("error" in contractSerial) return { ok: false, error: contractSerial.error };
+  const fields = {
+    fiveLevelClassification: fiveLevelClassification.value as string,
+    riskClassificationResult: riskClassificationResult.value,
+    loanBalance: loanBalance.value as string,
+    contractAmount: contractAmount.value,
+    contractSerial: contractSerial.value,
+  };
+  const loanBalanceUnit = amountSourceUnit(fields.loanBalance);
+  if (!loanBalanceUnit) {
+    return { ok: false, error: `无法从真实金额字段“${fields.loanBalance}”确认元、万元或亿元单位，请选择带单位的金额字段。` };
+  }
+  const contractAmountUnit = fields.contractAmount ? amountSourceUnit(fields.contractAmount) : null;
+  if (fields.contractAmount && !contractAmountUnit) {
+    return { ok: false, error: `无法从真实金额字段“${fields.contractAmount}”确认元、万元或亿元单位，请选择带单位的金额字段。` };
+  }
+  return {
+    ok: true,
+    value: {
+      fieldBindings: fields,
+      script: buildOverallRiskDistributionScript({
+        recipe: input.recipe,
+        fields,
+        loanBalanceUnit,
+        contractAmountUnit,
+        dataSourceName: input.dataSourceName.trim() || "当前数据源",
+      }),
+    },
+  };
+}
+
 export function compileSkillAnalysisRecipe(input: {
   recipe: Record<string, unknown>;
   availableFields: string[];
@@ -318,6 +581,14 @@ export function compileSkillAnalysisRecipe(input: {
   const recipe = parseRecipe(input.recipe);
   if (!recipe) return { ok: false, error: "Skill 分析配方无效或当前运行时不支持。" };
   const selectedFieldNames = input.selectedFieldNames ?? [];
+  if (recipe.kind === "overall-risk-distribution-v1") {
+    return compileOverallRiskDistributionRecipe({
+      recipe,
+      availableFields: input.availableFields,
+      selectedFieldNames,
+      dataSourceName: input.dataSourceName,
+    });
+  }
   const group = resolveRoleField({ role: "group", candidates: recipe.fieldRoles.group.candidates, availableFields: input.availableFields, selectedFieldNames });
   const risk = resolveRoleField({ role: "risk", candidates: recipe.fieldRoles.risk.candidates, availableFields: input.availableFields, selectedFieldNames });
   const amount = resolveRoleField({ role: "amount", candidates: recipe.fieldRoles.amount.candidates, availableFields: input.availableFields, selectedFieldNames });

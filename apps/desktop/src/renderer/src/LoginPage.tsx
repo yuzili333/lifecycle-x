@@ -168,7 +168,7 @@ export function LoginPage({ onPasswordLogin, onSsoComplete, lastError, onError }
             <form className="login-form" onKeyDown={handleCredentialsKeyDown}>
               <VStack gap={1} hAlign="center">
                 <Text type="display-3" as="h1">
-                  Cycle Probe
+                  溯据
                 </Text>
                 <Text type="body" color="secondary" size="sm">
                   使用内部账号或企业SSO登录

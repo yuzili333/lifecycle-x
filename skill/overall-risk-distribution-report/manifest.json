@@ -3,7 +3,7 @@
   "name": "overall-risk-distribution-report",
   "displayName": "整体风险分类分布分析报告",
   "description": "基于所选数据源的真实字段查询并分析整体风险分类笔数和贷款余额分布，生成五级分类、分类结果明细、笔数饼图、贷款余额柱状图及匹配模板的 Markdown 报告。",
-  "version": "1.0.9",
+  "version": "1.0.10",
   "category": "credit-risk-analysis",
   "tags": [
     "信贷资产",
@@ -36,6 +36,7 @@
   "inputSchemaFile": "schemas/skill-input.schema.json",
   "reportDataSchemaFile": "schemas/report-data.schema.json",
   "toolPolicyFile": "tool-policy.json",
+  "analysisRecipeFile": "analysis-recipe.json",
   "aliases": [
     "@整体风险分类分布",
     "@风险分类分布报告",

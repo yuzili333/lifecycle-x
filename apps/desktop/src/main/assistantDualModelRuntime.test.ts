@@ -1034,6 +1034,298 @@ describe("AssistantRuntime dual-model flow", () => {
     });
   });
 
+  it("executes the overall-risk Skill recipe without a Python model request", async () => {
+    const temp = mkdtempSync(join(tmpdir(), "cycle-probe-overall-risk-recipe-"));
+    const skillRoot = join(process.cwd(), "../../skill/overall-risk-distribution-report");
+    const manifest = JSON.parse(readFileSync(join(skillRoot, "manifest.json"), "utf8"));
+    const skillSnapshot = {
+      summary: {
+        skillId: manifest.skillId,
+        displayName: manifest.displayName,
+        description: manifest.description,
+        version: manifest.version,
+        category: manifest.category,
+        origin: "system" as const,
+        enabled: true,
+        availability: "ready" as const,
+        tags: manifest.tags,
+        keywords: manifest.keywords,
+        aliases: manifest.aliases,
+        canToggle: false,
+        canDelete: false,
+      },
+      requiredTools: manifest.requiredTools,
+      instructions: readFileSync(join(skillRoot, "SKILL.md"), "utf8"),
+      outputSchema: JSON.parse(readFileSync(join(skillRoot, "schemas/report-data.schema.json"), "utf8")),
+      analysisRecipe: JSON.parse(readFileSync(join(skillRoot, "analysis-recipe.json"), "utf8")),
+      contentHash: "overall-risk-analysis-recipe-test",
+      loadedAt: new Date().toISOString(),
+    };
+    const runtime = new AssistantRuntime({
+      dbPath: join(temp, "assistant.sqlite"),
+      csvSqlitePath: createCsvMetadataDatabase(temp),
+      toolLogPath: join(temp, "tools.jsonl"),
+      getModelApiKey: async () => "test-key",
+      loadSkill: async () => skillSnapshot,
+      emit: () => undefined,
+    });
+    const conversation = runtime.createConversation("user-1");
+    const attachment = runtime.importConversationCsv({
+      userId: "user-1",
+      conversationId: conversation.id,
+      fileName: "overall-risk.csv",
+      fileSizeBytes: 180,
+      fileBuffer: new TextEncoder().encode([
+        "最新风险五级分类,贷款余额(万元),合同流水号",
+        "正常,100,HT001",
+        "关注,200,HT002",
+        "次级,300,HT003",
+        "正常,100,HT001",
+      ].join("\n")),
+    });
+    const responses = [
+      toolCallResponse("plan-overall-risk-recipe", "submit_agent_execution_plan", {
+        outcome: "execute",
+        summary: "查询并统计整体风险分类分布。",
+        requestedOutputs: ["query", "analysis"],
+        steps: [
+          {
+            stepId: "query",
+            toolKind: "sql_query",
+            purpose: "查询整体风险分类明细",
+            dependencies: [],
+            inputResolution: "selected_data_source",
+            expectedOutput: "查询 Artifact",
+          },
+          {
+            stepId: "analysis",
+            toolKind: "python_analysis",
+            purpose: "统计整体风险分类笔数和贷款余额分布",
+            dependencies: ["query"],
+            inputResolution: "current_run",
+            expectedOutput: "统计 Artifact",
+          },
+        ],
+      }),
+      nonStreamToolCallResponse("sql-overall-risk-recipe", "request_sql_query_execution", {
+        sql: `SELECT T1."最新风险五级分类", T1."贷款余额(万元)", T1."合同流水号" FROM "${attachment.sqliteTableName}" AS T1`,
+      }),
+    ];
+    const requests: Array<Record<string, unknown>> = [];
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init?: RequestInit) => {
+      requests.push(JSON.parse(String(init?.body ?? "{}")));
+      const response = responses.shift();
+      if (!response) throw new Error("unexpected Python model request");
+      return response;
+    }));
+
+    const result = await runtime.sendMessage({
+      userId: "user-1",
+      conversationId: conversation.id,
+      clientRequestId: "overall-risk-analysis-recipe",
+      prompt: "分析整体风险分类的笔数和贷款余额分布",
+      modelName: "reasoning-model",
+      executionModelName: "execution-model",
+      dualModelOrchestrationEnabled: true,
+      dataSourceLabel: attachment.fileName,
+      selectedTempDataSourceIds: [attachment.tempDataSourceId!],
+      skill: skillSnapshot.summary.skillId,
+      approvalMode: "full_access",
+    });
+    const run = await waitForRun(runtime, "user-1", result.assistantMessage.id, "completed");
+    const records = (await runtime.listConversationToolCalls("user-1", result.conversation.id))
+      .filter((record) => record.messageId === result.assistantMessage.id);
+
+    expect(requests).toHaveLength(2);
+    expect(responses).toHaveLength(0);
+    expect(run.completedStepIds).toEqual(["query", "analysis"]);
+    expect(records.map((record) => [record.toolKind, record.status])).toEqual([
+      ["sql_query", "completed"],
+      ["python_analysis", "completed"],
+    ]);
+    expect(records[1]?.request.script).toMatch(/^# cycle-probe:skill-analysis-recipe-v1\n# recipe-kind: overall-risk-distribution-v1/);
+    const resultEnvelope = JSON.parse(String(records[1]?.result?.metadata?.resultPreview ?? "{}"));
+    expect(JSON.parse(resultEnvelope.stdout)).toMatchObject({
+      countBasis: "contract_serial",
+      analyzedRecordCount: 3,
+      totals: { count: 3, loanBalance: 600, contractAmount: null },
+      validation: {
+        countReconciled: true,
+        loanBalanceReconciled: true,
+        contractAmountReconciled: true,
+      },
+    });
+  });
+
+  it("inherits the confirmed Skill and CSV fields for a follow-up turn", async () => {
+    const temp = mkdtempSync(join(tmpdir(), "cycle-probe-follow-up-context-"));
+    const skillRoot = join(process.cwd(), "../../skill/overall-risk-distribution-report");
+    const manifest = JSON.parse(readFileSync(join(skillRoot, "manifest.json"), "utf8"));
+    const skillSnapshot = {
+      summary: {
+        skillId: manifest.skillId,
+        displayName: manifest.displayName,
+        description: manifest.description,
+        version: manifest.version,
+        category: manifest.category,
+        origin: "system" as const,
+        enabled: true,
+        availability: "ready" as const,
+        tags: manifest.tags,
+        keywords: manifest.keywords,
+        aliases: manifest.aliases,
+        canToggle: false,
+        canDelete: false,
+      },
+      requiredTools: manifest.requiredTools,
+      instructions: readFileSync(join(skillRoot, "SKILL.md"), "utf8"),
+      outputSchema: JSON.parse(readFileSync(join(skillRoot, "schemas/report-data.schema.json"), "utf8")),
+      analysisRecipe: JSON.parse(readFileSync(join(skillRoot, "analysis-recipe.json"), "utf8")),
+      contentHash: "follow-up-context-skill",
+      loadedAt: new Date().toISOString(),
+    };
+    const runtime = new AssistantRuntime({
+      dbPath: join(temp, "assistant.sqlite"),
+      csvSqlitePath: createCsvMetadataDatabase(temp),
+      toolLogPath: join(temp, "tools.jsonl"),
+      getModelApiKey: async () => "test-key",
+      loadSkill: async () => skillSnapshot,
+      emit: () => undefined,
+    });
+    const conversation = runtime.createConversation("user-1");
+    const attachment = runtime.importConversationCsv({
+      userId: "user-1",
+      conversationId: conversation.id,
+      fileName: "overall-risk.csv",
+      fileSizeBytes: 120,
+      fileBuffer: new TextEncoder().encode([
+        "最新风险五级分类,贷款余额(万元),合同流水号",
+        "正常,100,HT001",
+        "关注,200,HT002",
+      ].join("\n")),
+    });
+    const selectedFieldRefs = attachment.columns!.map((column, index) => ({
+      tokenId: `field-${index}`,
+      type: "csv_field" as const,
+      tempDataSourceId: attachment.tempDataSourceId!,
+      tempTableId: attachment.tempTableId!,
+      fieldId: `${attachment.tempDataSourceId}:${column.sourceHeader}`,
+      sourceHeader: column.sourceHeader,
+      physicalName: column.sqliteColumnName,
+      displayName: column.displayName,
+      logicalType: column.inferredLogicalType,
+      sqliteType: column.sqliteType,
+      rawText: `#${column.displayName}`,
+      start: index * 10,
+      end: index * 10 + column.displayName.length + 1,
+      createdAt: new Date().toISOString(),
+      status: "valid" as const,
+    }));
+    const responses = [
+      toolCallResponse("plan-initial-context", "submit_agent_execution_plan", {
+        outcome: "respond",
+        summary: "已确认分析上下文。",
+        responseText: "已确认分析上下文。",
+        requestedOutputs: [],
+        steps: [],
+      }),
+      toolCallResponse("plan-follow-up-context", "submit_agent_execution_plan", {
+        outcome: "respond",
+        summary: "已按上一轮上下文处理追问。",
+        responseText: "已按上一轮上下文处理追问。",
+        requestedOutputs: [],
+        steps: [],
+      }),
+      toolCallResponse("plan-new-source-context", "submit_agent_execution_plan", {
+        outcome: "respond",
+        summary: "已切换数据源。",
+        responseText: "已切换数据源。",
+        requestedOutputs: [],
+        steps: [],
+      }),
+    ];
+    const requests: Array<Record<string, unknown>> = [];
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init?: RequestInit) => {
+      requests.push(JSON.parse(String(init?.body ?? "{}")));
+      const response = responses.shift();
+      if (!response) throw new Error("unexpected model request");
+      return response;
+    }));
+
+    const initial = await runtime.sendMessage({
+      userId: "user-1",
+      conversationId: conversation.id,
+      clientRequestId: "initial-context",
+      prompt: "分析整体风险分类分布",
+      modelName: "reasoning-model",
+      executionModelName: "execution-model",
+      dualModelOrchestrationEnabled: true,
+      selectedTempDataSourceIds: [attachment.tempDataSourceId!],
+      selectedFieldRefs,
+      skill: skillSnapshot.summary.skillId,
+      approvalMode: "full_access",
+    });
+    await waitForRun(runtime, "user-1", initial.assistantMessage.id, "completed");
+
+    const followUp = await runtime.sendMessage({
+      userId: "user-1",
+      conversationId: conversation.id,
+      clientRequestId: "follow-up-context",
+      prompt: "按贷款余额降序重新展示，并生成新版报告",
+      modelName: "reasoning-model",
+      executionModelName: "execution-model",
+      dualModelOrchestrationEnabled: true,
+      selectedTempDataSourceIds: [attachment.tempDataSourceId!],
+      selectedFieldRefs: [],
+      schemaContextMarkdown: "FULL_SCHEMA_SHOULD_BE_REPLACED",
+      skill: null,
+      approvalMode: "full_access",
+    });
+    const run = await waitForRun(runtime, "user-1", followUp.assistantMessage.id, "completed");
+
+    expect(followUp.userMessage.context?.skill).toBe(skillSnapshot.summary.skillId);
+    expect(followUp.userMessage.context?.selectedFieldRefs?.map((field) => field.displayName)).toEqual([
+      "最新风险五级分类",
+      "贷款余额(万元)",
+      "合同流水号",
+    ]);
+    expect(run.input?.skill).toBe(skillSnapshot.summary.skillId);
+    expect(run.input?.selectedFieldRefs).toHaveLength(3);
+    expect(run.input?.schemaContextMarkdown).toContain("## 本轮已选字段");
+    expect(run.input?.schemaContextMarkdown).not.toContain("FULL_SCHEMA_SHOULD_BE_REPLACED");
+    expect(JSON.stringify(requests[1])).toContain("overall-risk-distribution-report");
+    expect(JSON.stringify(requests[1])).toContain("贷款余额(万元)");
+
+    const replacement = runtime.importConversationCsv({
+      userId: "user-1",
+      conversationId: conversation.id,
+      fileName: "replacement.csv",
+      fileSizeBytes: 80,
+      fileBuffer: new TextEncoder().encode([
+        "最新风险五级分类,贷款余额(万元),合同流水号",
+        "正常,300,NEW001",
+      ].join("\n")),
+    });
+    const newSourceTurn = await runtime.sendMessage({
+      userId: "user-1",
+      conversationId: conversation.id,
+      clientRequestId: "new-source-context",
+      prompt: "改用新文件继续分析",
+      modelName: "reasoning-model",
+      executionModelName: "execution-model",
+      dualModelOrchestrationEnabled: true,
+      selectedTempDataSourceIds: [replacement.tempDataSourceId!],
+      selectedFieldRefs: [],
+      skill: null,
+      approvalMode: "full_access",
+    });
+    const newSourceRun = await waitForRun(runtime, "user-1", newSourceTurn.assistantMessage.id, "completed");
+
+    expect(newSourceTurn.userMessage.context?.skill).toBe(skillSnapshot.summary.skillId);
+    expect(newSourceTurn.userMessage.context?.selectedFieldRefs).toEqual([]);
+    expect(newSourceRun.input?.selectedFieldRefs).toEqual([]);
+  });
+
   it("repairs empty SQL identifiers for a system Skill before creating a tool call", async () => {
     const temp = mkdtempSync(join(tmpdir(), "cycle-probe-system-skill-empty-sql-"));
     const runtime = new AssistantRuntime({
