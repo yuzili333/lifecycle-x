@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { AuthStore, MAX_FAILED_ATTEMPTS } from "./authStore.js";
+import { AuthStore, MAX_FAILED_ATTEMPTS, PUBLIC_DEMO_PASSWORD } from "./authStore.js";
 
 describe("AuthStore", () => {
   it("validates seeded user passwords and returns role permissions", () => {
@@ -7,21 +7,18 @@ describe("AuthStore", () => {
     const user = store.findUserByIdentifier("analyst");
 
     expect(user).toBeDefined();
-    expect(user && store.isPasswordValid(user, "Lifecycle@123")).toBe(true);
+    expect(user && store.isPasswordValid(user, PUBLIC_DEMO_PASSWORD)).toBe(true);
     expect(user && store.permissionsFor(user)).toContain("analysis:run");
     expect(user && store.permissionsFor(user)).not.toContain("audit:read");
   });
 
-  it("includes requested local administrator seed accounts", () => {
+  it("ships only generic local demo identities", () => {
     const store = new AuthStore();
-
-    for (const [username, password] of [["yuzili", "yuzili"], ["weiqi", "weiqi"]] as const) {
-      const user = store.findUserByIdentifier(username);
-      expect(user).toBeDefined();
-      expect(user?.role).toBe("admin");
-      expect(user && store.isPasswordValid(user, password)).toBe(true);
-      expect(user && store.permissionsFor(user)).toEqual(expect.arrayContaining(["user:manage", "audit:read", "datasource:manage"]));
-    }
+    const admin = store.findUserByIdentifier("admin");
+    expect(admin?.role).toBe("admin");
+    expect(admin && store.isPasswordValid(admin, PUBLIC_DEMO_PASSWORD)).toBe(true);
+    expect(store.findUserByIdentifier("analyst")?.role).toBe("user");
+    expect(store.findUserByIdentifier("disabled")?.status).toBe("disabled");
   });
 
   it("locks an account after five failed attempts", () => {

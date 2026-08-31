@@ -3,6 +3,7 @@ import { writeFile } from "node:fs/promises";
 import type { PythonRunnerAdapter, PythonRunnerAdapterResult, PythonRunnerModuleConfig, PythonSandboxRunInput } from "./types.js";
 import { PythonArtifactManager } from "./pythonArtifactManager.js";
 import { PythonSandboxPolicy } from "./pythonSandboxPolicy.js";
+import { resolvePythonExecutable } from "../pythonRuntime.js";
 
 export class LocalPythonRunnerAdapter implements PythonRunnerAdapter {
   private readonly sandboxPolicy: PythonSandboxPolicy;
@@ -34,7 +35,7 @@ export class LocalPythonRunnerAdapter implements PythonRunnerAdapter {
     });
 
     const env = this.sandboxPolicy.buildSafeEnv(paths);
-    const child = spawn(this.config.pythonExecutable ?? "python3", ["script.py"], {
+    const child = spawn(this.config.pythonExecutable ?? resolvePythonExecutable(), ["script.py"], {
       cwd: paths.runDir,
       env,
       stdio: ["ignore", "pipe", "pipe"],

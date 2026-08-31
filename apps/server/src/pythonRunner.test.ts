@@ -14,6 +14,7 @@ import {
   type PythonRunnerModuleConfig,
   type PythonUserPermissionContext,
 } from "./pythonRunner/index.js";
+import { resolvePythonExecutable } from "./pythonRuntime.js";
 
 const allowedLibraries = ["pandas", "numpy", "matplotlib", "math", "statistics", "json", "csv", "datetime", "re", "collections", "itertools", "scipy", "sklearn"];
 
@@ -66,7 +67,7 @@ function createModule(overrides: Partial<PythonRunnerModuleConfig> = {}) {
     requireApprovalByDefault: true,
     allowedLibraries,
     sandboxRootDir: join(tmpdir(), `cycle-probe-python-${randomUUID()}`),
-    pythonExecutable: "python3",
+    pythonExecutable: resolvePythonExecutable(),
     datasetResolver: createDatasetResolver(),
     auditLogger,
     ...overrides,

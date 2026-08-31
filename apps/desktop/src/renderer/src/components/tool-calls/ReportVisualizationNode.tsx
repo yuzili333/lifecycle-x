@@ -34,18 +34,26 @@ export type ReportVisualizationState =
 const artifactRequestCache = new Map<string, Promise<ResolvedReportVisualizationArtifact>>();
 
 export function ReportVisualizationNode(props: ReportVisualizationNodeProps) {
+  const { artifactId, conversationId, reportArtifactId, reportVersion, resolveArtifact, title, userId } = props;
   const [retryCount, setRetryCount] = useState(0);
-  const [state, setState] = useState<ReportVisualizationState>(() => props.artifactId ? { status: "loading" } : { status: "failed", message: "该可视化内容暂时无法显示。" });
+  const [state, setState] = useState<ReportVisualizationState>(() => artifactId ? { status: "loading" } : { status: "failed", message: "该可视化内容暂时无法显示。" });
   const cacheKey = cacheKeyFor(props);
 
   useEffect(() => {
-    if (!props.artifactId) {
+    if (!artifactId) {
       setState({ status: "failed", message: "该可视化内容暂时无法显示。" });
       return;
     }
     let active = true;
     setState({ status: "loading" });
-    const request = cachedArtifactRequest(props, cacheKey);
+    const request = cachedArtifactRequest({
+      artifactId,
+      conversationId,
+      reportArtifactId,
+      reportVersion,
+      resolveArtifact,
+      userId,
+    }, cacheKey);
     void request
       .then((artifact) => {
         if (!active) {
@@ -73,13 +81,13 @@ export function ReportVisualizationNode(props: ReportVisualizationNodeProps) {
     return () => {
       active = false;
     };
-  }, [cacheKey, props.artifactId, props.conversationId, props.reportArtifactId, props.resolveArtifact, props.userId, retryCount]);
+  }, [artifactId, cacheKey, conversationId, reportArtifactId, reportVersion, resolveArtifact, retryCount, userId]);
 
   return (
     <ReportVisualizationContent
       state={state}
-      title={props.title}
-      artifactId={props.artifactId}
+      title={title}
+      artifactId={artifactId}
       retryKey={`${cacheKey}\u0000${retryCount}`}
       onRetry={() => retryArtifact(cacheKey, setRetryCount)}
     />

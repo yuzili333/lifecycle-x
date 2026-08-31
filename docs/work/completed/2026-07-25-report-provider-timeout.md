@@ -1,6 +1,7 @@
 # Task: Report Provider Timeout Recovery
 
 - Status: completed
+- Archived: 2026-08-31
 - Owner: human + agent
 - Started: 2026-07-25
 

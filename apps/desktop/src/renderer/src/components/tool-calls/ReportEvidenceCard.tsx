@@ -42,15 +42,16 @@ const evidenceMarkdownComponents: MarkdownComponents = {
 };
 
 export function ReportEvidenceCard(props: ReportEvidenceCardProps) {
-  const [state, setState] = useState<EvidenceState>(props.evidenceCardId ? { status: "loading" } : { status: "invalid" });
+  const { conversationId, evidenceCardId, reportArtifactId, reportVersion, resolveArtifact, sectionNumber, userId } = props;
+  const [state, setState] = useState<EvidenceState>(evidenceCardId ? { status: "loading" } : { status: "invalid" });
   useEffect(() => {
-    if (!props.evidenceCardId) {
+    if (!evidenceCardId) {
       setState({ status: "invalid" });
       return;
     }
     let cancelled = false;
     setState({ status: "loading" });
-    resolveEvidence(props)
+    resolveEvidence({ conversationId, evidenceCardId, reportArtifactId, reportVersion, resolveArtifact, userId })
       .then((result) => {
         if (!cancelled) setState({ status: "ready", card: result.evidenceCard });
       })
@@ -60,8 +61,8 @@ export function ReportEvidenceCard(props: ReportEvidenceCardProps) {
     return () => {
       cancelled = true;
     };
-  }, [props.conversationId, props.evidenceCardId, props.reportArtifactId, props.reportVersion, props.resolveArtifact, props.userId]);
-  return <ReportEvidenceCardContent state={state} sectionNumber={props.sectionNumber} />;
+  }, [conversationId, evidenceCardId, reportArtifactId, reportVersion, resolveArtifact, userId]);
+  return <ReportEvidenceCardContent state={state} sectionNumber={sectionNumber} />;
 }
 
 export function ReportEvidenceCardContent({ state, sectionNumber }: { state: EvidenceState; sectionNumber?: string }) {

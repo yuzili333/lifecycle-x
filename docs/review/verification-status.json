@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "macosAppleSilicon": {
+    "status": "verified",
+    "verifiedAt": "2026-08-31",
+    "evidence": [
+      "pnpm run setup",
+      "pnpm verify",
+      "pnpm dev health-gated launch",
+      "generic analyst login and missing-key gate",
+      "clean process shutdown",
+      "existing Golden Path 2/2 on the unchanged tool and report protocol"
+    ]
+  },
+  "windows11X64": {
+    "status": "pending",
+    "verifiedAt": null,
+    "evidence": [],
+    "note": "Requires an independent Windows 11 x64 clean-environment run."
+  }
+}

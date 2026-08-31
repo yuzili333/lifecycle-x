@@ -865,7 +865,7 @@ export function DataManagementWorkspace({
     [activeSchemaTables, activeTab, openTableTab],
   );
   const activeSampleData = activeTab?.kind === "table" ? sampleDataByTabId[activeTab.id] : null;
-  const activeSampleRows = activeSampleData?.rows ?? [];
+  const activeSampleRows = useMemo(() => activeSampleData?.rows ?? [], [activeSampleData]);
   const activeRowsTotal = activeTab?.kind === "database" ? activeTableRows.length : activeTab?.kind === "table" ? activeSampleRows.length : 0;
   const activePageSize = activeTab ? tabPageSizes[activeTab.id] ?? DEFAULT_TABLE_PAGE_SIZE : DEFAULT_TABLE_PAGE_SIZE;
   const activePaginationPage = activeTab ? tabPages[activeTab.id] ?? 1 : 1;

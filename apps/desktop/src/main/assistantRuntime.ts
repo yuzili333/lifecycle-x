@@ -109,6 +109,8 @@ import {
 } from "./agentGuidance";
 import { compactSkillResultContract, validateSkillResult } from "./skills/SkillResultValidator";
 import { compileSkillAnalysisRecipe, SKILL_ANALYSIS_RECIPE_MARKER } from "./skills/SkillAnalysisRecipe";
+import { resolvePythonExecutable, restrictedPythonEnvironment } from "./pythonRuntime";
+import { MODEL_PROVIDER_BASE_URL, MODEL_PROVIDER_NAME } from "./modelProviderConfig";
 
 const require = createRequire(import.meta.url);
 const Database = require("better-sqlite3");
@@ -373,7 +375,6 @@ type ToolDetection = {
   script: string;
 };
 
-const SILICONFLOW_CHAT_COMPLETIONS_URL = "https://api.siliconflow.cn/v1/chat/completions";
 const MAX_STORED_MESSAGES_FOR_CONTEXT = 12;
 const MAX_STREAM_CHARS = 120_000;
 const MODEL_STREAM_TIMEOUT_MS = 180_000;
@@ -1777,8 +1778,8 @@ export function validatePythonScriptSyntax(
         "        validate_module_target(node.module, getattr(node, 'lineno', 0))",
       ]),
     ].join("\n");
-    const child = spawn("python3", ["-I", "-S", "-c", validator], {
-      env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
+    const child = spawn(resolvePythonExecutable(), ["-I", "-S", "-c", validator], {
+      env: restrictedPythonEnvironment(),
       shell: false,
       stdio: ["pipe", "ignore", "pipe"],
     });
@@ -7281,9 +7282,9 @@ export class AssistantRuntime {
       }
       const workingDirectory = join(tmpdir(), "cycle-probe-python-sandbox");
       mkdirSync(workingDirectory, { recursive: true });
-      const child = spawn("python3", ["-I", "-S", "-c", script], {
+      const child = spawn(resolvePythonExecutable(), ["-I", "-S", "-c", script], {
         cwd: workingDirectory,
-        env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
+        env: restrictedPythonEnvironment(),
         shell: false,
         stdio: [inputRows ? "pipe" : "ignore", "pipe", "pipe"],
       });
@@ -7489,8 +7490,8 @@ export class AssistantRuntime {
 
       this.agentTurnOrchestrator.routing(runId);
       const router = new TaskRouterAdapter({
-        providerName: "siliconflow",
-        baseURL: "https://api.siliconflow.cn/v1",
+        providerName: MODEL_PROVIDER_NAME,
+        baseURL: MODEL_PROVIDER_BASE_URL,
         apiKey,
         model: executionModelName,
         timeoutMs: Math.min(30_000, config.planningTimeoutMs),
@@ -7619,8 +7620,8 @@ export class AssistantRuntime {
 
       this.agentTurnOrchestrator.planning(runId, thinkingDecision);
       const planner = new AnalysisPlanningAdapter({
-        providerName: "siliconflow",
-        baseURL: "https://api.siliconflow.cn/v1",
+        providerName: MODEL_PROVIDER_NAME,
+        baseURL: MODEL_PROVIDER_BASE_URL,
         apiKey,
         model: reasoningModelName,
         timeoutMs: config.planningTimeoutMs,
@@ -7806,8 +7807,8 @@ export class AssistantRuntime {
       executorModel: input.executionModelName,
     });
     const fallbackPlanner = new ReasoningPlannerAdapter({
-      providerName: "siliconflow",
-      baseURL: "https://api.siliconflow.cn/v1",
+      providerName: MODEL_PROVIDER_NAME,
+      baseURL: MODEL_PROVIDER_BASE_URL,
       apiKey: input.apiKey,
       model: input.executionModelName,
       timeoutMs: Math.min(config.planningTimeoutMs, MODEL_STREAM_TIMEOUT_MS),
@@ -7893,8 +7894,8 @@ export class AssistantRuntime {
       maxCumulativeThinkingBudget: 0,
     }, "legacy_flow"));
     const planner = new ReasoningPlannerAdapter({
-      providerName: "siliconflow",
-      baseURL: "https://api.siliconflow.cn/v1",
+      providerName: MODEL_PROVIDER_NAME,
+      baseURL: MODEL_PROVIDER_BASE_URL,
       apiKey: input.apiKey,
       model: input.reasoningModelName,
       timeoutMs: input.planningTimeoutMs,
@@ -8436,8 +8437,8 @@ export class AssistantRuntime {
         ? "python"
         : input.step.toolKind === "chart_rendering" ? "chart" : "report";
     const adapter = new ExecutionParameterAdapter({
-      providerName: "siliconflow",
-      baseURL: "https://api.siliconflow.cn/v1",
+      providerName: MODEL_PROVIDER_NAME,
+      baseURL: MODEL_PROVIDER_BASE_URL,
       apiKey: input.apiKey,
       model: input.modelName,
       timeoutMs: MODEL_STREAM_TIMEOUT_MS,
@@ -8638,8 +8639,8 @@ export class AssistantRuntime {
         cumulativeThinkingBudget: current.cumulativeThinkingBudget + budget,
       });
       const planner = new AnalysisPlanningAdapter({
-        providerName: "siliconflow",
-        baseURL: "https://api.siliconflow.cn/v1",
+        providerName: MODEL_PROVIDER_NAME,
+        baseURL: MODEL_PROVIDER_BASE_URL,
         apiKey: input.apiKey,
         model: run.reasoningModelName,
         timeoutMs: config.planningTimeoutMs,
@@ -8731,8 +8732,8 @@ export class AssistantRuntime {
   }) {
     this.agentTurnOrchestrator.responding(input.runId, "正在生成回答");
     const adapter = createStreamingModelAdapter({
-      providerName: "siliconflow",
-      baseURL: "https://api.siliconflow.cn/v1",
+      providerName: MODEL_PROVIDER_NAME,
+      baseURL: MODEL_PROVIDER_BASE_URL,
       apiKey: input.apiKey,
       model: input.executionModelName,
       timeoutMs: MODEL_STREAM_TIMEOUT_MS,
@@ -9348,8 +9349,8 @@ export class AssistantRuntime {
 
     try {
       const adapter = createStreamingModelAdapter({
-        providerName: "siliconflow",
-        baseURL: "https://api.siliconflow.cn/v1",
+        providerName: MODEL_PROVIDER_NAME,
+        baseURL: MODEL_PROVIDER_BASE_URL,
         apiKey,
         model: input.modelName,
         toolExecutionMode: "serial",

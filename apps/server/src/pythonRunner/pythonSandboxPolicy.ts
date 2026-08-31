@@ -57,6 +57,8 @@ export class PythonSandboxPolicy {
 
   buildSafeEnv(paths: PythonSandboxPaths) {
     return {
+      ...(process.env.SYSTEMROOT ? { SYSTEMROOT: process.env.SYSTEMROOT } : {}),
+      ...(process.env.WINDIR ? { WINDIR: process.env.WINDIR } : {}),
       PYTHONUNBUFFERED: "1",
       MPLBACKEND: "Agg",
       CYCLE_PROBE_SANDBOX: "1",
@@ -65,6 +67,8 @@ export class PythonSandboxPolicy {
       CYCLE_PROBE_ARTIFACTS_DIR: "artifacts",
       HOME: paths.runDir,
       TMPDIR: paths.outputDir,
+      TEMP: paths.outputDir,
+      TMP: paths.outputDir,
     };
   }
 

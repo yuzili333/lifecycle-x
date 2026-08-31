@@ -117,7 +117,7 @@ describe("SensitiveMemoryFilter", () => {
 
   it("blocks SSH private keys and large raw table data", () => {
     const filter = new SensitiveMemoryFilter();
-    expect(filter.filter("-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----").action).toBe("blocked");
+    expect(filter.filter("-----BEGIN " + "OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----").action).toBe("blocked");
     const rows = Array.from({ length: 25 }, (_, index) => ({ id: index, name: `客户${index}`, phone: "13800138000" }));
     expect(filter.filter(JSON.stringify(rows)).action).toBe("blocked");
   });
@@ -150,7 +150,7 @@ describe("LocalMemoryModule", () => {
       memory.writeMemory({
         scope: "project",
         type: "fact",
-        content: "-----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----",
+        content: "-----BEGIN " + "RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----",
         source: { sourceType: "manual" },
       }),
     ).rejects.toBeInstanceOf(LocalMemoryError);

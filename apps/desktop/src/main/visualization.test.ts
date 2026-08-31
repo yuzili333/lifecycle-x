@@ -84,7 +84,7 @@ describe("Visualization validator", () => {
     expect(validateVisualizationSpec(baseSpec({ type: "timeline", encoding: { category: "title" } })).success).toBe(false);
     expect(validateVisualizationSpec(baseSpec({ metadata: { formatter: "function () { return 1 }" } })).success).toBe(false);
     expect(validateVisualizationSpec(baseSpec({ description: "<script>alert(1)</script>" })).success).toBe(false);
-    expect(validateVisualizationSpec(baseSpec({ description: "file:///Users/yuzili/private.csv" })).success).toBe(false);
+    expect(validateVisualizationSpec(baseSpec({ description: "file:///Users/example/private.csv" })).success).toBe(false);
   });
 
   it("enforces inline data limits", () => {
@@ -205,7 +205,7 @@ describe("WorkflowArtifactDataResolver", () => {
       name: "查询结果",
       sourceType: "sql_execution_result",
       sqliteTableName: "wf_dataset_1",
-      sqliteDatabasePath: "/Users/yuzili/private/app.sqlite",
+      sqliteDatabasePath: "/Users/example/private/app.sqlite",
       rowCount: 100,
       columnCount: 2,
       schema: { branch_name: "text", balance: "number" },
@@ -244,7 +244,7 @@ describe("WorkflowArtifactDataResolver", () => {
     expect(result.artifactId).toBe("workflow-dataset:dataset-1");
     expect(result.rows).toHaveLength(1);
     expect(result.dataRef).toBe("workflow-dataset:dataset-1");
-    expect(JSON.stringify(result)).not.toContain("/Users/yuzili");
+    expect(JSON.stringify(result)).not.toContain("/Users/example");
     expect(result.truncated).toBe(true);
   });
 

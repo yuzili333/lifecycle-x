@@ -1641,7 +1641,7 @@ export function DataAssistantWorkspace({
     [activeMessages, activeToolState],
   );
   const activePendingToolApproval = activePendingToolApprovals[0] ?? null;
-  const landingUserName = user?.displayName?.trim() || user?.username || "Yuzili";
+  const landingUserName = user?.displayName?.trim() || user?.username || "分析员";
   const activeArtifactMessage = useMemo(
     () => {
       if (!artifactWindow.isOpen || !artifactWindow.messageId) {
@@ -1677,15 +1677,27 @@ export function DataAssistantWorkspace({
     () => Object.values(agentRunsByMessage).some((run) => run.conversationId === activeConversation?.id && Boolean(run.activeStartedAt)),
     [activeConversation?.id, agentRunsByMessage],
   );
-  const activeChatCsvAttachments = activeConversation ? chatCsvAttachmentsByConversation[activeConversation.id] ?? [] : [];
+  const activeChatCsvAttachments = useMemo(
+    () => activeConversation ? chatCsvAttachmentsByConversation[activeConversation.id] ?? [] : [],
+    [activeConversation, chatCsvAttachmentsByConversation],
+  );
   const activeChatCsvProgress = useMemo(
     () => aggregateChatCsvProgress(activeChatCsvAttachments),
     [activeChatCsvAttachments],
   );
   const isImportingChatCsv = activeChatCsvProgress !== null;
-  const readyChatCsvAttachments = activeChatCsvAttachments.filter((attachment) => attachment.status === "ready" && attachment.tempDataSourceId);
-  const activeTempDataSourceIds = readyChatCsvAttachments.map((attachment) => attachment.tempDataSourceId as string);
-  const selectedTempDataSourceIds = activeTempDataSourceIds.filter((tempDataSourceId) => !disabledTempDataSourceIds.includes(tempDataSourceId));
+  const readyChatCsvAttachments = useMemo(
+    () => activeChatCsvAttachments.filter((attachment) => attachment.status === "ready" && attachment.tempDataSourceId),
+    [activeChatCsvAttachments],
+  );
+  const activeTempDataSourceIds = useMemo(
+    () => readyChatCsvAttachments.map((attachment) => attachment.tempDataSourceId as string),
+    [readyChatCsvAttachments],
+  );
+  const selectedTempDataSourceIds = useMemo(
+    () => activeTempDataSourceIds.filter((tempDataSourceId) => !disabledTempDataSourceIds.includes(tempDataSourceId)),
+    [activeTempDataSourceIds, disabledTempDataSourceIds],
+  );
   const lastUserMessage = useMemo(
     () =>
       [...activeMessages]
@@ -1703,12 +1715,18 @@ export function DataAssistantWorkspace({
     () => connectedDataSources.find((dataSource) => dataSource.id === selectedDataSourceId),
     [connectedDataSources, selectedDataSourceId],
   );
-  const messageTempDataSourceIds = selectedDataSource ? [] : selectedTempDataSourceIds;
-  const messageTempDataSourceLabels = selectedDataSource
-    ? []
-    : readyChatCsvAttachments
-      .filter((attachment) => attachment.tempDataSourceId && selectedTempDataSourceIds.includes(attachment.tempDataSourceId))
-      .map((attachment) => attachment.fileName);
+  const messageTempDataSourceIds = useMemo(
+    () => selectedDataSource ? [] : selectedTempDataSourceIds,
+    [selectedDataSource, selectedTempDataSourceIds],
+  );
+  const messageTempDataSourceLabels = useMemo(
+    () => selectedDataSource
+      ? []
+      : readyChatCsvAttachments
+        .filter((attachment) => attachment.tempDataSourceId && selectedTempDataSourceIds.includes(attachment.tempDataSourceId))
+        .map((attachment) => attachment.fileName),
+    [readyChatCsvAttachments, selectedDataSource, selectedTempDataSourceIds],
+  );
   const activeFieldCsvAttachment = useMemo(
     () => readyChatCsvAttachments.find((attachment) => attachment.tempDataSourceId && selectedTempDataSourceIds.includes(attachment.tempDataSourceId)),
     [readyChatCsvAttachments, selectedTempDataSourceIds],
@@ -1874,6 +1892,7 @@ export function DataAssistantWorkspace({
   }, [loadConversationMessages, toast, user?.id]);
 
   useEffect(() => {
+    const pendingMessageDeltas = pendingMessageDeltasRef.current;
     const dispose = window.lifecycleX?.assistant?.onStreamEvent((event: AssistantStreamEvent) => {
       if (event.type === "conversation") {
         setConversations((current) => mergeConversation(current, event.conversation));
@@ -1977,7 +1996,7 @@ export function DataAssistantWorkspace({
         window.clearTimeout(messageDeltaFlushTimerRef.current);
         messageDeltaFlushTimerRef.current = null;
       }
-      pendingMessageDeltasRef.current.clear();
+      pendingMessageDeltas.clear();
       dispose?.();
     };
   }, [flushPendingMessageDeltas, queueMessageDelta, toast, upsertMessage, user?.id]);
@@ -3561,7 +3580,7 @@ export function DataAssistantWorkspace({
         });
         return;
       }
-      const invalidFieldRefs = selectedFieldRefs.filter((field) => field.status !== "valid" || !composerValue.includes(field.rawText));
+      const invalidFieldRefs = selectedFieldRefs.filter((field) => field.status !== "valid" || !prompt.includes(field.rawText));
       if (invalidFieldRefs.length > 0) {
         toast({
           type: "error",

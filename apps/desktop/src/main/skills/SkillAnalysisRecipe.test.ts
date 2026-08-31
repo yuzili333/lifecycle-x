@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import { compileSkillAnalysisRecipe } from "./SkillAnalysisRecipe";
+import { resolvePythonExecutable } from "../pythonRuntime";
 
 const recipe = {
   kind: "grouped-risk-distribution-v1",
@@ -69,7 +70,7 @@ describe("Skill analysis recipe compiler", () => {
       { "主要担保方式名称": "04--保证金质押", "最新风险五级分类": "正常", "贷款余额(万元)": "400", "合同流水号": "C4" },
       { "主要担保方式名称": "04--保证金质押", "最新风险五级分类": "正常", "贷款余额(万元)": "400", "合同流水号": "C4" },
     ];
-    const stdout = execFileSync("python3", ["-I", "-S", "-c", compiled.value.script], {
+    const stdout = execFileSync(resolvePythonExecutable(), ["-I", "-S", "-c", compiled.value.script], {
       input: JSON.stringify(rows),
       encoding: "utf8",
     });
@@ -145,7 +146,7 @@ describe("Skill analysis recipe compiler", () => {
       { "最新风险五级分类": "0300--次级", "贷款余额(万元)": "300", "合同流水号": "C3" },
       { "最新风险五级分类": "", "贷款余额(万元)": "999", "合同流水号": "C4" },
     ];
-    const stdout = execFileSync("python3", ["-I", "-S", "-c", compiled.value.script], {
+    const stdout = execFileSync(resolvePythonExecutable(), ["-I", "-S", "-c", compiled.value.script], {
       input: JSON.stringify(rows),
       encoding: "utf8",
     });
@@ -186,7 +187,7 @@ describe("Skill analysis recipe compiler", () => {
     });
     expect(compiled.ok).toBe(true);
     if (!compiled.ok) return;
-    const stdout = execFileSync("python3", ["-I", "-S", "-c", compiled.value.script], {
+    const stdout = execFileSync(resolvePythonExecutable(), ["-I", "-S", "-c", compiled.value.script], {
       input: JSON.stringify([
         { "最新风险五级分类": "正常", "贷款余额(万元)": "100", "合同流水号": "C1" },
         { "最新风险五级分类": "关注", "贷款余额(万元)": "200", "合同流水号": "C1" },

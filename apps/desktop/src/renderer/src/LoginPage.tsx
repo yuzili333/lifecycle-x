@@ -28,8 +28,8 @@ function isEmail(value: string) {
 
 export function LoginPage({ onPasswordLogin, onSsoComplete, lastError, onError }: LoginPageProps) {
   const [step, setStep] = useState<LoginStep>("credentials");
-  const [identifier, setIdentifier] = useState("yuzili");
-  const [password, setPassword] = useState("yuzili");
+  const [identifier, setIdentifier] = useState("analyst");
+  const [password, setPassword] = useState("");
   const [ssoState, setSsoState] = useState<{ token: string; providerName: string; email: string } | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const toast = useAppToast();

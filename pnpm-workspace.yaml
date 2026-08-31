@@ -5,11 +5,7 @@ packages:
 "strict-dep-builds": false
 "verify-deps-before-run": false
 
-onlyBuiltDependencies:
-  - esbuild
-neverBuiltDependencies:
-  - electron
 allowBuilds:
   better-sqlite3: true
-  electron: false
+  electron: true
   esbuild: true

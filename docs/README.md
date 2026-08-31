@@ -6,6 +6,7 @@ active implementation status belongs under `docs/work/`.
 
 ## Start
 
+- [Judge review guide](review/README.md): source deployment, Golden Path, architecture, originality, and verification.
 - [Repository map](repo-map.md): where changes belong and the smallest checks.
 - [Architecture overview](architecture/overview.md): runtime surfaces and data flow.
 - [Architecture boundaries](architecture/boundaries.md): constraints that changes must preserve.

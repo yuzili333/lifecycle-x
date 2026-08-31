@@ -6,6 +6,8 @@ export const LOCK_MINUTES = 30;
 export const ACCESS_TOKEN_TTL_MS = 15 * 60 * 1000;
 export const REFRESH_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 export const SSO_STATE_TTL_MS = 10 * 60 * 1000;
+// Public local-demo credential. It is intentionally non-secret and must never be used in production.
+export const PUBLIC_DEMO_PASSWORD = "Lifecycle@123";
 
 type InternalUser = AuthUser & {
   passwordHash?: string;
@@ -388,7 +390,7 @@ export class AuthStore {
         role: "admin",
         status: "active",
         avatarUrl: "https://api.dicebear.com/9.x/initials/svg?seed=Admin",
-        passwordHash: hashPassword("Lifecycle@123"),
+        passwordHash: hashPassword(PUBLIC_DEMO_PASSWORD),
         failedAttempts: 0,
         ssoProviderId: "bank-oidc",
       },
@@ -400,31 +402,7 @@ export class AuthStore {
         role: "user",
         status: "active",
         avatarUrl: "https://api.dicebear.com/9.x/initials/svg?seed=Analyst",
-        passwordHash: hashPassword("Lifecycle@123"),
-        failedAttempts: 0,
-        ssoProviderId: "bank-oidc",
-      },
-      {
-        id: "usr_yuzili",
-        username: "yuzili",
-        email: "yuzili@bank.example.com",
-        displayName: "Yuzili",
-        role: "admin",
-        status: "active",
-        avatarUrl: "https://api.dicebear.com/9.x/initials/svg?seed=Yuzili",
-        passwordHash: hashPassword("yuzili"),
-        failedAttempts: 0,
-        ssoProviderId: "bank-oidc",
-      },
-      {
-        id: "usr_weiqi",
-        username: "weiqi",
-        email: "weiqi@bank.example.com",
-        displayName: "Weiqi",
-        role: "admin",
-        status: "active",
-        avatarUrl: "https://api.dicebear.com/9.x/initials/svg?seed=Weiqi",
-        passwordHash: hashPassword("weiqi"),
+        passwordHash: hashPassword(PUBLIC_DEMO_PASSWORD),
         failedAttempts: 0,
         ssoProviderId: "bank-oidc",
       },
@@ -436,7 +414,7 @@ export class AuthStore {
         role: "user",
         status: "disabled",
         avatarUrl: "https://api.dicebear.com/9.x/initials/svg?seed=Disabled",
-        passwordHash: hashPassword("Lifecycle@123"),
+        passwordHash: hashPassword(PUBLIC_DEMO_PASSWORD),
         failedAttempts: 0,
         ssoProviderId: "bank-oidc",
       },
