@@ -23,12 +23,32 @@ const BODY_SIZE = 20;
 const HEADING_SIZE = 28;
 const DOCX_CONTENT_WIDTH_PX = 640;
 const DOCX_CONTENT_WIDTH_TWIPS = convertMillimetersToTwip(170);
-const FANGSONG_FONT = {
-  ascii: "FangSong",
-  hAnsi: "FangSong",
-  eastAsia: "仿宋",
-  cs: "FangSong",
-};
+const REPORT_DOCUMENT_FONT = reportDocumentFont();
+
+export function reportDocumentFont(platform: NodeJS.Platform = process.platform) {
+  if (platform === "win32") {
+    return {
+      ascii: "Segoe UI",
+      hAnsi: "Segoe UI",
+      eastAsia: "Microsoft YaHei UI",
+      cs: "Segoe UI",
+    };
+  }
+  if (platform === "darwin") {
+    return {
+      ascii: "Helvetica Neue",
+      hAnsi: "Helvetica Neue",
+      eastAsia: "PingFang SC",
+      cs: "Helvetica Neue",
+    };
+  }
+  return {
+    ascii: "Arial",
+    hAnsi: "Arial",
+    eastAsia: "Noto Sans CJK SC",
+    cs: "Arial",
+  };
+}
 
 export type ExportDocumentModel = {
   markdown: string;
@@ -46,7 +66,7 @@ export function renderReportHtml(model: ExportDocumentModel) {
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; background: #fff; color: #111; }
   body {
-    font-family: "FangSong", "仿宋", "STFangsong", "Songti SC", serif;
+    font-family: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
     font-size: 10pt;
     line-height: 1.65;
     overflow-wrap: anywhere;
@@ -115,7 +135,7 @@ export async function renderReportDocx(model: ExportDocumentModel) {
     styles: {
       default: {
         document: {
-          run: { font: FANGSONG_FONT, size: BODY_SIZE, sizeComplexScript: BODY_SIZE },
+          run: { font: REPORT_DOCUMENT_FONT, size: BODY_SIZE, sizeComplexScript: BODY_SIZE },
           paragraph: { spacing: { line: 330, after: 100 } },
         },
         heading1: headingStyle(),
@@ -124,7 +144,7 @@ export async function renderReportDocx(model: ExportDocumentModel) {
         heading4: headingStyle(),
         heading5: headingStyle(),
         heading6: headingStyle(),
-        strong: { run: { bold: true, font: FANGSONG_FONT, size: BODY_SIZE } },
+        strong: { run: { bold: true, font: REPORT_DOCUMENT_FONT, size: BODY_SIZE } },
       },
     },
     sections: [{
@@ -147,7 +167,7 @@ export async function renderReportDocx(model: ExportDocumentModel) {
 
 function headingStyle() {
   return {
-    run: { font: FANGSONG_FONT, size: HEADING_SIZE, sizeComplexScript: HEADING_SIZE, bold: true },
+    run: { font: REPORT_DOCUMENT_FONT, size: HEADING_SIZE, sizeComplexScript: HEADING_SIZE, bold: true },
     paragraph: { spacing: { before: 220, after: 110 }, keepNext: true },
   };
 }
@@ -274,7 +294,7 @@ function docxBlock(
 
 function paragraphFor(children: InlineNode[], context: { quote?: boolean; listLevel?: number }, prefix = "") {
   const runs = inlineRuns(children);
-  if (prefix) runs.unshift(new TextRun({ text: prefix, font: FANGSONG_FONT, size: BODY_SIZE }));
+  if (prefix) runs.unshift(new TextRun({ text: prefix, font: REPORT_DOCUMENT_FONT, size: BODY_SIZE }));
   return new Paragraph({
     children: runs,
     indent: {
@@ -312,7 +332,7 @@ function inlineRuns(nodes: InlineNode[], style: { bold?: boolean; italics?: bool
 function textRun(text: string, style: { bold?: boolean; italics?: boolean; strike?: boolean }) {
   return new TextRun({
     text,
-    font: FANGSONG_FONT,
+    font: REPORT_DOCUMENT_FONT,
     size: BODY_SIZE,
     bold: style.bold,
     italics: style.italics,

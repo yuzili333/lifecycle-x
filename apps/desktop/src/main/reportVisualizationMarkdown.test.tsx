@@ -40,6 +40,36 @@ describe("report visualization markdown", () => {
     expect(JSON.stringify(segments)).not.toContain("```visualization");
   });
 
+  it("removes a legacy chart placeholder when rendering the controlled visualization node", () => {
+    const artifactId = "assistant-chart-spec:chart-1";
+    const markdown = [
+      "# 风险报告",
+      "",
+      `{{chart:${artifactId}}}`,
+      "",
+      visualizationFence(artifactId),
+      "",
+      "图表后正文。",
+    ].join("\n");
+    const segments = parseReportMarkdownVisualizations(markdown, 2);
+    const visibleMarkdown = segments
+      .filter((segment) => segment.type === "markdown")
+      .map((segment) => segment.markdown)
+      .join("");
+
+    expect(segments.filter((segment) => segment.type === "visualization")).toHaveLength(1);
+    expect(visibleMarkdown).toContain("图表后正文");
+    expect(visibleMarkdown).not.toContain("{{chart:");
+  });
+
+  it("keeps chart placeholder examples inside ordinary code fences", () => {
+    const markdown = "示例\n\n```text\n{{chart:assistant-chart-spec:example}}\n```";
+
+    expect(parseReportMarkdownVisualizations(markdown)).toEqual([
+      { type: "markdown", key: "report-markdown:1:0", markdown },
+    ]);
+  });
+
   it("supports multiple stable chart nodes and deduplicates declared artifact ids", () => {
     const markdown = `${visualizationFence("assistant-chart-spec:chart-1")}\n${visualizationFence("assistant-chart-spec:chart-2", "贷款余额分布")}`;
     const segments = parseReportMarkdownVisualizations(markdown, 7);

@@ -68,9 +68,7 @@ export class ReportExportService {
         throw exportError("REPORT_EXPORT_ARTIFACT_NOT_FOUND", "当前报告版本不存在或已失效。", request, traceId, false);
       }
       const sourceMarkdown = artifact.content;
-      const model = request.format === "markdown"
-        ? { markdown: sourceMarkdown, images: new Map<string, ReportExportVisualizationImage>() }
-        : await this.prepareDocumentModel(request, sourceMarkdown, traceId);
+      const model = await this.prepareDocumentModel(request, sourceMarkdown, traceId);
       const fileName = defaultFileName(request.suggestedTitle || artifact.title || "分析报告", request.format);
       const target = await dialog.showSaveDialog({
         title: `导出${formatLabel(request.format)}`,
@@ -260,9 +258,17 @@ export function materializeExportDocument(
 }
 
 async function createOutput(format: ReportExportFormat, model: ExportDocumentModel) {
-  if (format === "markdown") return model.markdown;
+  if (format === "markdown") return renderPortableMarkdown(model);
   if (format === "docx") return renderReportDocx(model);
   return renderPdf(renderReportHtml(model));
+}
+
+function renderPortableMarkdown(model: ExportDocumentModel) {
+  let markdown = model.markdown;
+  for (const [token, image] of model.images) {
+    markdown = markdown.replaceAll(`](${token})`, `](${image.dataUrl})`);
+  }
+  return markdown;
 }
 
 async function renderPdf(html: string) {

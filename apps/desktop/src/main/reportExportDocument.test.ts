@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { calculateDocxColumnWidths, renderReportDocx, renderReportHtml } from "./reportExportDocument";
+import { calculateDocxColumnWidths, renderReportDocx, renderReportHtml, reportDocumentFont } from "./reportExportDocument";
 import type { TableCellNode } from "@astryxdesign/core/Markdown";
 
 const chartDataUrl = `data:image/png;base64,${Buffer.from("png-test-data").toString("base64")}`;
@@ -31,7 +31,9 @@ describe("report export document rendering", () => {
     const html = renderReportHtml(model);
 
     expect(html).toContain("@page { size: A4");
-    expect(html).toContain('"FangSong", "仿宋"');
+    expect(html).toContain('font-family: system-ui, -apple-system, "Segoe UI"');
+    expect(html).not.toContain("FangSong");
+    expect(html).not.toContain("仿宋");
     expect(html).toContain("<h1>信贷风险分析报告</h1>");
     expect(html).toContain("<strong>重要结论</strong>");
     expect(html).toContain("<table>");
@@ -44,6 +46,13 @@ describe("report export document rendering", () => {
 
     expect(output.subarray(0, 2).toString("ascii")).toBe("PK");
     expect(output.byteLength).toBeGreaterThan(2_000);
+  });
+
+  it("uses platform-native report fonts without forcing FangSong", () => {
+    expect(reportDocumentFont("darwin")).toMatchObject({ hAnsi: "Helvetica Neue", eastAsia: "PingFang SC" });
+    expect(reportDocumentFont("win32")).toMatchObject({ hAnsi: "Segoe UI", eastAsia: "Microsoft YaHei UI" });
+    expect(JSON.stringify(reportDocumentFont("darwin"))).not.toMatch(/FangSong|仿宋/);
+    expect(JSON.stringify(reportDocumentFont("win32"))).not.toMatch(/FangSong|仿宋/);
   });
 
   it("allocates the full document width across table columns based on content length", () => {

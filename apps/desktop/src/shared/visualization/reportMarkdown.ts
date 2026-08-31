@@ -53,6 +53,10 @@ export function parseReportMarkdownVisualizations(markdown: string, reportVersio
           startLine: index + 1,
           content: "",
         };
+      } else if (isLegacyChartPlaceholder(trimmed)) {
+        // Older report prompts emitted a transport-only chart marker before the
+        // controlled visualization fence. It must never become report content.
+        continue;
       } else {
         markdownBuffer += line;
         if (opening) {
@@ -81,6 +85,11 @@ export function parseReportMarkdownVisualizations(markdown: string, reportVersio
   }
   flushMarkdown();
   return segments;
+}
+
+function isLegacyChartPlaceholder(value: string) {
+  const match = value.match(/^\{\{chart:([^{}]+)\}\}$/);
+  return Boolean(match && isSafeArtifactId(match[1].trim()));
 }
 
 export function reportVisualizationArtifactIds(markdown: string) {

@@ -1,6 +1,7 @@
 import { Theme } from "@astryxdesign/core";
 import { neutralTheme } from "@astryxdesign/theme-neutral/built";
 import { toPng } from "html-to-image";
+import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { reportVisualizationArtifactIds } from "../../../shared/visualization";
 import type {
@@ -60,19 +61,21 @@ async function renderVisualizationImage(
   document.body.append(host);
   const root = createRoot(host);
   try {
-    root.render(
-      <Theme theme={neutralTheme} mode="light">
-        <VisualizationRenderer
-          spec={artifact.visualizationSpec}
-          data={artifact.data}
-          embedded
-          appearance="light"
-        />
-      </Theme>,
-    );
+    flushSync(() => {
+      root.render(
+        <Theme theme={neutralTheme} mode="light">
+          <VisualizationRenderer
+            spec={artifact.visualizationSpec}
+            data={artifact.data}
+            embedded
+            appearance="light"
+          />
+        </Theme>,
+      );
+    });
     await waitForSnapshotLayout();
     const node = host.querySelector<HTMLElement>(".assistant-visualization");
-    if (!node || host.querySelector(".assistant-visualization-error")) {
+    if (!node || node.classList.contains("error")) {
       throw new Error(`图表“${artifact.title ?? artifact.visualizationSpec.title}”渲染失败，导出已取消。`);
     }
     const rect = node.getBoundingClientRect();

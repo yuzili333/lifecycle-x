@@ -3209,15 +3209,13 @@ export function DataAssistantWorkspace({
       }
       setIsExportingReport(true);
       try {
-        const visualizationImages = format === "markdown"
-          ? []
-          : await prepareReportVisualizationImages({
-            userId: user.id,
-            conversationId: activeArtifactMessage.conversationId,
-            reportArtifactId: activeArtifactId,
-            reportVersion,
-            markdown,
-          });
+        const visualizationImages = await prepareReportVisualizationImages({
+          userId: user.id,
+          conversationId: activeArtifactMessage.conversationId,
+          reportArtifactId: activeArtifactId,
+          reportVersion,
+          markdown,
+        });
         const result = await api.exportReport({
           userId: user.id,
           conversationId: activeArtifactMessage.conversationId,
