@@ -1,0 +1,76 @@
+scene: 1
+shots:
+  - id: scene_01_shot_001
+    source_shot: S01
+    timecode: 00:00-00:05
+    shot_type: medium-wide establishing
+    lens: 35mm
+    camera_angle: eye-level, slight rear three-quarter
+    emotion: professional focus with restrained urgency
+    action: morning task alert lights up as the business lead opens a blank report template
+    composition: wall clock foreground, protagonist midground, monitor and notebook background
+    continuity:
+      - establish char_business_lead_v1, loc_office_morning_v1, prop_task_card_v1
+    status: keyframe_generated
+  - id: scene_01_shot_002
+    source_shot: S02
+    timecode: 00:05-00:10
+    shot_type: medium over-shoulder
+    lens: 50mm
+    camera_angle: eye-level
+    emotion: analytical and capable, paused at the data-processing gap
+    action: she circles the business question beside a prior report and an empty new report
+    composition: natural hands and notebook foreground, report shapes midground, face in soft side profile
+    continuity:
+      - preserve S01 identity, wardrobe, desk and light direction
+    status: keyframe_generated
+  - id: scene_01_shot_003
+    source_shot: S03
+    timecode: 00:10-00:15
+    shot_type: two-person side composition
+    lens: 50mm
+    camera_angle: eye-level
+    emotion: precise collaborative explanation
+    action: business lead explains fields, metrics and desired chart to an engineer using a sanitized requirement page
+    composition: requirement page central, both adults on opposite thirds, no screen text legible
+    continuity:
+      - preserve business lead identity and prop_task_card_v1
+      - establish char_engineer_v1 without villain framing
+    status: keyframe_generated
+  - id: scene_01_shot_004
+    source_shot: S04
+    timecode: 00:15-00:20
+    shot_type: telephoto detail
+    lens: 85mm
+    camera_angle: slight over-shoulder
+    emotion: orderly workload and quiet waiting
+    action: the same task card joins a populated iteration board while the business lead checks a calendar
+    composition: generic board foreground, protagonist soft in background, amber status point visible
+    continuity:
+      - preserve prop_task_card_v1 and morning office light
+    status: keyframe_generated
+  - id: scene_01_shot_005
+    source_shot: S05
+    timecode: 00:20-00:25
+    shot_type: meeting-table medium close-up
+    lens: 50mm
+    camera_angle: table height
+    emotion: brief satisfaction turning into thoughtful attention
+    action: a correct static report is placed on the table; a colleague points to one chart area and asks a natural follow-up
+    composition: report and pointing hand foreground, business lead side profile midground
+    continuity:
+      - preserve char_business_lead_v1 and prop_report_v1
+      - no error markers or accusatory gesture
+    status: keyframe_generated
+  - id: scene_01_shot_006
+    source_shot: S06
+    timecode: 00:25-00:29
+    shot_type: close detail with layered depth
+    lens: 85mm
+    camera_angle: high three-quarter
+    emotion: focused rework, not frustration
+    action: new annotation returns to the requirement card while a generic script workspace reopens in the distance
+    composition: pen, annotation and task card sharp; engineer screen abstract and defocused
+    continuity:
+      - preserve task card, watch, wardrobe and report palette
+    status: keyframe_generated

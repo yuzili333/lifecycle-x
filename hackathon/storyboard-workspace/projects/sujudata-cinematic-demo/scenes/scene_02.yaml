@@ -1,0 +1,13 @@
+scene: 2
+id: scene_02_break_the_loop
+title: 等待循环转化为受控分析链
+timecode: 00:29-00:36
+location: abstract_process_space_v1
+time_of_day: 非写实时间
+story_beat: 同一需求卡在需求、排期、开发和报表之间循环，随后脱离循环并拉直为受控工具链，准备进入产品揭示。
+characters: []
+visual_style: style_process_transition_v1
+continuity_notes:
+  - S07保留prop_task_card_v1的横向比例和琥珀色状态点。
+  - S08只把路径由循环改为线性，不把节点画成真实产品UI。
+  - 最后一段青绿色路径向画面中心收束，为S09品牌揭示提供匹配切换。

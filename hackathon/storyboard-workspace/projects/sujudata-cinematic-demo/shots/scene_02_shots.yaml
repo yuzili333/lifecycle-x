@@ -1,0 +1,27 @@
+scene: 2
+shots:
+  - id: scene_02_shot_007
+    source_shot: S07
+    timecode: 00:29-00:32
+    shot_type: graphic overhead loop
+    lens: orthographic-like 50mm
+    camera_angle: ten-degree top-down
+    emotion: repetition and suspended progress
+    action: one task card moves around four unlabelled nodes and returns to the start beside a clock ring
+    composition: centered loop with clean negative space for later title
+    continuity:
+      - preserve prop_task_card_v1 silhouette and amber status point
+    status: keyframe_generated
+  - id: scene_02_shot_008
+    source_shot: S08
+    timecode: 00:32-00:36
+    shot_type: graphic perspective transition
+    lens: 50mm equivalent
+    camera_angle: centered, slight top-down
+    emotion: clarity, agency and controlled momentum
+    action: the same task card exits the gray loop; a teal path straightens through ordered abstract checkpoints toward a clean central aperture
+    composition: old loop receding on one side, linear path leading to center, product-reveal match point
+    continuity:
+      - preserve task card geometry
+      - no product UI or labels; teal indicates controlled flow, not automatic decision
+    status: keyframe_generated

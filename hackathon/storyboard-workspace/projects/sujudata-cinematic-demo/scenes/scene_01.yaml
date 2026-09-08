@@ -1,0 +1,17 @@
+scene: 1
+id: scene_01_office_waiting_loop
+title: 临时分析任务进入协作与排期循环
+timecode: 00:00-00:29
+location: loc_office_morning_v1
+time_of_day: 工作日上午约09:00起
+story_beat: 业务主管收到临时任务，转写并沟通需求，等待研发排期；静态报表交付后出现新的下钻问题，需求再次返回修改。
+characters:
+  - char_business_lead_v1
+  - char_engineer_v1
+  - char_colleague_v1
+visual_style: style_corporate_cinema_v1
+continuity_notes:
+  - S01至S06保持同一主角、服装、工位和清晨光线。
+  - prop_task_card_v1从任务提醒贯穿到再次修改。
+  - prop_report_v1是正确交付物，不能表现为错误报告。
+  - 画面内不生成准确文字，后期叠加任务与流程标签。
